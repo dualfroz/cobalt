@@ -409,3 +409,127 @@ pub const Reader = struct {
         return self.index.len;
     }
 };
+
+pub const Cursor = struct {
+    reader: *const Reader,
+    blockIdx: usize,
+    pos: usize,
+    nextPos: usize,
+    cur: ?Record,
+
+    pub fn valid(self: *const Cursor) bool {
+        return self.cur != null;
+    }
+
+    pub fn record(self: *const Cursor) Record {
+        return self.cur.?;
+    }
+
+    pub fn advance(self: *Cursor) void {
+        self.pos = self.nextPos;
+        self.refresh();
+    }
+
+    fn refresh(self: *Cursor) void {
+        while (self.blockIdx < self.reader.index.len) {
+            const block = self.reader.blockBytes(self.blockIdx);
+            if (self.pos >= block.len) {
+                self.blockIdx += 1;
+                self.pos = 0;
+                continue;
+            }
+            const decoded = decodeRecord(block, self.pos);
+            self.cur = decoded.record;
+            self.nextPos = decoded.next;
+            return;
+        }
+        self.cur = null;
+    }
+};
+
+pub const ReverseCursor = struct {
+    reader: *const Reader,
+    allocator: Allocator,
+    positions: std.ArrayList(usize),
+    blockIdx: usize,
+    idx: usize,
+    exhausted: bool,
+    cur: ?Record,
+
+    pub fn deinit(self: *ReverseCursor) void {
+        self.positions.deinit();
+    }
+
+    pub fn valid(self: *const ReverseCursor) bool {
+        return self.cur != null;
+    }
+
+    pub fn record(self: *const ReverseCursor) Record {
+        return self.cur.?;
+    }
+
+    pub fn advance(self: *ReverseCursor) void {
+        if (self.exhausted) return;
+        if (self.idx == 0) {
+            if (self.blockIdx == 0) {
+                self.exhausted = true;
+                self.cur = null;
+                return;
+            }
+            self.loadBlock(self.blockIdx - 1) catch {
+                self.exhausted = true;
+                self.cur = null;
+                return;
+            };
+            self.idx = self.positions.items.len - 1;
+        } else {
+            self.idx -= 1;
+        }
+        self.setCurrent();
+    }
+
+    fn loadBlock(self: *ReverseCursor, blockIdx: usize) !void {
+        self.blockIdx = blockIdx;
+        self.positions.clearRetainingCapacity();
+        const block = self.reader.blockBytes(blockIdx);
+        var pos: usize = 0;
+        while (pos < block.len) {
+            try self.positions.append(pos);
+            pos = decodeRecord(block, pos).next;
+        }
+    }
+
+    fn setCurrent(self: *ReverseCursor) void {
+        const block = self.reader.blockBytes(self.blockIdx);
+        self.cur = decodeRecord(block, self.positions.items[self.idx]).record;
+    }
+};
+
+fn verifiedBlock(buffer: []const u8, offset: u64, len: u32) ![]const u8 {
+    const start: usize = @intCast(offset);
+    const end = start + len;
+    if (end + 4 > buffer.len) return error.CorruptSstable;
+    const block = buffer[start..end];
+    if (encode.crc(block) != readU32(buffer, end)) return error.CorruptSstable;
+    return block;
+}
+
+const Decoded = struct {
+    record: Record,
+    next: usize,
+};
+
+fn decodeRecord(block: []const u8, pos: usize) Decoded {
+    const kind: Kind = @enumFromInt(block[pos]);
+    const seq = readU64(block, pos + 1);
+    const keyLen = readU32(block, pos + 9);
+    const valLen = readU32(block, pos + 13);
+    const keyStart = pos + recordHeader;
+    const key = block[keyStart .. keyStart + keyLen];
+    const valStart = keyStart + keyLen;
+    const value = block[valStart .. valStart + valLen];
+    return .{
+        .record = .{ .key = key, .value = value, .seq = seq, .kind = kind },
+        .next = valStart + valLen,
+    };
+}
