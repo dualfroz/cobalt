@@ -1,0 +1,166 @@
+const std = @import("std");
+const encode = @import("encode.zig");
+const Memtable = @import("memtable.zig").Memtable;
+
+const Allocator = std.mem.Allocator;
+const Kind = encode.Kind;
+const Record = encode.Record;
+
+const headerLen = 8 + 1 + 4 + 4;
+const batchMarker: u8 = 0xB0;
+const batchHeader = 8 + 1 + 4;
+const opHeader = 1 + 8 + 4 + 4;
+
+pub const Wal = struct {
+    allocator: Allocator,
+    file: std.fs.File,
+
+    pub fn open(allocator: Allocator, dir: std.fs.Dir, name: []const u8) !Wal {
+        const file = try dir.createFile(name, .{ .read = true, .truncate = false });
+        return .{ .allocator = allocator, .file = file };
+    }
+
+    pub fn close(self: *Wal) void {
+        self.file.close();
+    }
+
+    pub fn append(self: *Wal, kind: Kind, seq: u64, key: []const u8, value: []const u8) !void {
+        var body = std.ArrayList(u8).init(self.allocator);
+        defer body.deinit();
+        const writer = encode.ByteWriter.init(&body);
+        try writer.putU64(seq);
+        try writer.byte(@intFromEnum(kind));
+        try writer.putU32(@intCast(key.len));
+        try writer.putU32(@intCast(value.len));
+        try writer.slice(key);
+        try writer.slice(value);
+
+        var frame = std.ArrayList(u8).init(self.allocator);
+        defer frame.deinit();
+        const frameWriter = encode.ByteWriter.init(&frame);
+        try frameWriter.putU32(encode.crc(body.items));
+        try frameWriter.slice(body.items);
+
+        try self.file.seekFromEnd(0);
+        try self.file.writeAll(frame.items);
+    }
+
+    pub fn appendBatch(self: *Wal, records: []const Record) !void {
+        var body = std.ArrayList(u8).init(self.allocator);
+        defer body.deinit();
+        const writer = encode.ByteWriter.init(&body);
+        try writer.putU64(0);
+        try writer.byte(batchMarker);
+        try writer.putU32(@intCast(records.len));
+        for (records) |record| {
+            try writer.byte(@intFromEnum(record.kind));
+            try writer.putU64(record.seq);
+            try writer.putU32(@intCast(record.key.len));
+            try writer.putU32(@intCast(record.value.len));
+            try writer.slice(record.key);
+            try writer.slice(record.value);
+        }
+
+        var frame = std.ArrayList(u8).init(self.allocator);
+        defer frame.deinit();
+        const frameWriter = encode.ByteWriter.init(&frame);
+        try frameWriter.putU32(encode.crc(body.items));
+        try frameWriter.slice(body.items);
+
+        try self.file.seekFromEnd(0);
+        try self.file.writeAll(frame.items);
+    }
+
+    pub fn sync(self: *Wal) !void {
+        try self.file.sync();
+    }
+
+    pub fn reset(self: *Wal) !void {
+        try self.file.setEndPos(0);
+        try self.file.seekTo(0);
+        try self.file.sync();
+    }
+
+    pub fn replay(self: *Wal, memtable: *Memtable) !u64 {
+        try self.file.seekTo(0);
+        const data = try self.file.readToEndAlloc(self.allocator, std.math.maxInt(usize));
+        defer self.allocator.free(data);
+
+        var pos: usize = 0;
+        var goodEnd: usize = 0;
+        var maxSeq: u64 = 0;
+        while (pos + 4 + batchHeader <= data.len) {
+            const storedCrc = encode.readU32(data, pos);
+            const bodyStart = pos + 4;
+            const bodyLen = frameBodyLen(data, bodyStart) orelse break;
+            if (bodyStart + bodyLen > data.len) break;
+            const body = data[bodyStart .. bodyStart + bodyLen];
+            if (encode.crc(body) != storedCrc) break;
+
+            const frameMax = try applyFrame(memtable, body);
+            if (frameMax > maxSeq) maxSeq = frameMax;
+
+            pos = bodyStart + bodyLen;
+            goodEnd = pos;
+        }
+
+        if (goodEnd != data.len) {
+            try self.file.setEndPos(goodEnd);
+        }
+        try self.file.seekFromEnd(0);
+        return maxSeq;
+    }
+};
+
+fn frameBodyLen(data: []const u8, bodyStart: usize) ?usize {
+    const marker = data[bodyStart + 8];
+    if (marker == batchMarker) {
+        if (bodyStart + batchHeader > data.len) return null;
+        const opCount = encode.readU32(data, bodyStart + 9);
+        var p = bodyStart + batchHeader;
+        var n: u32 = 0;
+        while (n < opCount) : (n += 1) {
+            if (p + opHeader > data.len) return null;
+            const keyLen = encode.readU32(data, p + 9);
+            const valLen = encode.readU32(data, p + 13);
+            const end = p + opHeader + keyLen + valLen;
+            if (end > data.len) return null;
+            p = end;
+        }
+        return p - bodyStart;
+    }
+    if (bodyStart + headerLen > data.len) return null;
+    const keyLen = encode.readU32(data, bodyStart + 9);
+    const valLen = encode.readU32(data, bodyStart + 13);
+    return headerLen + keyLen + valLen;
+}
+
+fn applyFrame(memtable: *Memtable, body: []const u8) !u64 {
+    var maxSeq: u64 = 0;
+    if (body[8] == batchMarker) {
+        const opCount = encode.readU32(body, 9);
+        var p: usize = batchHeader;
+        var n: u32 = 0;
+        while (n < opCount) : (n += 1) {
+            const kind: Kind = @enumFromInt(body[p]);
+            const seq = encode.readU64(body, p + 1);
+            const keyLen = encode.readU32(body, p + 9);
+            const valLen = encode.readU32(body, p + 13);
+            const keyStart = p + opHeader;
+            const key = body[keyStart .. keyStart + keyLen];
+            const value = body[keyStart + keyLen .. keyStart + keyLen + valLen];
+            try memtable.upsert(kind, seq, key, value);
+            if (seq > maxSeq) maxSeq = seq;
+            p = keyStart + keyLen + valLen;
+        }
+        return maxSeq;
+    }
+    const seq = encode.readU64(body, 0);
+    const kind: Kind = @enumFromInt(body[8]);
+    const keyLen = encode.readU32(body, 9);
+    const valLen = encode.readU32(body, 13);
+    const key = body[headerLen .. headerLen + keyLen];
+    const value = body[headerLen + keyLen .. headerLen + keyLen + valLen];
+    try memtable.upsert(kind, seq, key, value);
+    return seq;
+}
