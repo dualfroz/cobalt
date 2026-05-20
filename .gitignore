@@ -1,0 +1,13 @@
+# zig build artifacts / caches
+.zig-cache/
+zig-cache/
+zig-out/
+*.o
+
+# benchmark scratch data
+cobalt-bench-data/
+
+# os / logs / env
+.DS_Store
+*.log
+.env
