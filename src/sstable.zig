@@ -533,3 +533,118 @@ fn decodeRecord(block: []const u8, pos: usize) Decoded {
         .next = valStart + valLen,
     };
 }
+
+fn buildFixture(allocator: Allocator, dir: std.fs.Dir, name: []const u8, count: usize) !void {
+    var builder = try Builder.init(allocator, dir, name, count);
+    defer builder.deinit();
+    var buf: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const key = try std.fmt.bufPrint(&buf, "k{d:0>6}", .{i});
+        try builder.add(.{ .key = key, .value = "payload-value", .seq = i + 1, .kind = .value });
+    }
+    try builder.finish();
+}
+
+test "sstable build find" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try buildFixture(allocator, tmp.dir, "test.sst", 500);
+    var reader = try Reader.open(allocator, tmp.dir, "test.sst", 1);
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(u64, 500), reader.numEntries);
+    try std.testing.expect(reader.index.len > 1);
+
+    try std.testing.expectEqualStrings("payload-value", reader.find("k000000").?.value);
+    try std.testing.expectEqualStrings("payload-value", reader.find("k000499").?.value);
+    try std.testing.expectEqualStrings("payload-value", reader.find("k000250").?.value);
+    try std.testing.expectEqual(@as(?Record, null), reader.find("k000500"));
+    try std.testing.expectEqual(@as(?Record, null), reader.find("zzz"));
+    try std.testing.expectEqual(@as(?Record, null), reader.find("aaa"));
+}
+
+test "sstable cursor ordered scan" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try buildFixture(allocator, tmp.dir, "test.sst", 500);
+    var reader = try Reader.open(allocator, tmp.dir, "test.sst", 1);
+    defer reader.deinit();
+
+    var cur = reader.cursor(null);
+    var expected: usize = 0;
+    var buf: [16]u8 = undefined;
+    while (cur.valid()) : (cur.advance()) {
+        const key = try std.fmt.bufPrint(&buf, "k{d:0>6}", .{expected});
+        try std.testing.expectEqualStrings(key, cur.record().key);
+        expected += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 500), expected);
+}
+
+test "sstable cursor seek" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try buildFixture(allocator, tmp.dir, "test.sst", 500);
+    var reader = try Reader.open(allocator, tmp.dir, "test.sst", 1);
+    defer reader.deinit();
+
+    var cur = reader.cursor("k000123");
+    try std.testing.expectEqualStrings("k000123", cur.record().key);
+    cur.advance();
+    try std.testing.expectEqualStrings("k000124", cur.record().key);
+
+    var beyond = reader.cursor("k000600");
+    try std.testing.expect(!beyond.valid());
+}
+
+test "sstable reverse cursor descends fully" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try buildFixture(allocator, tmp.dir, "test.sst", 500);
+    var reader = try Reader.open(allocator, tmp.dir, "test.sst", 1);
+    defer reader.deinit();
+
+    var cur = try reader.reverseCursor(allocator, null, false);
+    defer cur.deinit();
+    var expected: usize = 500;
+    var buf: [16]u8 = undefined;
+    while (cur.valid()) : (cur.advance()) {
+        expected -= 1;
+        const key = try std.fmt.bufPrint(&buf, "k{d:0>6}", .{expected});
+        try std.testing.expectEqualStrings(key, cur.record().key);
+    }
+    try std.testing.expectEqual(@as(usize, 0), expected);
+}
+
+test "sstable reverse cursor honors upper bound" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try buildFixture(allocator, tmp.dir, "test.sst", 500);
+    var reader = try Reader.open(allocator, tmp.dir, "test.sst", 1);
+    defer reader.deinit();
+
+    var cur = try reader.reverseCursor(allocator, "k000100", false);
+    defer cur.deinit();
+    try std.testing.expectEqualStrings("k000099", cur.record().key);
+    cur.advance();
+    try std.testing.expectEqualStrings("k000098", cur.record().key);
+
+    var inclusive = try reader.reverseCursor(allocator, "k000100", true);
+    defer inclusive.deinit();
+    try std.testing.expectEqualStrings("k000100", inclusive.record().key);
+
+    var below = try reader.reverseCursor(allocator, "k000000", false);
+    defer below.deinit();
+    try std.testing.expect(!below.valid());
+}

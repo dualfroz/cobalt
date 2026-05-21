@@ -239,3 +239,101 @@ fn makeNode(allocator: Allocator, key: []const u8, value: []const u8, seq: u64, 
     while (i < level) : (i += 1) node.forward[i] = null;
     return node;
 }
+
+test "memtable put get" {
+    const allocator = std.testing.allocator;
+    var mt = try Memtable.init(allocator);
+    defer mt.deinit();
+
+    try mt.upsert(.value, 1, "banana", "yellow");
+    try mt.upsert(.value, 2, "apple", "red");
+    try mt.upsert(.value, 3, "cherry", "dark");
+
+    try std.testing.expectEqualStrings("red", mt.find("apple").?.value);
+    try std.testing.expectEqualStrings("yellow", mt.find("banana").?.value);
+    try std.testing.expectEqual(@as(?Record, null), mt.find("durian"));
+    try std.testing.expectEqual(@as(usize, 3), mt.count);
+}
+
+test "memtable overwrite and tombstone" {
+    const allocator = std.testing.allocator;
+    var mt = try Memtable.init(allocator);
+    defer mt.deinit();
+
+    try mt.upsert(.value, 1, "key", "first");
+    try mt.upsert(.value, 2, "key", "second");
+    try std.testing.expectEqualStrings("second", mt.find("key").?.value);
+    try std.testing.expectEqual(@as(usize, 1), mt.count);
+
+    try mt.upsert(.tombstone, 3, "key", "");
+    try std.testing.expectEqual(Kind.tombstone, mt.find("key").?.kind);
+}
+
+test "memtable sorted cursor" {
+    const allocator = std.testing.allocator;
+    var mt = try Memtable.init(allocator);
+    defer mt.deinit();
+
+    var buf: [16]u8 = undefined;
+    var i: usize = 200;
+    while (i > 0) : (i -= 1) {
+        const key = try std.fmt.bufPrint(&buf, "k{d:0>4}", .{i});
+        try mt.upsert(.value, i, key, "v");
+    }
+
+    var cur = mt.cursor(null);
+    var prev: [16]u8 = undefined;
+    var prevLen: usize = 0;
+    var seen: usize = 0;
+    while (cur.valid()) : (cur.advance()) {
+        const rec = cur.record();
+        if (prevLen > 0) try std.testing.expect(std.mem.order(u8, prev[0..prevLen], rec.key) == .lt);
+        @memcpy(prev[0..rec.key.len], rec.key);
+        prevLen = rec.key.len;
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 200), seen);
+}
+
+test "memtable cursor seek" {
+    const allocator = std.testing.allocator;
+    var mt = try Memtable.init(allocator);
+    defer mt.deinit();
+
+    try mt.upsert(.value, 1, "a", "1");
+    try mt.upsert(.value, 2, "c", "3");
+    try mt.upsert(.value, 3, "e", "5");
+
+    var cur = mt.cursor("b");
+    try std.testing.expectEqualStrings("c", cur.record().key);
+}
+
+test "memtable reverse cursor descends" {
+    const allocator = std.testing.allocator;
+    var mt = try Memtable.init(allocator);
+    defer mt.deinit();
+
+    var buf: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        const key = try std.fmt.bufPrint(&buf, "k{d:0>4}", .{i});
+        try mt.upsert(.value, i + 1, key, "v");
+    }
+
+    var cur = mt.cursorRev(null, false);
+    var expected: usize = 50;
+    var seen: usize = 0;
+    while (cur.valid()) : (cur.advance()) {
+        expected -= 1;
+        const key = try std.fmt.bufPrint(&buf, "k{d:0>4}", .{expected});
+        try std.testing.expectEqualStrings(key, cur.record().key);
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 50), seen);
+
+    var bounded = mt.cursorRev("k0010", false);
+    try std.testing.expectEqualStrings("k0009", bounded.record().key);
+
+    var inclusive = mt.cursorRev("k0010", true);
+    try std.testing.expectEqualStrings("k0010", inclusive.record().key);
+}

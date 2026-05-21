@@ -164,3 +164,114 @@ fn applyFrame(memtable: *Memtable, body: []const u8) !u64 {
     try memtable.upsert(kind, seq, key, value);
     return seq;
 }
+
+test "wal append and replay" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var wal = try Wal.open(allocator, tmp.dir, "wal.log");
+        defer wal.close();
+        try wal.append(.value, 1, "alpha", "one");
+        try wal.append(.value, 2, "bravo", "two");
+        try wal.append(.tombstone, 3, "alpha", "");
+        try wal.sync();
+    }
+
+    var wal = try Wal.open(allocator, tmp.dir, "wal.log");
+    defer wal.close();
+    var mt = try Memtable.init(allocator);
+    defer mt.deinit();
+    const maxSeq = try wal.replay(&mt);
+
+    try std.testing.expectEqual(@as(u64, 3), maxSeq);
+    try std.testing.expectEqual(Kind.tombstone, mt.find("alpha").?.kind);
+    try std.testing.expectEqualStrings("two", mt.find("bravo").?.value);
+}
+
+test "wal batch replay applies all ops" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var wal = try Wal.open(allocator, tmp.dir, "wal.log");
+        defer wal.close();
+        const ops = [_]Record{
+            .{ .key = "one", .value = "1", .seq = 10, .kind = .value },
+            .{ .key = "two", .value = "2", .seq = 11, .kind = .value },
+            .{ .key = "three", .value = "", .seq = 12, .kind = .tombstone },
+        };
+        try wal.appendBatch(&ops);
+        try wal.sync();
+    }
+
+    var wal = try Wal.open(allocator, tmp.dir, "wal.log");
+    defer wal.close();
+    var mt = try Memtable.init(allocator);
+    defer mt.deinit();
+    const maxSeq = try wal.replay(&mt);
+
+    try std.testing.expectEqual(@as(u64, 12), maxSeq);
+    try std.testing.expectEqualStrings("1", mt.find("one").?.value);
+    try std.testing.expectEqualStrings("2", mt.find("two").?.value);
+    try std.testing.expectEqual(Kind.tombstone, mt.find("three").?.kind);
+    try std.testing.expectEqual(@as(usize, 3), mt.count);
+}
+
+test "wal torn batch applies nothing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var wal = try Wal.open(allocator, tmp.dir, "wal.log");
+        defer wal.close();
+        try wal.append(.value, 1, "survivor", "kept");
+        try wal.sync();
+        const ops = [_]Record{
+            .{ .key = "gone-a", .value = "x", .seq = 2, .kind = .value },
+            .{ .key = "gone-b", .value = "y", .seq = 3, .kind = .value },
+        };
+        try wal.appendBatch(&ops);
+        try wal.sync();
+        try wal.file.setEndPos((try wal.file.getEndPos()) - 1);
+        try wal.sync();
+    }
+
+    var wal = try Wal.open(allocator, tmp.dir, "wal.log");
+    defer wal.close();
+    var mt = try Memtable.init(allocator);
+    defer mt.deinit();
+    _ = try wal.replay(&mt);
+
+    try std.testing.expectEqualStrings("kept", mt.find("survivor").?.value);
+    try std.testing.expectEqual(@as(?encode.Record, null), mt.find("gone-a"));
+    try std.testing.expectEqual(@as(?encode.Record, null), mt.find("gone-b"));
+    try std.testing.expectEqual(@as(usize, 1), mt.count);
+}
+
+test "wal ignores torn tail" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var wal = try Wal.open(allocator, tmp.dir, "wal.log");
+        defer wal.close();
+        try wal.append(.value, 1, "good", "data");
+        try wal.sync();
+        try wal.file.seekFromEnd(0);
+        try wal.file.writeAll(&[_]u8{ 0xff, 0xff, 0xff });
+        try wal.sync();
+    }
+
+    var wal = try Wal.open(allocator, tmp.dir, "wal.log");
+    defer wal.close();
+    var mt = try Memtable.init(allocator);
+    defer mt.deinit();
+    _ = try wal.replay(&mt);
+    try std.testing.expectEqualStrings("data", mt.find("good").?.value);
+    try std.testing.expectEqual(@as(usize, 1), mt.count);
+}
