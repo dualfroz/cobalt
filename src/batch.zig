@@ -44,3 +44,19 @@ pub const WriteBatch = struct {
         return self.ops.items.len;
     }
 };
+
+test "write batch accumulates typed ops" {
+    const allocator = std.testing.allocator;
+    var batch = WriteBatch.init(allocator);
+    defer batch.deinit();
+
+    try batch.put("alpha", "one");
+    try batch.put("bravo", "two");
+    try batch.delete("charlie");
+
+    try std.testing.expectEqual(@as(usize, 3), batch.count());
+    try std.testing.expectEqual(Kind.value, batch.ops.items[0].kind);
+    try std.testing.expectEqualStrings("bravo", batch.ops.items[1].key);
+    try std.testing.expectEqual(Kind.tombstone, batch.ops.items[2].kind);
+    try std.testing.expectEqual(@as(usize, 0), batch.ops.items[2].value.len);
+}

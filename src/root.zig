@@ -17,3 +17,17 @@ pub const BlockCache = @import("cache.zig").BlockCache;
 pub const compress = @import("compress.zig");
 pub const Transaction = @import("txn.zig").Transaction;
 pub const Stats = @import("stats.zig").Stats;
+
+test {
+    _ = @import("encode.zig");
+    _ = @import("bloom.zig");
+    _ = @import("memtable.zig");
+    _ = @import("wal.zig");
+    _ = @import("sstable.zig");
+    _ = @import("cache.zig");
+    _ = @import("batch.zig");
+    _ = @import("compress.zig");
+    _ = @import("txn.zig");
+    _ = @import("stats.zig");
+    _ = @import("db.zig");
+}

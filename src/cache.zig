@@ -119,3 +119,51 @@ pub const BlockCache = struct {
         if (self.tail == null) self.tail = node;
     }
 };
+
+test "block cache stores and serves" {
+    const allocator = std.testing.allocator;
+    var cache = BlockCache.init(allocator, 1024);
+    defer cache.deinit();
+
+    const key = BlockKey{ .fileId = 1, .offset = 0 };
+    try std.testing.expectEqual(@as(?[]const u8, null), cache.get(key));
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.misses);
+
+    try cache.put(key, "block-bytes");
+    const got = cache.get(key).?;
+    try std.testing.expectEqualStrings("block-bytes", got);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.hits);
+}
+
+test "block cache evicts least recently used" {
+    const allocator = std.testing.allocator;
+    var cache = BlockCache.init(allocator, 20);
+    defer cache.deinit();
+
+    const a = BlockKey{ .fileId = 1, .offset = 0 };
+    const b = BlockKey{ .fileId = 1, .offset = 100 };
+    const c = BlockKey{ .fileId = 1, .offset = 200 };
+
+    try cache.put(a, "0123456789");
+    try cache.put(b, "0123456789");
+    _ = cache.get(a);
+    try cache.put(c, "0123456789");
+
+    try std.testing.expect(cache.get(b) == null);
+    try std.testing.expect(cache.get(a) != null);
+    try std.testing.expect(cache.get(c) != null);
+}
+
+test "block cache keeps most recent under tiny capacity" {
+    const allocator = std.testing.allocator;
+    var cache = BlockCache.init(allocator, 1);
+    defer cache.deinit();
+
+    const a = BlockKey{ .fileId = 2, .offset = 0 };
+    const b = BlockKey{ .fileId = 2, .offset = 50 };
+    try cache.put(a, "big-payload");
+    try cache.put(b, "big-payload");
+
+    try std.testing.expect(cache.get(a) == null);
+    try std.testing.expect(cache.get(b) != null);
+}

@@ -96,3 +96,74 @@ pub fn decode(allocator: Allocator, codec: Codec, payload: []const u8, originalL
         .rle => rleDecompress(allocator, payload, originalLen),
     };
 }
+
+fn expectRoundtrip(allocator: Allocator, input: []const u8) !void {
+    const compressed = try rleCompress(allocator, input);
+    defer allocator.free(compressed);
+    const restored = try rleDecompress(allocator, compressed, input.len);
+    defer allocator.free(restored);
+    try std.testing.expectEqualSlices(u8, input, restored);
+}
+
+test "rle roundtrip on runs literals and mixed" {
+    const allocator = std.testing.allocator;
+    try expectRoundtrip(allocator, "");
+    try expectRoundtrip(allocator, "a");
+    try expectRoundtrip(allocator, "aaaaaaaaaa");
+    try expectRoundtrip(allocator, "abcdefghij");
+    try expectRoundtrip(allocator, "aaabbbcccdddeeefff");
+    try expectRoundtrip(allocator, "aaaaaXbbbbbYcccccZ");
+    try expectRoundtrip(allocator, &[_]u8{0} ** 300);
+    try expectRoundtrip(allocator, &[_]u8{0xff} ** 300);
+}
+
+test "rle roundtrip on random data" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x1234abcd);
+    const random = prng.random();
+    var buf: [4096]u8 = undefined;
+    var trial: usize = 0;
+    while (trial < 40) : (trial += 1) {
+        const len = random.intRangeAtMost(usize, 0, buf.len);
+        for (buf[0..len]) |*byte| byte.* = random.intRangeAtMost(u8, 0, 5);
+        try expectRoundtrip(allocator, buf[0..len]);
+    }
+}
+
+test "rle compresses repetitive payload" {
+    const allocator = std.testing.allocator;
+    const payload = "x" ** 1000;
+    const compressed = try rleCompress(allocator, payload);
+    defer allocator.free(compressed);
+    try std.testing.expect(compressed.len < payload.len / 10);
+}
+
+test "encode picks smaller representation" {
+    const allocator = std.testing.allocator;
+
+    const compressible = "y" ** 500;
+    const enc1 = try encode(allocator, compressible);
+    defer enc1.deinit(allocator);
+    try std.testing.expectEqual(Codec.rle, enc1.codec);
+    const back1 = try decode(allocator, enc1.codec, enc1.bytes, compressible.len);
+    defer allocator.free(back1);
+    try std.testing.expectEqualSlices(u8, compressible, back1);
+
+    var incompressible: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xfeed);
+    prng.random().bytes(&incompressible);
+    const enc2 = try encode(allocator, &incompressible);
+    defer enc2.deinit(allocator);
+    try std.testing.expectEqual(Codec.none, enc2.codec);
+    const back2 = try decode(allocator, enc2.codec, enc2.bytes, incompressible.len);
+    defer allocator.free(back2);
+    try std.testing.expectEqualSlices(u8, &incompressible, back2);
+}
+
+test "decompress rejects truncated stream" {
+    const allocator = std.testing.allocator;
+    const payload = "z" ** 200;
+    const compressed = try rleCompress(allocator, payload);
+    defer allocator.free(compressed);
+    try std.testing.expectError(error.CorruptBlock, rleDecompress(allocator, compressed[0 .. compressed.len - 1], payload.len));
+}

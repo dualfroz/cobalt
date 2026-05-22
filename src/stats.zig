@@ -46,3 +46,20 @@ pub const Stats = struct {
         }
     }
 };
+
+test "stats hit rate and deepest level" {
+    var stats = Stats{};
+    stats.cacheHits = 3;
+    stats.cacheMisses = 1;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), stats.cacheHitRate(), 1e-9);
+
+    stats.levels[0].tables = 2;
+    stats.levels[2].tables = 1;
+    try std.testing.expectEqual(@as(usize, 2), stats.deepestLevel());
+}
+
+test "empty stats hit rate is zero" {
+    const stats = Stats{};
+    try std.testing.expectEqual(@as(f64, 0), stats.cacheHitRate());
+    try std.testing.expectEqual(@as(usize, 0), stats.deepestLevel());
+}

@@ -76,3 +76,40 @@ pub const Bloom = struct {
         };
     }
 };
+
+test "bloom no false negatives" {
+    const allocator = std.testing.allocator;
+    var bloom = try Bloom.init(allocator, 1000, 0.01);
+    defer bloom.deinit();
+
+    var buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        const key = try std.fmt.bufPrint(&buf, "key-{d}", .{i});
+        bloom.add(key);
+    }
+    i = 0;
+    while (i < 1000) : (i += 1) {
+        const key = try std.fmt.bufPrint(&buf, "key-{d}", .{i});
+        try std.testing.expect(bloom.mayContain(key));
+    }
+}
+
+test "bloom serialize roundtrip" {
+    const allocator = std.testing.allocator;
+    var bloom = try Bloom.init(allocator, 100, 0.01);
+    defer bloom.deinit();
+    bloom.add("alpha");
+    bloom.add("bravo");
+
+    var out = std.ArrayList(u8).init(allocator);
+    defer out.deinit();
+    try bloom.serialize(encode.ByteWriter.init(&out));
+
+    var restored = try Bloom.deserialize(allocator, out.items);
+    defer restored.deinit();
+    try std.testing.expect(restored.mayContain("alpha"));
+    try std.testing.expect(restored.mayContain("bravo"));
+    try std.testing.expectEqual(bloom.bitCount, restored.bitCount);
+    try std.testing.expectEqual(bloom.hashCount, restored.hashCount);
+}

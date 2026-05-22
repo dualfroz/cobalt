@@ -885,3 +885,590 @@ fn parseSstId(name: []const u8) ?u64 {
     return std.fmt.parseInt(u64, digits, 10) catch null;
 }
 
+fn openTemp(tmp: *std.testing.TmpDir, allocator: Allocator, options: Options) !Db {
+    var pathBuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &pathBuf);
+    var dbPathBuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dbPath = try std.fmt.bufPrint(&dbPathBuf, "{s}/store", .{base});
+    return Db.open(allocator, dbPath, options);
+}
+
+test "put get delete" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try openTemp(&tmp, allocator, .{});
+    defer db.close();
+
+    try db.put("apple", "red");
+    try db.put("banana", "yellow");
+
+    const apple = (try db.get(allocator, "apple")).?;
+    defer allocator.free(apple);
+    try std.testing.expectEqualStrings("red", apple);
+
+    try db.put("apple", "green");
+    const apple2 = (try db.get(allocator, "apple")).?;
+    defer allocator.free(apple2);
+    try std.testing.expectEqualStrings("green", apple2);
+
+    try db.delete("apple");
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "apple"));
+
+    const banana = (try db.get(allocator, "banana")).?;
+    defer allocator.free(banana);
+    try std.testing.expectEqualStrings("yellow", banana);
+}
+
+test "wal recovery after reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try openTemp(&tmp, allocator, .{});
+        defer db.close();
+        try db.put("city", "warsaw");
+        try db.put("river", "vistula");
+        try db.delete("city");
+        try std.testing.expectEqual(@as(usize, 0), db.sstables.items.len);
+    }
+
+    var db = try openTemp(&tmp, allocator, .{});
+    defer db.close();
+    try std.testing.expectEqual(@as(usize, 0), db.sstables.items.len);
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "city"));
+    const river = (try db.get(allocator, "river")).?;
+    defer allocator.free(river);
+    try std.testing.expectEqualStrings("vistula", river);
+}
+
+test "flush to sstable and reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try openTemp(&tmp, allocator, .{ .flushThreshold = 64 });
+        defer db.close();
+        var buf: [16]u8 = undefined;
+        var i: usize = 0;
+        while (i < 200) : (i += 1) {
+            const key = try std.fmt.bufPrint(&buf, "k{d:0>5}", .{i});
+            try db.put(key, "value-payload");
+        }
+        try std.testing.expect(db.sstables.items.len > 0);
+    }
+
+    var db = try openTemp(&tmp, allocator, .{ .flushThreshold = 64 });
+    defer db.close();
+    var buf: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        const key = try std.fmt.bufPrint(&buf, "k{d:0>5}", .{i});
+        const got = (try db.get(allocator, key)).?;
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings("value-payload", got);
+    }
+}
+
+test "compaction dedups and drops tombstones" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try openTemp(&tmp, allocator, .{ .flushThreshold = 1 });
+    defer db.close();
+
+    try db.put("a", "1");
+    try db.put("b", "2");
+    try db.put("c", "3");
+    try db.put("d", "4");
+    try db.put("a", "11");
+    try db.delete("c");
+    try db.flush();
+
+    try std.testing.expect(db.sstables.items.len > 1);
+    try db.compact();
+    try std.testing.expectEqual(@as(usize, 1), db.sstables.items.len);
+
+    const a = (try db.get(allocator, "a")).?;
+    defer allocator.free(a);
+    try std.testing.expectEqualStrings("11", a);
+
+    const b = (try db.get(allocator, "b")).?;
+    defer allocator.free(b);
+    try std.testing.expectEqualStrings("2", b);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "c"));
+
+    const d = (try db.get(allocator, "d")).?;
+    defer allocator.free(d);
+    try std.testing.expectEqualStrings("4", d);
+}
+
+test "scan merges memtable and sstable with tombstones" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try openTemp(&tmp, allocator, .{});
+    defer db.close();
+
+    try db.put("a", "1");
+    try db.put("b", "2");
+    try db.put("c", "3");
+    try db.put("d", "4");
+    try db.put("e", "5");
+    try db.flush();
+
+    try db.put("c", "cNew");
+    try db.delete("b");
+
+    var iter = try db.scan(allocator, null, null);
+    defer iter.deinit();
+
+    const expectedKeys = [_][]const u8{ "a", "c", "d", "e" };
+    const expectedVals = [_][]const u8{ "1", "cNew", "4", "5" };
+    var idx: usize = 0;
+    while (try iter.next()) |item| {
+        try std.testing.expect(idx < expectedKeys.len);
+        try std.testing.expectEqualStrings(expectedKeys[idx], item.key);
+        try std.testing.expectEqualStrings(expectedVals[idx], item.value);
+        idx += 1;
+    }
+    try std.testing.expectEqual(expectedKeys.len, idx);
+}
+
+test "scan honors range bounds" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try openTemp(&tmp, allocator, .{ .flushThreshold = 32 });
+    defer db.close();
+
+    var keyBuf: [8]u8 = undefined;
+    var i: usize = 0;
+    while (i < 26) : (i += 1) {
+        const key = try std.fmt.bufPrint(&keyBuf, "{c}", .{@as(u8, 'a') + @as(u8, @intCast(i))});
+        try db.put(key, "x");
+    }
+
+    var iter = try db.scan(allocator, "d", "h");
+    defer iter.deinit();
+    const expected = [_][]const u8{ "d", "e", "f", "g" };
+    var idx: usize = 0;
+    while (try iter.next()) |item| {
+        try std.testing.expect(idx < expected.len);
+        try std.testing.expectEqualStrings(expected[idx], item.key);
+        idx += 1;
+    }
+    try std.testing.expectEqual(expected.len, idx);
+}
+
+test "snapshot reads pre-overwrite value" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try openTemp(&tmp, allocator, .{});
+    defer db.close();
+
+    try db.put("color", "red");
+    try db.put("shape", "circle");
+
+    var snap = try db.snapshot();
+
+    try db.put("color", "green");
+    try db.delete("shape");
+    try db.put("color", "blue");
+
+    const snapColor = (try snap.get(allocator, "color")).?;
+    defer allocator.free(snapColor);
+    try std.testing.expectEqualStrings("red", snapColor);
+
+    const snapShape = (try snap.get(allocator, "shape")).?;
+    defer allocator.free(snapShape);
+    try std.testing.expectEqualStrings("circle", snapShape);
+
+    const liveColor = (try db.get(allocator, "color")).?;
+    defer allocator.free(liveColor);
+    try std.testing.expectEqualStrings("blue", liveColor);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "shape"));
+
+    var snapIter = try snap.scan(allocator, null, null);
+    defer snapIter.deinit();
+    var snapCount: usize = 0;
+    while (try snapIter.next()) |entry| {
+        if (std.mem.eql(u8, entry.key, "color")) try std.testing.expectEqualStrings("red", entry.value);
+        snapCount += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), snapCount);
+}
+
+test "write batch applies all or nothing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try openTemp(&tmp, allocator, .{});
+        defer db.close();
+
+        try db.put("existing", "keep");
+        const seqBefore = db.nextSeq;
+
+        var batch = WriteBatch.init(allocator);
+        defer batch.deinit();
+        try batch.put("one", "1");
+        try batch.put("two", "2");
+        try batch.put("three", "3");
+        try batch.delete("existing");
+        try db.apply(&batch);
+
+        try std.testing.expectEqual(seqBefore + 4, db.nextSeq);
+
+        const one = (try db.get(allocator, "one")).?;
+        defer allocator.free(one);
+        try std.testing.expectEqualStrings("1", one);
+        const three = (try db.get(allocator, "three")).?;
+        defer allocator.free(three);
+        try std.testing.expectEqualStrings("3", three);
+        try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "existing"));
+    }
+
+    var db = try openTemp(&tmp, allocator, .{});
+    defer db.close();
+    const two = (try db.get(allocator, "two")).?;
+    defer allocator.free(two);
+    try std.testing.expectEqualStrings("2", two);
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "existing"));
+}
+
+test "block cache serves repeated reads" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try openTemp(&tmp, allocator, .{});
+    defer db.close();
+
+    try db.put("alpha", "one");
+    try db.put("bravo", "two");
+    try db.flush();
+
+    const first = (try db.get(allocator, "alpha")).?;
+    allocator.free(first);
+    try std.testing.expect(db.blockCache.stats.misses >= 1);
+
+    const hitsBefore = db.blockCache.stats.hits;
+    const second = (try db.get(allocator, "alpha")).?;
+    allocator.free(second);
+    try std.testing.expect(db.blockCache.stats.hits > hitsBefore);
+}
+
+test "leveled compaction keeps levels disjoint and drops bottom tombstones" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try openTemp(&tmp, allocator, .{
+        .flushThreshold = 512,
+        .l0CompactionTrigger = 2,
+        .l1BaseBytes = 4 * 1024 * 1024,
+        .sstableTargetBytes = 2048,
+    });
+    defer db.close();
+
+    var keyBuf: [16]u8 = undefined;
+    const payload = "x" ** 120;
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        const key = try std.fmt.bufPrint(&keyBuf, "key:{d:0>4}", .{i});
+        try db.put(key, payload);
+    }
+    try db.delete("key:0005");
+    try db.delete("key:0025");
+    try db.flush();
+
+    try db.maybeCompact();
+
+    try std.testing.expectEqual(@as(usize, 0), db.countLevel(0));
+    try std.testing.expect(db.sstables.items.len >= 2);
+
+    var live: usize = 0;
+    var totalEntries: u64 = 0;
+    for (db.sstables.items) |reader| {
+        try std.testing.expect(reader.level >= 1);
+        totalEntries += reader.numEntries;
+    }
+
+    var levelOneReaders = std.ArrayList(*Reader).init(allocator);
+    defer levelOneReaders.deinit();
+    for (db.sstables.items) |reader| {
+        if (reader.level == 1) try levelOneReaders.append(reader);
+    }
+    std.mem.sort(*Reader, levelOneReaders.items, {}, lessByMinKey);
+    var r: usize = 1;
+    while (r < levelOneReaders.items.len) : (r += 1) {
+        try std.testing.expect(order(levelOneReaders.items[r - 1].maxKey, levelOneReaders.items[r].minKey) == .lt);
+    }
+
+    i = 0;
+    while (i < 60) : (i += 1) {
+        const key = try std.fmt.bufPrint(&keyBuf, "key:{d:0>4}", .{i});
+        if (i == 5 or i == 25) {
+            try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, key));
+        } else {
+            const got = (try db.get(allocator, key)).?;
+            defer allocator.free(got);
+            try std.testing.expectEqualStrings(payload, got);
+            live += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 58), live);
+    try std.testing.expectEqual(@as(u64, 58), totalEntries);
+}
+
+fn lessByMinKey(_: void, a: *Reader, b: *Reader) bool {
+    return order(a.minKey, b.minKey) == .lt;
+}
+
+fn lessString(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+test "reverse scan yields descending order merging sources" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try openTemp(&tmp, allocator, .{ .flushThreshold = 48 });
+    defer db.close();
+
+    var keyBuf: [8]u8 = undefined;
+    var i: usize = 0;
+    while (i < 26) : (i += 1) {
+        const key = try std.fmt.bufPrint(&keyBuf, "{c}", .{@as(u8, 'a') + @as(u8, @intCast(i))});
+        try db.put(key, "old");
+    }
+    try db.put("m", "fresh");
+    try db.delete("d");
+
+    var iter = try db.scanReverse(allocator, .{});
+    defer iter.deinit();
+    var prev: [8]u8 = undefined;
+    var prevLen: usize = 0;
+    var count: usize = 0;
+    var sawFreshM = false;
+    var sawD = false;
+    while (try iter.next()) |entry| {
+        if (prevLen > 0) try std.testing.expect(order(entry.key, prev[0..prevLen]) == .lt);
+        @memcpy(prev[0..entry.key.len], entry.key);
+        prevLen = entry.key.len;
+        if (std.mem.eql(u8, entry.key, "m")) {
+            try std.testing.expectEqualStrings("fresh", entry.value);
+            sawFreshM = true;
+        }
+        if (std.mem.eql(u8, entry.key, "d")) sawD = true;
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 25), count);
+    try std.testing.expect(sawFreshM);
+    try std.testing.expect(!sawD);
+}
+
+test "prefix scan isolates a namespace" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try openTemp(&tmp, allocator, .{ .flushThreshold = 64 });
+    defer db.close();
+
+    try db.put("user:alice", "1");
+    try db.put("user:bob", "2");
+    try db.put("user:carol", "3");
+    try db.put("post:1", "x");
+    try db.put("userx", "y");
+    try db.put("zzz", "z");
+
+    var iter = try db.scanPrefix(allocator, "user:");
+    defer iter.deinit();
+    const expected = [_][]const u8{ "user:alice", "user:bob", "user:carol" };
+    var idx: usize = 0;
+    while (try iter.next()) |entry| {
+        try std.testing.expect(idx < expected.len);
+        try std.testing.expectEqualStrings(expected[idx], entry.key);
+        idx += 1;
+    }
+    try std.testing.expectEqual(expected.len, idx);
+}
+
+test "inclusive and exclusive bounds" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try openTemp(&tmp, allocator, .{});
+    defer db.close();
+
+    var keyBuf: [8]u8 = undefined;
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const key = try std.fmt.bufPrint(&keyBuf, "k{d}", .{i});
+        try db.put(key, "v");
+    }
+
+    {
+        var iter = try db.scanRange(allocator, .{ .start = "k2", .end = "k5", .startInclusive = true, .endInclusive = true });
+        defer iter.deinit();
+        const expected = [_][]const u8{ "k2", "k3", "k4", "k5" };
+        var idx: usize = 0;
+        while (try iter.next()) |entry| {
+            try std.testing.expectEqualStrings(expected[idx], entry.key);
+            idx += 1;
+        }
+        try std.testing.expectEqual(expected.len, idx);
+    }
+    {
+        var iter = try db.scanRange(allocator, .{ .start = "k2", .end = "k5", .startInclusive = false, .endInclusive = false });
+        defer iter.deinit();
+        const expected = [_][]const u8{ "k3", "k4" };
+        var idx: usize = 0;
+        while (try iter.next()) |entry| {
+            try std.testing.expectEqualStrings(expected[idx], entry.key);
+            idx += 1;
+        }
+        try std.testing.expectEqual(expected.len, idx);
+    }
+}
+
+fn setLive(map: *std.StringHashMap([]const u8), arena: Allocator, key: []const u8, value: []const u8) !void {
+    const gop = try map.getOrPut(key);
+    if (!gop.found_existing) gop.key_ptr.* = try arena.dupe(u8, key);
+    gop.value_ptr.* = try arena.dupe(u8, value);
+}
+
+test "scan matches sorted reference across flush restart and compaction" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var refArena = std.heap.ArenaAllocator.init(allocator);
+    defer refArena.deinit();
+    const arena = refArena.allocator();
+
+    var live = std.StringHashMap([]const u8).init(allocator);
+    defer live.deinit();
+
+    const keyspace = 300;
+    const ops = 4000;
+    var prng = std.Random.DefaultPrng.init(0xC0BA17);
+    const random = prng.random();
+
+    {
+        var db = try openTemp(&tmp, allocator, .{ .flushThreshold = 2048, .sstableTargetBytes = 1024 });
+        defer db.close();
+
+        var keyBuf: [16]u8 = undefined;
+        var valBuf: [24]u8 = undefined;
+        var op: usize = 0;
+        while (op < ops) : (op += 1) {
+            const id = random.intRangeLessThan(usize, 0, keyspace);
+            const key = try std.fmt.bufPrint(&keyBuf, "key:{d:0>6}", .{id});
+            if (random.intRangeLessThan(usize, 0, 10) < 3) {
+                try db.delete(key);
+                _ = live.remove(key);
+            } else {
+                const value = try std.fmt.bufPrint(&valBuf, "val-{d}-{d}", .{ id, random.int(u16) });
+                try db.put(key, value);
+                try setLive(&live, arena, key, value);
+            }
+            if (random.intRangeLessThan(usize, 0, 200) == 0) try db.flush();
+        }
+        try db.maybeCompact();
+    }
+
+    var db = try openTemp(&tmp, allocator, .{ .flushThreshold = 2048, .sstableTargetBytes = 1024 });
+    defer db.close();
+
+    var sortedKeys = std.ArrayList([]const u8).init(allocator);
+    defer sortedKeys.deinit();
+    var keyIt = live.keyIterator();
+    while (keyIt.next()) |key| try sortedKeys.append(key.*);
+    std.mem.sort([]const u8, sortedKeys.items, {}, lessString);
+
+    var forward = try db.scan(allocator, null, null);
+    defer forward.deinit();
+    var idx: usize = 0;
+    while (try forward.next()) |entry| {
+        try std.testing.expect(idx < sortedKeys.items.len);
+        try std.testing.expectEqualStrings(sortedKeys.items[idx], entry.key);
+        try std.testing.expectEqualStrings(live.get(entry.key).?, entry.value);
+        idx += 1;
+    }
+    try std.testing.expectEqual(sortedKeys.items.len, idx);
+
+    var reverse = try db.scanReverse(allocator, .{});
+    defer reverse.deinit();
+    idx = sortedKeys.items.len;
+    while (try reverse.next()) |entry| {
+        try std.testing.expect(idx > 0);
+        idx -= 1;
+        try std.testing.expectEqualStrings(sortedKeys.items[idx], entry.key);
+        try std.testing.expectEqualStrings(live.get(entry.key).?, entry.value);
+    }
+    try std.testing.expectEqual(@as(usize, 0), idx);
+
+    for (sortedKeys.items) |key| {
+        const got = (try db.get(allocator, key)).?;
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(live.get(key).?, got);
+    }
+}
+
+test "crash recovery honors wal durability boundary" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const total = 8;
+    {
+        var db = try openTemp(&tmp, allocator, .{});
+        defer db.close();
+        var keyBuf: [8]u8 = undefined;
+        var i: usize = 0;
+        while (i < total) : (i += 1) {
+            const key = try std.fmt.bufPrint(&keyBuf, "wkey{d}", .{i});
+            try db.put(key, "durable");
+        }
+        try std.testing.expectEqual(@as(usize, 0), db.sstables.items.len);
+    }
+
+    {
+        const walFile = try tmp.dir.openFile("store/wal.log", .{ .mode = .read_write });
+        defer walFile.close();
+        const size = try walFile.getEndPos();
+        try walFile.setEndPos(size - 1);
+        try walFile.sync();
+    }
+
+    var db = try openTemp(&tmp, allocator, .{});
+    defer db.close();
+
+    var keyBuf: [8]u8 = undefined;
+    var i: usize = 0;
+    while (i < total - 1) : (i += 1) {
+        const key = try std.fmt.bufPrint(&keyBuf, "wkey{d}", .{i});
+        const got = (try db.get(allocator, key)).?;
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings("durable", got);
+    }
+    const lastKey = try std.fmt.bufPrint(&keyBuf, "wkey{d}", .{total - 1});
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, lastKey));
+}
