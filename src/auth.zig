@@ -162,3 +162,159 @@ pub const Store = struct {
         try self.db.put(key, &encoded);
     }
 
+    fn mustGet(self: Store, allocator: Allocator, key: []const u8) !UserRecord {
+        const raw = try self.db.get(allocator, key) orelse return error.UserNotFound;
+        defer allocator.free(raw);
+        return UserRecord.decode(raw);
+    }
+
+    pub fn setPassword(self: Store, allocator: Allocator, username: []const u8, newPassword: []const u8, rounds: u32) !void {
+        const key = try userKey(allocator, username);
+        defer allocator.free(key);
+        var record = try self.mustGet(allocator, key);
+        record.rounds = rounds;
+        record.salt = randomSalt();
+        record.hash = try hashPassword(newPassword, record.salt, rounds);
+        const encoded = record.encode();
+        try self.db.put(key, &encoded);
+    }
+
+    pub fn setRole(self: Store, allocator: Allocator, username: []const u8, role: Role) !void {
+        const key = try userKey(allocator, username);
+        defer allocator.free(key);
+        var record = try self.mustGet(allocator, key);
+        record.role = role;
+        const encoded = record.encode();
+        try self.db.put(key, &encoded);
+    }
+
+    pub fn deleteUser(self: Store, allocator: Allocator, username: []const u8) !void {
+        const key = try userKey(allocator, username);
+        defer allocator.free(key);
+        _ = try self.mustGet(allocator, key);
+        try self.db.delete(key);
+    }
+
+    /// Verifies `password` for `username`, returning the stored role on
+    /// success. See `dummySalt`/`dummyRounds` for why a missing user still
+    /// pays a full PBKDF2 pass before failing. The final comparison uses
+    /// `std.crypto.utils.timingSafeEql` rather than `std.mem.eql`, since an
+    /// early-exit byte comparison on the hash would leak how many leading
+    /// bytes matched to a network attacker timing repeated attempts.
+    pub fn verify(self: Store, allocator: Allocator, username: []const u8, password: []const u8) !Role {
+        const key = try userKey(allocator, username);
+        defer allocator.free(key);
+        const raw = try self.db.get(allocator, key) orelse {
+            _ = hashPassword(password, dummySalt, dummyRounds) catch {};
+            return error.InvalidCredentials;
+        };
+        defer allocator.free(raw);
+        const record = try UserRecord.decode(raw);
+        const candidate = try hashPassword(password, record.salt, record.rounds);
+        if (!std.crypto.utils.timingSafeEql([hashLen]u8, candidate, record.hash)) return error.InvalidCredentials;
+        return record.role;
+    }
+
+    /// Whether at least one admin account exists - `main.zig` uses this to
+    /// refuse turning on server-side auth enforcement until an operator has
+    /// created a way back in, so enabling `--auth` can never lock everyone
+    /// out of a fresh database.
+    pub fn hasAnyAdmin(self: Store, allocator: Allocator) !bool {
+        var it = try self.db.scanPrefix(allocator, &userPrefixBytes);
+        defer it.deinit();
+        while (try it.next()) |entry| {
+            const record = UserRecord.decode(entry.value) catch continue;
+            if (record.role == .admin) return true;
+        }
+        return false;
+    }
+
+    /// Returns every user with their role, independently owned - free with
+    /// `freeUserList`. Order follows key order (lexicographic by username).
+    pub fn listUsers(self: Store, allocator: Allocator) ![]UserInfo {
+        var it = try self.db.scanPrefix(allocator, &userPrefixBytes);
+        defer it.deinit();
+        var out = std.ArrayList(UserInfo).init(allocator);
+        errdefer {
+            for (out.items) |u| u.deinit(allocator);
+            out.deinit();
+        }
+        while (try it.next()) |entry| {
+            const record = UserRecord.decode(entry.value) catch continue;
+            const uname = entry.key[userPrefixBytes.len..];
+            try out.append(.{ .username = try allocator.dupe(u8, uname), .role = record.role });
+        }
+        return out.toOwnedSlice();
+    }
+};
+
+fn testDb(allocator: Allocator, dir: std.fs.Dir) !Db {
+    const path = try dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    return Db.open(allocator, path, .{});
+}
+
+test "role ordering is a total order across readonly/readwrite/admin" {
+    try std.testing.expect(Role.readwrite.atLeast(.readonly));
+    try std.testing.expect(Role.admin.atLeast(.readonly));
+    try std.testing.expect(Role.admin.atLeast(.readwrite));
+    try std.testing.expect(Role.admin.atLeast(.admin));
+    try std.testing.expect(!Role.readonly.atLeast(.readwrite));
+    try std.testing.expect(!Role.readwrite.atLeast(.admin));
+}
+
+test "Role.parse rejects an unknown role name" {
+    try std.testing.expectEqual(Role.admin, try Role.parse("admin"));
+    try std.testing.expectError(error.Malformed, Role.parse("superuser"));
+}
+
+test "createUser then verify accepts the correct password" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try testDb(allocator, tmp.dir);
+    defer db.close();
+
+    const store = Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readwrite, 16);
+
+    const role = try store.verify(allocator, "alice", "hunter2");
+    try std.testing.expectEqual(Role.readwrite, role);
+}
+
+test "verify rejects a wrong password without revealing which part was wrong" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try testDb(allocator, tmp.dir);
+    defer db.close();
+
+    const store = Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readonly, 16);
+
+    try std.testing.expectError(error.InvalidCredentials, store.verify(allocator, "alice", "wrong"));
+}
+
+test "verify rejects an unknown username the same way as a wrong password" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try testDb(allocator, tmp.dir);
+    defer db.close();
+
+    const store = Store.init(&db);
+    try std.testing.expectError(error.InvalidCredentials, store.verify(allocator, "ghost", "anything"));
+}
+
+test "createUser rejects a duplicate username" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try testDb(allocator, tmp.dir);
+    defer db.close();
+
+    const store = Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readonly, 16);
+    try std.testing.expectError(error.UserExists, store.createUser(allocator, "alice", "different", .admin, 16));
+}
+
