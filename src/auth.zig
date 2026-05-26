@@ -318,3 +318,133 @@ test "createUser rejects a duplicate username" {
     try std.testing.expectError(error.UserExists, store.createUser(allocator, "alice", "different", .admin, 16));
 }
 
+test "setPassword replaces the password and invalidates the old one" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try testDb(allocator, tmp.dir);
+    defer db.close();
+
+    const store = Store.init(&db);
+    try store.createUser(allocator, "alice", "old-pass", .readonly, 16);
+    try store.setPassword(allocator, "alice", "new-pass", 16);
+
+    try std.testing.expectError(error.InvalidCredentials, store.verify(allocator, "alice", "old-pass"));
+    try std.testing.expectEqual(Role.readonly, try store.verify(allocator, "alice", "new-pass"));
+}
+
+test "setPassword on a missing user reports UserNotFound" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try testDb(allocator, tmp.dir);
+    defer db.close();
+
+    const store = Store.init(&db);
+    try std.testing.expectError(error.UserNotFound, store.setPassword(allocator, "ghost", "x", 16));
+}
+
+test "setRole changes role without disturbing the password" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try testDb(allocator, tmp.dir);
+    defer db.close();
+
+    const store = Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readonly, 16);
+    try store.setRole(allocator, "alice", .admin);
+
+    try std.testing.expectEqual(Role.admin, try store.verify(allocator, "alice", "hunter2"));
+}
+
+test "deleteUser removes the account so verify and mustGet both fail" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try testDb(allocator, tmp.dir);
+    defer db.close();
+
+    const store = Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readonly, 16);
+    try store.deleteUser(allocator, "alice");
+
+    try std.testing.expectError(error.InvalidCredentials, store.verify(allocator, "alice", "hunter2"));
+    try std.testing.expectError(error.UserNotFound, store.deleteUser(allocator, "alice"));
+}
+
+test "hasAnyAdmin reflects whether any created user carries the admin role" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try testDb(allocator, tmp.dir);
+    defer db.close();
+
+    const store = Store.init(&db);
+    try std.testing.expect(!(try store.hasAnyAdmin(allocator)));
+
+    try store.createUser(allocator, "alice", "hunter2", .readwrite, 16);
+    try std.testing.expect(!(try store.hasAnyAdmin(allocator)));
+
+    try store.createUser(allocator, "root", "toor", .admin, 16);
+    try std.testing.expect(try store.hasAnyAdmin(allocator));
+}
+
+test "listUsers returns every account with its role" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try testDb(allocator, tmp.dir);
+    defer db.close();
+
+    const store = Store.init(&db);
+    try store.createUser(allocator, "alice", "a-pass", .readonly, 16);
+    try store.createUser(allocator, "bob", "b-pass", .readwrite, 16);
+    try store.createUser(allocator, "root", "r-pass", .admin, 16);
+
+    const users = try store.listUsers(allocator);
+    defer freeUserList(allocator, users);
+    try std.testing.expectEqual(@as(usize, 3), users.len);
+
+    var sawAdmin = false;
+    for (users) |u| {
+        if (std.mem.eql(u8, u.username, "root")) {
+            try std.testing.expectEqual(Role.admin, u.role);
+            sawAdmin = true;
+        }
+    }
+    try std.testing.expect(sawAdmin);
+}
+
+test "users survive a Db close and reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try testDb(allocator, tmp.dir);
+        defer db.close();
+        const store = Store.init(&db);
+        try store.createUser(allocator, "alice", "hunter2", .admin, 16);
+    }
+
+    var db = try testDb(allocator, tmp.dir);
+    defer db.close();
+    const store = Store.init(&db);
+    try std.testing.expectEqual(Role.admin, try store.verify(allocator, "alice", "hunter2"));
+}
+
+test "a malformed stored record is reported as Malformed, not a crash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try testDb(allocator, tmp.dir);
+    defer db.close();
+
+    const key = try userKey(allocator, "alice");
+    defer allocator.free(key);
+    try db.put(key, "too short to be a real record");
+
+    const store = Store.init(&db);
+    try std.testing.expectError(error.Malformed, store.verify(allocator, "alice", "anything"));
+}
