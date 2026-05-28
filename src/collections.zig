@@ -159,3 +159,478 @@ pub fn dropCollection(db: *Db, allocator: Allocator, k: Kind, name: []const u8) 
         return 1;
     }
 
+    const p = try genericPrefix(allocator, k, name);
+    defer allocator.free(p);
+
+    var keys = std.ArrayList([]u8).init(allocator);
+    defer {
+        for (keys.items) |kk| allocator.free(kk);
+        keys.deinit();
+    }
+    {
+        // Collect first, delete after: db.delete mid-scan would mutate the
+        // memtable structure a live RangeIterator's cursors are threaded
+        // through (same reasoning as ttl.zig's sweepExpired).
+        var it = try db.scanPrefix(allocator, p);
+        defer it.deinit();
+        while (try it.next()) |entry| {
+            try keys.append(try allocator.dupe(u8, entry.key));
+        }
+    }
+    for (keys.items) |kk| try db.delete(kk);
+    return keys.items.len;
+}
+
+fn prefixUpperBound(allocator: Allocator, prefix: []const u8) !?[]u8 {
+    var end = prefix.len;
+    while (end > 0 and prefix[end - 1] == 0xff) end -= 1;
+    if (end == 0) return null;
+    const upper = try allocator.alloc(u8, end);
+    @memcpy(upper, prefix[0..end]);
+    upper[end - 1] += 1;
+    return upper;
+}
+
+// ---------------------------------------------------------------------
+// Counter
+// ---------------------------------------------------------------------
+
+pub const Counter = struct {
+    fn key(allocator: Allocator, name: []const u8) ![]u8 {
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        try out.append(nsTag);
+        try appendSegment(&out, "C");
+        try out.appendSlice(name);
+        return out.toOwnedSlice();
+    }
+
+    pub fn get(db: *Db, allocator: Allocator, name: []const u8) !i64 {
+        const k = try key(allocator, name);
+        defer allocator.free(k);
+        const raw = try db.get(allocator, k) orelse return 0;
+        defer allocator.free(raw);
+        return readI64(raw);
+    }
+
+    pub fn set(db: *Db, allocator: Allocator, name: []const u8, value: i64) !void {
+        const k = try key(allocator, name);
+        defer allocator.free(k);
+        var out = std.ArrayList(u8).init(allocator);
+        defer out.deinit();
+        try putI64(&out, value);
+        try db.put(k, out.items);
+    }
+
+    /// Atomically adds `delta` to the counter (creating it at 0 if absent)
+    /// and returns the new value. Uses an OCC transaction so concurrent
+    /// increments never lose an update to a lost read-modify-write race.
+    pub fn incrBy(db: *Db, allocator: Allocator, name: []const u8, delta: i64) !i64 {
+        const k = try key(allocator, name);
+        defer allocator.free(k);
+
+        var attempt: usize = 0;
+        while (attempt < maxConflictRetries) : (attempt += 1) {
+            var txn = Transaction.begin(db);
+            defer txn.deinit();
+
+            const current: i64 = blk: {
+                const raw = try txn.get(allocator, k) orelse break :blk 0;
+                defer allocator.free(raw);
+                break :blk try readI64(raw);
+            };
+            const next = current + delta;
+
+            var out = std.ArrayList(u8).init(allocator);
+            defer out.deinit();
+            try putI64(&out, next);
+            try txn.put(k, out.items);
+
+            txn.commit() catch |err| {
+                if (err == error.Conflict) continue;
+                return err;
+            };
+            return next;
+        }
+        return error.TooManyConflicts;
+    }
+};
+
+// ---------------------------------------------------------------------
+// Hash
+// ---------------------------------------------------------------------
+
+pub const HashField = struct {
+    field: []u8,
+    value: []u8,
+
+    pub fn free(self: HashField, allocator: Allocator) void {
+        allocator.free(self.field);
+        allocator.free(self.value);
+    }
+};
+
+pub const Hash = struct {
+    fn prefix(allocator: Allocator, name: []const u8) ![]u8 {
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        try out.append(nsTag);
+        try appendSegment(&out, "H");
+        try appendSegment(&out, name);
+        return out.toOwnedSlice();
+    }
+
+    fn fieldKey(allocator: Allocator, name: []const u8, field: []const u8) ![]u8 {
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        try out.append(nsTag);
+        try appendSegment(&out, "H");
+        try appendSegment(&out, name);
+        try out.appendSlice(field);
+        return out.toOwnedSlice();
+    }
+
+    /// Sets a field, returning true if the field was newly created.
+    pub fn set(db: *Db, allocator: Allocator, name: []const u8, field: []const u8, value: []const u8) !bool {
+        const k = try fieldKey(allocator, name, field);
+        defer allocator.free(k);
+        const existing = try db.get(allocator, k);
+        if (existing) |raw| allocator.free(raw);
+        try db.put(k, value);
+        return existing == null;
+    }
+
+    pub fn get(db: *Db, allocator: Allocator, name: []const u8, field: []const u8) !?[]u8 {
+        const k = try fieldKey(allocator, name, field);
+        defer allocator.free(k);
+        return db.get(allocator, k);
+    }
+
+    pub fn exists(db: *Db, allocator: Allocator, name: []const u8, field: []const u8) !bool {
+        const raw = try get(db, allocator, name, field) orelse return false;
+        allocator.free(raw);
+        return true;
+    }
+
+    /// Deletes a field, returning true if it existed.
+    pub fn del(db: *Db, allocator: Allocator, name: []const u8, field: []const u8) !bool {
+        const existed = try exists(db, allocator, name, field);
+        if (!existed) return false;
+        const k = try fieldKey(allocator, name, field);
+        defer allocator.free(k);
+        try db.delete(k);
+        return true;
+    }
+
+    pub fn len(db: *Db, allocator: Allocator, name: []const u8) !usize {
+        const p = try prefix(allocator, name);
+        defer allocator.free(p);
+        var it = try db.scanPrefix(allocator, p);
+        defer it.deinit();
+        var count: usize = 0;
+        while (try it.next()) |_| count += 1;
+        return count;
+    }
+
+    /// Returns every field/value pair currently stored under `name`. Caller
+    /// owns the returned slice and each entry's `field`/`value` buffers.
+    pub fn getAll(db: *Db, allocator: Allocator, name: []const u8) ![]HashField {
+        const p = try prefix(allocator, name);
+        defer allocator.free(p);
+
+        var results = std.ArrayList(HashField).init(allocator);
+        errdefer {
+            for (results.items) |f| f.free(allocator);
+            results.deinit();
+        }
+
+        var it = try db.scanPrefix(allocator, p);
+        defer it.deinit();
+        while (try it.next()) |entry| {
+            const field = try allocator.dupe(u8, entry.key[p.len..]);
+            errdefer allocator.free(field);
+            const value = try allocator.dupe(u8, entry.value);
+            try results.append(.{ .field = field, .value = value });
+        }
+        return results.toOwnedSlice();
+    }
+};
+
+// ---------------------------------------------------------------------
+// Set
+// ---------------------------------------------------------------------
+
+pub const Set = struct {
+    fn prefix(allocator: Allocator, name: []const u8) ![]u8 {
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        try out.append(nsTag);
+        try appendSegment(&out, "S");
+        try appendSegment(&out, name);
+        return out.toOwnedSlice();
+    }
+
+    fn memberKey(allocator: Allocator, name: []const u8, member: []const u8) ![]u8 {
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        try out.append(nsTag);
+        try appendSegment(&out, "S");
+        try appendSegment(&out, name);
+        try out.appendSlice(member);
+        return out.toOwnedSlice();
+    }
+
+    /// Returns true if the member was newly added (false if already present).
+    pub fn add(db: *Db, allocator: Allocator, name: []const u8, member: []const u8) !bool {
+        if (try isMember(db, allocator, name, member)) return false;
+        const k = try memberKey(allocator, name, member);
+        defer allocator.free(k);
+        try db.put(k, &.{});
+        return true;
+    }
+
+    /// Returns true if the member was present and has been removed.
+    pub fn remove(db: *Db, allocator: Allocator, name: []const u8, member: []const u8) !bool {
+        if (!try isMember(db, allocator, name, member)) return false;
+        const k = try memberKey(allocator, name, member);
+        defer allocator.free(k);
+        try db.delete(k);
+        return true;
+    }
+
+    pub fn isMember(db: *Db, allocator: Allocator, name: []const u8, member: []const u8) !bool {
+        const k = try memberKey(allocator, name, member);
+        defer allocator.free(k);
+        const raw = try db.get(allocator, k) orelse return false;
+        allocator.free(raw);
+        return true;
+    }
+
+    pub fn card(db: *Db, allocator: Allocator, name: []const u8) !usize {
+        const members_ = try members(db, allocator, name);
+        defer {
+            for (members_) |m| allocator.free(m);
+            allocator.free(members_);
+        }
+        return members_.len;
+    }
+
+    /// Returns every member currently in the set. Caller owns the slice and
+    /// each element.
+    pub fn members(db: *Db, allocator: Allocator, name: []const u8) ![][]u8 {
+        const p = try prefix(allocator, name);
+        defer allocator.free(p);
+
+        var results = std.ArrayList([]u8).init(allocator);
+        errdefer {
+            for (results.items) |m| allocator.free(m);
+            results.deinit();
+        }
+
+        var it = try db.scanPrefix(allocator, p);
+        defer it.deinit();
+        while (try it.next()) |entry| {
+            try results.append(try allocator.dupe(u8, entry.key[p.len..]));
+        }
+        return results.toOwnedSlice();
+    }
+
+    fn containsSorted(haystack: [][]const u8, needle: []const u8) bool {
+        for (haystack) |h| {
+            if (std.mem.eql(u8, h, needle)) return true;
+        }
+        return false;
+    }
+
+    /// Members present in every one of `names`. Caller owns the result.
+    pub fn intersect(db: *Db, allocator: Allocator, names: []const []const u8) ![][]u8 {
+        var results = std.ArrayList([]u8).init(allocator);
+        errdefer {
+            for (results.items) |m| allocator.free(m);
+            results.deinit();
+        }
+        if (names.len == 0) return results.toOwnedSlice();
+
+        const first = try members(db, allocator, names[0]);
+        defer {
+            for (first) |m| allocator.free(m);
+            allocator.free(first);
+        }
+
+        outer: for (first) |candidate| {
+            for (names[1..]) |other| {
+                if (!try isMember(db, allocator, other, candidate)) continue :outer;
+            }
+            try results.append(try allocator.dupe(u8, candidate));
+        }
+        return results.toOwnedSlice();
+    }
+
+    /// Members present in any of `names`, deduplicated. Caller owns the result.
+    pub fn unionOf(db: *Db, allocator: Allocator, names: []const []const u8) ![][]u8 {
+        var results = std.ArrayList([]u8).init(allocator);
+        errdefer {
+            for (results.items) |m| allocator.free(m);
+            results.deinit();
+        }
+
+        for (names) |name| {
+            const ms = try members(db, allocator, name);
+            defer {
+                for (ms) |m| allocator.free(m);
+                allocator.free(ms);
+            }
+            for (ms) |m| {
+                var seen = false;
+                for (results.items) |existing| {
+                    if (std.mem.eql(u8, existing, m)) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) try results.append(try allocator.dupe(u8, m));
+            }
+        }
+        return results.toOwnedSlice();
+    }
+
+    /// Members in `name` that are not in any set of `others`. Caller owns the result.
+    pub fn difference(db: *Db, allocator: Allocator, name: []const u8, others: []const []const u8) ![][]u8 {
+        var results = std.ArrayList([]u8).init(allocator);
+        errdefer {
+            for (results.items) |m| allocator.free(m);
+            results.deinit();
+        }
+
+        const base = try members(db, allocator, name);
+        defer {
+            for (base) |m| allocator.free(m);
+            allocator.free(base);
+        }
+
+        outer: for (base) |candidate| {
+            for (others) |other| {
+                if (try isMember(db, allocator, other, candidate)) continue :outer;
+            }
+            try results.append(try allocator.dupe(u8, candidate));
+        }
+        return results.toOwnedSlice();
+    }
+};
+
+// ---------------------------------------------------------------------
+// List (double-ended queue keyed by a monotonic sequence range)
+// ---------------------------------------------------------------------
+
+const ListMeta = struct {
+    // Elements occupy sequence numbers (head+1 .. tail-1) inclusive; an
+    // empty list has tail == head + 1. Pushing left decrements head and
+    // writes at the new head; pushing right increments tail and writes at
+    // the slot just below the new tail.
+    head: i64,
+    tail: i64,
+};
+
+pub const List = struct {
+    fn metaKey(allocator: Allocator, name: []const u8) ![]u8 {
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        try out.append(nsTag);
+        try appendSegment(&out, "L");
+        try appendSegment(&out, name);
+        try out.append('M');
+        return out.toOwnedSlice();
+    }
+
+    fn elementPrefix(allocator: Allocator, name: []const u8) ![]u8 {
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        try out.append(nsTag);
+        try appendSegment(&out, "L");
+        try appendSegment(&out, name);
+        try appendSegment(&out, "E");
+        return out.toOwnedSlice();
+    }
+
+    fn elementKey(allocator: Allocator, name: []const u8, seq: i64) ![]u8 {
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        try out.append(nsTag);
+        try appendSegment(&out, "L");
+        try appendSegment(&out, name);
+        try appendSegment(&out, "E");
+        try row.appendOrdered(&out, .{ .int = seq });
+        return out.toOwnedSlice();
+    }
+
+    fn readMeta(txn: *Transaction, allocator: Allocator, k: []const u8) !ListMeta {
+        const raw = try txn.get(allocator, k) orelse return ListMeta{ .head = 0, .tail = 1 };
+        defer allocator.free(raw);
+        if (raw.len != 16) return error.Malformed;
+        return .{
+            .head = std.mem.readInt(i64, raw[0..8], .big),
+            .tail = std.mem.readInt(i64, raw[8..16], .big),
+        };
+    }
+
+    fn writeMeta(txn: *Transaction, k: []const u8, meta: ListMeta) !void {
+        var buf: [16]u8 = undefined;
+        std.mem.writeInt(i64, buf[0..8], meta.head, .big);
+        std.mem.writeInt(i64, buf[8..16], meta.tail, .big);
+        try txn.put(k, &buf);
+    }
+
+    pub fn pushLeft(db: *Db, allocator: Allocator, name: []const u8, value: []const u8) !void {
+        const mk = try metaKey(allocator, name);
+        defer allocator.free(mk);
+
+        var attempt: usize = 0;
+        while (attempt < maxConflictRetries) : (attempt += 1) {
+            var txn = Transaction.begin(db);
+            defer txn.deinit();
+
+            var meta = try readMeta(&txn, allocator, mk);
+            const seq = meta.head;
+            meta.head -= 1;
+
+            const ek = try elementKey(allocator, name, seq);
+            defer allocator.free(ek);
+            try txn.put(ek, value);
+            try writeMeta(&txn, mk, meta);
+
+            txn.commit() catch |err| {
+                if (err == error.Conflict) continue;
+                return err;
+            };
+            return;
+        }
+        return error.TooManyConflicts;
+    }
+
+    pub fn pushRight(db: *Db, allocator: Allocator, name: []const u8, value: []const u8) !void {
+        const mk = try metaKey(allocator, name);
+        defer allocator.free(mk);
+
+        var attempt: usize = 0;
+        while (attempt < maxConflictRetries) : (attempt += 1) {
+            var txn = Transaction.begin(db);
+            defer txn.deinit();
+
+            var meta = try readMeta(&txn, allocator, mk);
+            const seq = meta.tail;
+            meta.tail += 1;
+
+            const ek = try elementKey(allocator, name, seq);
+            defer allocator.free(ek);
+            try txn.put(ek, value);
+            try writeMeta(&txn, mk, meta);
+
+            txn.commit() catch |err| {
+                if (err == error.Conflict) continue;
+                return err;
+            };
+            return;
+        }
+        return error.TooManyConflicts;
+    }
+
