@@ -4,7 +4,10 @@ const memtable = @import("memtable.zig");
 const sstable = @import("sstable.zig");
 const cache = @import("cache.zig");
 const statsmod = @import("stats.zig");
-const Wal = @import("wal.zig").Wal;
+const heap = @import("heap.zig");
+const version = @import("version.zig");
+const walmod = @import("wal.zig");
+const Wal = walmod.Wal;
 
 const Allocator = std.mem.Allocator;
 const Kind = encode.Kind;
@@ -13,6 +16,8 @@ const Memtable = memtable.Memtable;
 const Reader = sstable.Reader;
 const Builder = sstable.Builder;
 const BlockCache = cache.BlockCache;
+const VersionSet = version.VersionSet;
+const VersionEdit = version.VersionEdit;
 
 pub const WriteBatch = @import("batch.zig").WriteBatch;
 pub const Stats = statsmod.Stats;
@@ -22,7 +27,6 @@ fn order(a: []const u8, b: []const u8) std.math.Order {
 }
 
 const walName = "wal.log";
-const manifestName = "MANIFEST";
 
 pub const Options = struct {
     flushThreshold: usize = 4 * 1024 * 1024,
@@ -46,6 +50,8 @@ pub const Db = struct {
     wal: Wal,
     sstables: std.ArrayList(*Reader),
     blockCache: BlockCache,
+    versionSet: VersionSet,
+    versionState: std.AutoHashMap(u64, usize),
     nextFileId: u64,
     nextSeq: u64,
     flushThreshold: usize,
@@ -91,10 +97,11 @@ pub const Db = struct {
             if (id > maxId) maxId = id;
         }
 
-        var levelMap = try loadManifest(allocator, dir);
-        defer levelMap.deinit();
+        var opened = try VersionSet.open(allocator, dir);
+        errdefer opened.set.close();
+        errdefer opened.state.deinit();
         for (sstables.items) |reader| {
-            reader.level = levelMap.get(reader.fileId) orelse 0;
+            reader.level = opened.state.get(reader.fileId) orelse 0;
         }
 
         var table = try Memtable.init(allocator);
@@ -103,6 +110,20 @@ pub const Db = struct {
         errdefer wal.close();
         const walMaxSeq = try wal.replay(&table);
         if (walMaxSeq > maxSeq) maxSeq = walMaxSeq;
+
+        // The directory scan alone can regress: a leveled compaction that
+        // fully garbage-collects a run of tombstones produces zero output
+        // files (see runMerge), so no fresh fileId is minted and the
+        // deleted inputs' seq/fileId watermark vanishes from disk. The
+        // manifest's persisted counters (stamped on every flush/compact,
+        // see VersionEdit.nextFileId/nextSeq) are the authoritative floor
+        // for exactly that case; take whichever recovery source is higher
+        // so this is purely additive safety, never a regression versus the
+        // scan-only behaviour this project already relied on.
+        const scanNextFileId = maxId + 1;
+        const scanNextSeq = maxSeq + 1;
+        const nextFileId = @max(scanNextFileId, opened.set.counters.nextFileId orelse 0);
+        const nextSeq = @max(scanNextSeq, opened.set.counters.nextSeq orelse 0);
 
         const dirPathCopy = try allocator.dupe(u8, dirPath);
 
@@ -114,8 +135,10 @@ pub const Db = struct {
             .wal = wal,
             .sstables = sstables,
             .blockCache = BlockCache.init(allocator, options.blockCacheBytes),
-            .nextFileId = maxId + 1,
-            .nextSeq = maxSeq + 1,
+            .versionSet = opened.set,
+            .versionState = opened.state,
+            .nextFileId = nextFileId,
+            .nextSeq = nextSeq,
             .flushThreshold = options.flushThreshold,
             .l0Trigger = options.l0CompactionTrigger,
             .l1BaseBytes = options.l1BaseBytes,
@@ -132,6 +155,8 @@ pub const Db = struct {
         }
         self.sstables.deinit();
         self.blockCache.deinit();
+        self.versionSet.close();
+        self.versionState.deinit();
         self.memtable.deinit();
         self.dir.close();
         self.allocator.free(self.dirPath);
@@ -234,7 +259,14 @@ pub const Db = struct {
         self.nextFileId += 1;
         self.memtable.clear();
         try self.wal.reset();
-        try self.writeManifest();
+        _ = try walmod.bumpGeneration(self.dir);
+
+        var edit = VersionEdit.init(self.allocator);
+        defer edit.deinit();
+        try edit.addFile(fileId, 0);
+        edit.setNextFileId(self.nextFileId);
+        edit.setNextSeq(self.nextSeq);
+        try self.versionSet.logAndApply(&edit, &self.versionState);
         std.posix.fsync(self.dir.fd) catch {};
     }
 
@@ -254,7 +286,9 @@ pub const Db = struct {
         {
             var builder = try Builder.init(self.allocator, self.dir, name, expected);
             defer builder.deinit();
-            while (pickWinner(cursors)) |winner| {
+            var merger = try SstableMerger.init(self.allocator, cursors);
+            defer merger.deinit();
+            while (try merger.next()) |winner| {
                 if (winner.kind == .value) try builder.add(winner);
             }
             try builder.finish();
@@ -265,7 +299,10 @@ pub const Db = struct {
         reader.* = try Reader.open(self.allocator, self.dir, name, fileId);
         errdefer reader.deinit();
 
+        var edit = VersionEdit.init(self.allocator);
+        defer edit.deinit();
         for (self.sstables.items) |old| {
+            try edit.deleteFile(old.fileId);
             var oldNameBuf: [64]u8 = undefined;
             const oldName = sstName(&oldNameBuf, old.fileId) catch unreachable;
             old.deinit();
@@ -276,7 +313,10 @@ pub const Db = struct {
         reader.level = 0;
         try self.sstables.append(reader);
         self.nextFileId += 1;
-        try self.writeManifest();
+        try edit.addFile(fileId, 0);
+        edit.setNextFileId(self.nextFileId);
+        edit.setNextSeq(self.nextSeq);
+        try self.versionSet.logAndApply(&edit, &self.versionState);
         std.posix.fsync(self.dir.fd) catch {};
     }
 
@@ -365,7 +405,9 @@ pub const Db = struct {
         var outputName: [64]u8 = undefined;
         errdefer if (builder) |*b| b.deinit();
 
-        while (pickWinner(cursors)) |winner| {
+        var merger = try SstableMerger.init(self.allocator, cursors);
+        defer merger.deinit();
+        while (try merger.next()) |winner| {
             if (dropTombstones and winner.kind == .tombstone) continue;
             if (builder == null) {
                 outputId = self.nextFileId;
@@ -385,7 +427,10 @@ pub const Db = struct {
             try self.finishOutput(done, outputId, targetLevel, &outputs);
         }
 
+        var edit = VersionEdit.init(self.allocator);
+        defer edit.deinit();
         for (inputs) |old| {
+            try edit.deleteFile(old.fileId);
             self.removeReader(old);
             var oldNameBuf: [64]u8 = undefined;
             const oldName = sstName(&oldNameBuf, old.fileId) catch unreachable;
@@ -393,10 +438,21 @@ pub const Db = struct {
             self.allocator.destroy(old);
             self.dir.deleteFile(oldName) catch {};
         }
-        for (outputs.items) |produced| try self.sstables.append(produced);
+        for (outputs.items) |produced| {
+            try edit.addFile(produced.fileId, produced.level);
+            try self.sstables.append(produced);
+        }
         outputs.deinit();
 
-        try self.writeManifest();
+        // Stamped even when this round produced zero output files (every
+        // input was a dropped tombstone): that is exactly the case where no
+        // fresh fileId gets minted and a directory scan on the next restart
+        // could otherwise regress below the seq/fileId already consumed by
+        // the now-deleted inputs (see the comment on VersionEdit.nextFileId
+        // and Db.open's counter merge).
+        edit.setNextFileId(self.nextFileId);
+        edit.setNextSeq(self.nextSeq);
+        try self.versionSet.logAndApply(&edit, &self.versionState);
         std.posix.fsync(self.dir.fd) catch {};
     }
 
@@ -465,32 +521,6 @@ pub const Db = struct {
         return false;
     }
 
-    fn writeManifest(self: *Db) !void {
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
-        const bodyWriter = encode.ByteWriter.init(&buf);
-        try bodyWriter.putU32(@intCast(self.sstables.items.len));
-        for (self.sstables.items) |reader| {
-            try bodyWriter.putU64(reader.fileId);
-            try bodyWriter.putU32(@intCast(reader.level));
-        }
-
-        var frame = std.ArrayList(u8).init(self.allocator);
-        defer frame.deinit();
-        const frameWriter = encode.ByteWriter.init(&frame);
-        try frameWriter.putU32(encode.crc(buf.items));
-        try frameWriter.slice(buf.items);
-
-        const tmpName = "MANIFEST.tmp";
-        {
-            const file = try self.dir.createFile(tmpName, .{ .truncate = true });
-            defer file.close();
-            try file.writeAll(frame.items);
-            try file.sync();
-        }
-        try self.dir.rename(tmpName, manifestName);
-    }
-
     pub fn levelOf(self: *Db, fileId: u64) ?usize {
         for (self.sstables.items) |reader| {
             if (reader.fileId == fileId) return reader.level;
@@ -548,6 +578,12 @@ pub const Db = struct {
         cursors[0] = .{ .mem = self.memtable.cursor(options.start) };
         for (self.sstables.items, 0..) |reader, i| cursors[i + 1] = .{ .sst = reader.cursor(options.start) };
 
+        var mergeHeap = AscKeyHeap.init(allocator, {});
+        errdefer mergeHeap.deinit();
+        for (cursors, 0..) |*c, i| {
+            if (c.valid()) try mergeHeap.push(.{ .key = c.record().key, .idx = i });
+        }
+
         var startCopy: ?[]u8 = null;
         errdefer if (startCopy) |s| allocator.free(s);
         if (options.start) |bound| startCopy = try allocator.dupe(u8, bound);
@@ -558,6 +594,7 @@ pub const Db = struct {
             .resultAllocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
             .cursors = cursors,
+            .heap = mergeHeap,
             .start = startCopy,
             .end = endCopy,
             .startInclusive = options.startInclusive,
@@ -596,6 +633,12 @@ pub const Db = struct {
             built += 1;
         }
 
+        var mergeHeap = DescKeyHeap.init(allocator, {});
+        errdefer mergeHeap.deinit();
+        for (cursors, 0..) |*c, i| {
+            if (c.valid()) try mergeHeap.push(.{ .key = c.record().key, .idx = i });
+        }
+
         var startCopy: ?[]u8 = null;
         if (options.start) |bound| startCopy = try allocator.dupe(u8, bound);
 
@@ -603,6 +646,7 @@ pub const Db = struct {
             .resultAllocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
             .cursors = cursors,
+            .heap = mergeHeap,
             .start = startCopy,
             .startInclusive = options.startInclusive,
             .maxSeq = maxSeq,
@@ -678,30 +722,68 @@ const SourceCursor = union(enum) {
     }
 };
 
-fn pickWinner(cursors: []sstable.Cursor) ?Record {
-    var minKey: ?[]const u8 = null;
-    for (cursors) |*c| {
-        if (c.valid()) {
-            const key = c.record().key;
-            if (minKey == null or order(key, minKey.?) == .lt) minKey = key;
+/// One live position in a k-way merge: the key it currently points at
+/// (a snapshot valid for the underlying source's whole lifetime, since
+/// sstable/memtable cursors never overwrite already-decoded key bytes)
+/// plus the index of the source cursor it belongs to.
+const KeyedIndex = struct { key: []const u8, idx: usize };
+
+fn keyIndexLess(_: void, a: KeyedIndex, b: KeyedIndex) bool {
+    return order(a.key, b.key) == .lt;
+}
+fn keyIndexGreater(_: void, a: KeyedIndex, b: KeyedIndex) bool {
+    return order(a.key, b.key) == .gt;
+}
+
+/// Ascending k-way merge heap: root always holds the smallest live key.
+const AscKeyHeap = heap.MinHeap(KeyedIndex, void, keyIndexLess);
+/// Descending k-way merge heap: root always holds the largest live key.
+const DescKeyHeap = heap.MinHeap(KeyedIndex, void, keyIndexGreater);
+
+/// Merges N sorted sstable cursors (compaction inputs) in ascending key
+/// order using a binary heap: O(log N) per advance instead of the O(N)
+/// full rescan a naive linear-scan merge needs for every emitted record.
+/// Ties (same key present in several inputs) resolve to the entry with
+/// the highest seq, matching last-writer-wins semantics.
+const SstableMerger = struct {
+    cursors: []sstable.Cursor,
+    heap: AscKeyHeap,
+
+    fn init(allocator: Allocator, cursors: []sstable.Cursor) !SstableMerger {
+        var h = AscKeyHeap.init(allocator, {});
+        errdefer h.deinit();
+        for (cursors, 0..) |*c, i| {
+            if (c.valid()) try h.push(.{ .key = c.record().key, .idx = i });
         }
+        return .{ .cursors = cursors, .heap = h };
     }
-    if (minKey == null) return null;
-    var winner: ?Record = null;
-    for (cursors) |*c| {
-        if (c.valid() and order(c.record().key, minKey.?) == .eq) {
+
+    fn deinit(self: *SstableMerger) void {
+        self.heap.deinit();
+    }
+
+    fn next(self: *SstableMerger) !?Record {
+        const top = self.heap.peek() orelse return null;
+        const minKey = top.key;
+        var winner: ?Record = null;
+        while (self.heap.peek()) |entry| {
+            if (order(entry.key, minKey) != .eq) break;
+            const popped = self.heap.pop().?;
+            var c = &self.cursors[popped.idx];
             const rec = c.record();
             if (winner == null or rec.seq > winner.?.seq) winner = rec;
             c.advance();
+            if (c.valid()) try self.heap.push(.{ .key = c.record().key, .idx = popped.idx });
         }
+        return winner.?;
     }
-    return winner.?;
-}
+};
 
 pub const RangeIterator = struct {
     resultAllocator: Allocator,
     arena: std.heap.ArenaAllocator,
     cursors: []SourceCursor,
+    heap: AscKeyHeap,
     start: ?[]u8,
     end: ?[]u8,
     startInclusive: bool,
@@ -710,26 +792,22 @@ pub const RangeIterator = struct {
 
     pub fn next(self: *RangeIterator) !?Entry {
         while (true) {
-            var minKey: ?[]const u8 = null;
-            for (self.cursors) |*c| {
-                if (c.valid()) {
-                    const key = c.record().key;
-                    if (minKey == null or order(key, minKey.?) == .lt) minKey = key;
-                }
-            }
-            if (minKey == null) return null;
+            const top = self.heap.peek() orelse return null;
+            const minKey = top.key;
             if (self.end) |bound| {
-                const past = if (self.endInclusive) order(minKey.?, bound) == .gt else order(minKey.?, bound) != .lt;
+                const past = if (self.endInclusive) order(minKey, bound) == .gt else order(minKey, bound) != .lt;
                 if (past) return null;
             }
 
             var winner: ?Record = null;
-            for (self.cursors) |*c| {
-                if (c.valid() and order(c.record().key, minKey.?) == .eq) {
-                    const rec = c.record();
-                    if (rec.seq <= self.maxSeq and (winner == null or rec.seq > winner.?.seq)) winner = rec;
-                    c.advance();
-                }
+            while (self.heap.peek()) |entry| {
+                if (order(entry.key, minKey) != .eq) break;
+                const popped = self.heap.pop().?;
+                var c = &self.cursors[popped.idx];
+                const rec = c.record();
+                if (rec.seq <= self.maxSeq and (winner == null or rec.seq > winner.?.seq)) winner = rec;
+                c.advance();
+                if (c.valid()) try self.heap.push(.{ .key = c.record().key, .idx = popped.idx });
             }
             if (winner == null) continue;
             if (!self.startInclusive) {
@@ -749,6 +827,7 @@ pub const RangeIterator = struct {
 
     pub fn deinit(self: *RangeIterator) void {
         self.arena.deinit();
+        self.heap.deinit();
         if (self.start) |bound| self.resultAllocator.free(bound);
         if (self.end) |bound| self.resultAllocator.free(bound);
         self.resultAllocator.free(self.cursors);
@@ -792,32 +871,29 @@ pub const ReverseRangeIterator = struct {
     resultAllocator: Allocator,
     arena: std.heap.ArenaAllocator,
     cursors: []ReverseSource,
+    heap: DescKeyHeap,
     start: ?[]u8,
     startInclusive: bool,
     maxSeq: u64,
 
     pub fn next(self: *ReverseRangeIterator) !?Entry {
         while (true) {
-            var maxKey: ?[]const u8 = null;
-            for (self.cursors) |*c| {
-                if (c.valid()) {
-                    const key = c.record().key;
-                    if (maxKey == null or order(key, maxKey.?) == .gt) maxKey = key;
-                }
-            }
-            if (maxKey == null) return null;
+            const top = self.heap.peek() orelse return null;
+            const maxKey = top.key;
             if (self.start) |bound| {
-                const past = if (self.startInclusive) order(maxKey.?, bound) == .lt else order(maxKey.?, bound) != .gt;
+                const past = if (self.startInclusive) order(maxKey, bound) == .lt else order(maxKey, bound) != .gt;
                 if (past) return null;
             }
 
             var winner: ?Record = null;
-            for (self.cursors) |*c| {
-                if (c.valid() and order(c.record().key, maxKey.?) == .eq) {
-                    const rec = c.record();
-                    if (rec.seq <= self.maxSeq and (winner == null or rec.seq > winner.?.seq)) winner = rec;
-                    c.advance();
-                }
+            while (self.heap.peek()) |entry| {
+                if (order(entry.key, maxKey) != .eq) break;
+                const popped = self.heap.pop().?;
+                var c = &self.cursors[popped.idx];
+                const rec = c.record();
+                if (rec.seq <= self.maxSeq and (winner == null or rec.seq > winner.?.seq)) winner = rec;
+                c.advance();
+                if (c.valid()) try self.heap.push(.{ .key = c.record().key, .idx = popped.idx });
             }
             if (winner == null) continue;
             if (winner.?.kind == .tombstone) continue;
@@ -832,6 +908,7 @@ pub const ReverseRangeIterator = struct {
 
     pub fn deinit(self: *ReverseRangeIterator) void {
         self.arena.deinit();
+        self.heap.deinit();
         for (self.cursors) |*c| c.deinit();
         if (self.start) |bound| self.resultAllocator.free(bound);
         self.resultAllocator.free(self.cursors);
@@ -840,36 +917,6 @@ pub const ReverseRangeIterator = struct {
 
 fn rangesOverlap(aMin: []const u8, aMax: []const u8, bMin: []const u8, bMax: []const u8) bool {
     return order(aMin, bMax) != .gt and order(bMin, aMax) != .gt;
-}
-
-fn loadManifest(allocator: Allocator, dir: std.fs.Dir) !std.AutoHashMap(u64, usize) {
-    var map = std.AutoHashMap(u64, usize).init(allocator);
-    errdefer map.deinit();
-
-    const file = dir.openFile(manifestName, .{}) catch |err| switch (err) {
-        error.FileNotFound => return map,
-        else => return err,
-    };
-    defer file.close();
-    const data = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-    defer allocator.free(data);
-    if (data.len < 8) return map;
-
-    const storedCrc = encode.readU32(data, 0);
-    const body = data[4..];
-    if (encode.crc(body) != storedCrc) return map;
-
-    const count = encode.readU32(body, 0);
-    var pos: usize = 4;
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        if (pos + 12 > body.len) break;
-        const fileId = encode.readU64(body, pos);
-        const level = encode.readU32(body, pos + 8);
-        try map.put(fileId, level);
-        pos += 12;
-    }
-    return map;
 }
 
 fn sstName(buf: []u8, id: u64) ![]const u8 {
@@ -1234,6 +1281,67 @@ test "leveled compaction keeps levels disjoint and drops bottom tombstones" {
     try std.testing.expectEqual(@as(u64, 58), totalEntries);
 }
 
+test "seq and fileId counters survive a compaction that garbage-collects every key" {
+    // Reproduces a real recovery gap: when a bottom-level compaction merges
+    // inputs that are entirely tombstones, runMerge produces zero output
+    // files (see the `builder == null` guard around minting a fresh
+    // fileId). If every file that ever carried a high seq/fileId gets
+    // deleted in that round and nothing new gets flushed before a restart,
+    // a directory-scan-only recovery would compute too low a floor and
+    // risk reusing already-consumed seq numbers. The manifest's persisted
+    // counters (VersionEdit.nextFileId/nextSeq, stamped unconditionally in
+    // runMerge) must close that gap.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var beforeNextSeq: u64 = 0;
+    var beforeNextFileId: u64 = 0;
+    {
+        var db = try openTemp(&tmp, allocator, .{
+            .l0CompactionTrigger = 2,
+            .l1BaseBytes = 4 * 1024 * 1024,
+        });
+        defer db.close();
+
+        var keyBuf: [16]u8 = undefined;
+        var round: usize = 0;
+        while (round < 2) : (round += 1) {
+            const key = try std.fmt.bufPrint(&keyBuf, "gone:{d}", .{round});
+            try db.put(key, "value");
+            try db.delete(key);
+            try db.flush();
+        }
+        try std.testing.expectEqual(@as(usize, 2), db.countLevel(0));
+
+        try db.maybeCompact();
+
+        // The whole point: every input was a dropped tombstone, so the
+        // compaction round produced no output file at all, and no new
+        // fileId was ever minted for it.
+        try std.testing.expectEqual(@as(usize, 0), db.sstables.items.len);
+
+        beforeNextSeq = db.nextSeq;
+        beforeNextFileId = db.nextFileId;
+        try std.testing.expect(beforeNextSeq > 1);
+    }
+
+    // On disk right now: no sstable files, an empty (reset) WAL. A
+    // scan-only recovery would compute nextSeq=1/nextFileId=1 here.
+    var reopened = try openTemp(&tmp, allocator, .{
+        .l0CompactionTrigger = 2,
+        .l1BaseBytes = 4 * 1024 * 1024,
+    });
+    defer reopened.close();
+    try std.testing.expectEqual(beforeNextSeq, reopened.nextSeq);
+    try std.testing.expectEqual(beforeNextFileId, reopened.nextFileId);
+
+    // Functional proof, not just counter equality: a fresh write after
+    // reopen must not reuse a seq number already spent on the GC'd keys.
+    try reopened.put("fresh", "value");
+    try std.testing.expect(reopened.nextSeq > beforeNextSeq);
+}
+
 fn lessByMinKey(_: void, a: *Reader, b: *Reader) bool {
     return order(a.minKey, b.minKey) == .lt;
 }
@@ -1307,6 +1415,56 @@ test "prefix scan isolates a namespace" {
         idx += 1;
     }
     try std.testing.expectEqual(expected.len, idx);
+}
+
+test "scan merges a wide fan-in of uncompacted sstables with overlapping keys" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try openTemp(&tmp, allocator, .{ .flushThreshold = 1 });
+    defer db.close();
+
+    const sstableCount = 14;
+    var round: usize = 0;
+    while (round < sstableCount) : (round += 1) {
+        var keyBuf: [16]u8 = undefined;
+        var valBuf: [24]u8 = undefined;
+        var i: usize = 0;
+        while (i < 5) : (i += 1) {
+            const key = try std.fmt.bufPrint(&keyBuf, "shared:{d:0>2}", .{i});
+            const value = try std.fmt.bufPrint(&valBuf, "round{d}", .{round});
+            try db.put(key, value);
+        }
+        try db.flush();
+    }
+    try db.delete("shared:02");
+    try db.flush();
+    try std.testing.expect(db.sstables.items.len >= sstableCount + 1);
+
+    var forward = try db.scan(allocator, null, null);
+    defer forward.deinit();
+    var seen: usize = 0;
+    while (try forward.next()) |entry| {
+        if (std.mem.eql(u8, entry.key, "shared:02")) {
+            try std.testing.expect(false);
+        }
+        try std.testing.expectEqualStrings("round13", entry.value);
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), seen);
+
+    var reverse = try db.scanReverse(allocator, .{});
+    defer reverse.deinit();
+    var revSeen: usize = 0;
+    var lastKey: ?[]const u8 = null;
+    while (try reverse.next()) |entry| {
+        if (lastKey) |prev| try std.testing.expect(order(entry.key, prev) == .lt);
+        lastKey = entry.key;
+        try std.testing.expectEqualStrings("round13", entry.value);
+        revSeen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), revSeen);
 }
 
 test "inclusive and exclusive bounds" {
