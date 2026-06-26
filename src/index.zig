@@ -1110,3 +1110,828 @@ pub fn scanCompositeRangeCursor(
         break :blk endBuf.?;
     };
 
+    return .{ .it = try db.scanRange(allocator, .{
+        .start = start,
+        .end = end,
+        .startInclusive = true,
+        .endInclusive = false,
+    }) };
+}
+
+/// Lazy cursor over an equality index lookup: decodes one primary key at a
+/// time from the underlying `Db.RangeIterator` instead of materializing the
+/// whole match set up front. This is what lets `Table.selectPage` honour a
+/// small `limit` without reading and decoding every index entry for a value
+/// that may have thousands of matches.
+pub const EqCursor = struct {
+    it: dbmod.RangeIterator,
+
+    pub fn next(self: *EqCursor, allocator: Allocator) !?Value {
+        const entry = try self.it.next() orelse return null;
+        return try row.decodeValue(allocator, entry.value);
+    }
+
+    pub fn deinit(self: *EqCursor) void {
+        self.it.deinit();
+    }
+};
+
+/// Point lookup, streaming: opens the underlying scan but decodes nothing
+/// until `EqCursor.next` is called.
+pub fn scanEqCursor(db: *Db, allocator: Allocator, table: []const u8, field: []const u8, value: Value) !EqCursor {
+    const prefix = try indexValueBound(allocator, table, field, value);
+    defer allocator.free(prefix);
+    return .{ .it = try db.scanPrefix(allocator, prefix) };
+}
+
+/// Point lookup: all primary keys currently indexed under `value`.
+pub fn scanEq(db: *Db, allocator: Allocator, table: []const u8, field: []const u8, value: Value) ![]Value {
+    var cursor = try scanEqCursor(db, allocator, table, field, value);
+    defer cursor.deinit();
+
+    var results = std.ArrayList(Value).init(allocator);
+    errdefer {
+        for (results.items) |v| v.free(allocator);
+        results.deinit();
+    }
+    while (try cursor.next(allocator)) |pk| try results.append(pk);
+    return results.toOwnedSlice();
+}
+
+pub const Bound = struct {
+    value: Value,
+    inclusive: bool,
+};
+
+/// Lazy cursor over a range index lookup, same rationale as `EqCursor`.
+pub const RangeCursor = struct {
+    it: dbmod.RangeIterator,
+
+    pub fn next(self: *RangeCursor, allocator: Allocator) !?Value {
+        const entry = try self.it.next() orelse return null;
+        return try row.decodeValue(allocator, entry.value);
+    }
+
+    pub fn deinit(self: *RangeCursor) void {
+        self.it.deinit();
+    }
+};
+
+/// Range lookup over `table.field`'s index, streaming: primary keys whose
+/// indexed value falls within [low, high] (either side may be open/null),
+/// decoded one at a time as the caller consumes the cursor.
+pub fn scanRangeCursor(
+    db: *Db,
+    allocator: Allocator,
+    table: []const u8,
+    field: []const u8,
+    low: ?Bound,
+    high: ?Bound,
+) !RangeCursor {
+    const prefix = try indexPrefix(allocator, table, field);
+    defer allocator.free(prefix);
+
+    var startBuf: ?[]u8 = null;
+    defer if (startBuf) |b| allocator.free(b);
+    var endBuf: ?[]u8 = null;
+    defer if (endBuf) |b| allocator.free(b);
+
+    // Every real index-entry key is `indexValueBound(value) ++ orderedPk`, a
+    // strict byte-extension of the bare value bound (pk encodings are never
+    // empty). So a key with value == threshold always compares greater than
+    // `indexValueBound(threshold)` itself - inclusive/exclusive thresholds
+    // are therefore expressed by choosing which side of that gap to start
+    // or stop the scan at, not by the start/endInclusive flags.
+    const start = if (low) |b| blk: {
+        const bound = try indexValueBound(allocator, table, field, b.value);
+        if (b.inclusive) {
+            startBuf = bound;
+        } else {
+            defer allocator.free(bound);
+            startBuf = try prefixUpperBound(allocator, bound) orelse try allocator.dupe(u8, bound);
+        }
+        break :blk startBuf.?;
+    } else prefix;
+
+    const end = if (high) |b| blk: {
+        const bound = try indexValueBound(allocator, table, field, b.value);
+        if (b.inclusive) {
+            defer allocator.free(bound);
+            endBuf = try prefixUpperBound(allocator, bound) orelse try allocator.dupe(u8, bound);
+        } else {
+            endBuf = bound;
+        }
+        break :blk endBuf.?;
+    } else blk: {
+        endBuf = try prefixUpperBound(allocator, prefix) orelse try allocator.dupe(u8, prefix);
+        break :blk endBuf.?;
+    };
+
+    return .{ .it = try db.scanRange(allocator, .{
+        .start = start,
+        .end = end,
+        .startInclusive = true,
+        .endInclusive = false,
+    }) };
+}
+
+/// Range lookup over `table.field`'s index: all primary keys whose indexed
+/// value falls within [low, high] (either side may be open/null).
+pub fn scanRange(
+    db: *Db,
+    allocator: Allocator,
+    table: []const u8,
+    field: []const u8,
+    low: ?Bound,
+    high: ?Bound,
+) ![]Value {
+    var cursor = try scanRangeCursor(db, allocator, table, field, low, high);
+    defer cursor.deinit();
+
+    var results = std.ArrayList(Value).init(allocator);
+    errdefer {
+        for (results.items) |v| v.free(allocator);
+        results.deinit();
+    }
+    while (try cursor.next(allocator)) |pk| try results.append(pk);
+    return results.toOwnedSlice();
+}
+
+test "rowKey and indexEntryKey stay within their own namespace" {
+    const allocator = std.testing.allocator;
+    const rk = try rowKey(allocator, "users", .{ .int = 1 });
+    defer allocator.free(rk);
+    const ik = try indexEntryKey(allocator, "users", "email", .{ .text = "a@b.c" }, .{ .int = 1 });
+    defer allocator.free(ik);
+
+    try std.testing.expectEqual(@as(u8, 'R'), rk[0]);
+    try std.testing.expectEqual(@as(u8, 'I'), ik[0]);
+}
+
+test "prefixUpperBound bounds a prefix scan" {
+    const allocator = std.testing.allocator;
+    const upper = (try prefixUpperBound(allocator, "abc")).?;
+    defer allocator.free(upper);
+    try std.testing.expect(std.mem.order(u8, "abc", upper) == .lt);
+    try std.testing.expect(std.mem.order(u8, "abd", upper) != .lt);
+}
+
+test "IndexSet add remove save load round trip" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    var set = try IndexSet.load(allocator, &db, "users");
+    defer set.deinit();
+    try std.testing.expectEqual(@as(usize, 0), set.fields.items.len);
+
+    try set.add("email");
+    try set.add("age");
+    try set.add("email");
+    try std.testing.expectEqual(@as(usize, 2), set.fields.items.len);
+    try set.save(&db, "users");
+
+    var reloaded = try IndexSet.load(allocator, &db, "users");
+    defer reloaded.deinit();
+    try std.testing.expect(reloaded.has("email"));
+    try std.testing.expect(reloaded.has("age"));
+    try std.testing.expect(!reloaded.has("missing"));
+
+    try std.testing.expect(reloaded.remove("email"));
+    try std.testing.expect(!reloaded.remove("email"));
+    try reloaded.save(&db, "users");
+
+    var third = try IndexSet.load(allocator, &db, "users");
+    defer third.deinit();
+    try std.testing.expect(!third.has("email"));
+    try std.testing.expect(third.has("age"));
+}
+
+test "UniqueSet add remove save load round trip" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    var set = try UniqueSet.load(allocator, &db, "users");
+    defer set.deinit();
+    try std.testing.expectEqual(@as(usize, 0), set.fields.items.len);
+
+    try set.add("email");
+    try set.add("ssn");
+    try set.add("email");
+    try std.testing.expectEqual(@as(usize, 2), set.fields.items.len);
+    try set.save(&db, "users");
+
+    var reloaded = try UniqueSet.load(allocator, &db, "users");
+    defer reloaded.deinit();
+    try std.testing.expect(reloaded.has("email"));
+    try std.testing.expect(reloaded.has("ssn"));
+    try std.testing.expect(!reloaded.has("missing"));
+
+    try std.testing.expect(reloaded.remove("email"));
+    try std.testing.expect(!reloaded.remove("email"));
+    try reloaded.save(&db, "users");
+
+    var third = try UniqueSet.load(allocator, &db, "users");
+    defer third.deinit();
+    try std.testing.expect(!third.has("email"));
+    try std.testing.expect(third.has("ssn"));
+}
+
+test "UniqueSet and IndexSet on the same table never collide, each keeps its own membership" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    var indexes = try IndexSet.load(allocator, &db, "users");
+    defer indexes.deinit();
+    try indexes.add("email");
+    try indexes.add("city");
+    try indexes.save(&db, "users");
+
+    var unique = try UniqueSet.load(allocator, &db, "users");
+    defer unique.deinit();
+    try unique.add("email");
+    try unique.save(&db, "users");
+
+    // "city" is indexed but not unique, "email" is both - the two sets
+    // must agree on "email" and disagree on "city" after an independent
+    // reload of each, proving neither save() overwrote the other's key.
+    var reloadedIndexes = try IndexSet.load(allocator, &db, "users");
+    defer reloadedIndexes.deinit();
+    var reloadedUnique = try UniqueSet.load(allocator, &db, "users");
+    defer reloadedUnique.deinit();
+
+    try std.testing.expect(reloadedIndexes.has("email"));
+    try std.testing.expect(reloadedIndexes.has("city"));
+    try std.testing.expect(reloadedUnique.has("email"));
+    try std.testing.expect(!reloadedUnique.has("city"));
+}
+
+test "ForeignKeySet add remove save load round trip" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    var set = try ForeignKeySet.load(allocator, &db, "orders");
+    defer set.deinit();
+    try std.testing.expectEqual(@as(usize, 0), set.specs.items.len);
+
+    try set.add("customer_id", "customers", "__pk", .cascade);
+    try set.add("customer_id", "customers", "some_other_field", .restrict);
+    try std.testing.expectEqual(@as(usize, 1), set.specs.items.len);
+    try set.save(&db, "orders");
+
+    var reloaded = try ForeignKeySet.load(allocator, &db, "orders");
+    defer reloaded.deinit();
+    try std.testing.expect(reloaded.has("customer_id"));
+    try std.testing.expect(!reloaded.has("missing"));
+    const spec = reloaded.find("customer_id").?;
+    try std.testing.expectEqualStrings("customers", spec.refTable);
+    try std.testing.expectEqualStrings("__pk", spec.refField);
+    // First `add` wins (mirrors `has` guard above) - `onDelete` survives the
+    // save/load round trip as the mode from that first call, not the
+    // no-op second one.
+    try std.testing.expectEqual(OnDelete.cascade, spec.onDelete);
+
+    try std.testing.expect(reloaded.remove("customer_id"));
+    try std.testing.expect(!reloaded.remove("customer_id"));
+    try reloaded.save(&db, "orders");
+
+    var third = try ForeignKeySet.load(allocator, &db, "orders");
+    defer third.deinit();
+    try std.testing.expect(!third.has("customer_id"));
+}
+
+test "ForeignKeySet.load rejects a corrupted onDelete byte instead of accepting garbage" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    var set = try ForeignKeySet.load(allocator, &db, "orders");
+    defer set.deinit();
+    try set.add("customer_id", "customers", "__pk", .restrict);
+    try set.save(&db, "orders");
+
+    const key = try foreignKeyMetaKey(allocator, "orders");
+    defer allocator.free(key);
+    const raw = try db.get(allocator, key) orelse return error.TestUnexpectedResult;
+    defer allocator.free(raw);
+
+    // Flip the trailing onDelete byte to a value neither `restrict` (0)
+    // nor `cascade` (1) can ever legitimately be - same "malformed input
+    // is rejected, not silently coerced" contract every other decoder in
+    // this file already gives length-prefixed strings.
+    const corrupted = try allocator.dupe(u8, raw);
+    defer allocator.free(corrupted);
+    corrupted[corrupted.len - 1] = 0xFF;
+    try db.put(key, corrupted);
+
+    try std.testing.expectError(error.Malformed, ForeignKeySet.load(allocator, &db, "orders"));
+}
+
+test "ReferencedBySet add replaces an existing (childTable, childField) pair instead of duplicating it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    var set = try ReferencedBySet.load(allocator, &db, "customers");
+    defer set.deinit();
+    try std.testing.expectEqual(@as(usize, 0), set.specs.items.len);
+
+    try set.add("orders", "customer_id", "__pk", .restrict);
+    try set.add("orders", "customer_id", "__pk", .restrict);
+    try std.testing.expectEqual(@as(usize, 1), set.specs.items.len);
+    try set.add("line_items", "customer_id", "__pk", .cascade);
+    try std.testing.expectEqual(@as(usize, 2), set.specs.items.len);
+    try set.save(&db, "customers");
+
+    var reloaded = try ReferencedBySet.load(allocator, &db, "customers");
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), reloaded.specs.items.len);
+    for (reloaded.specs.items) |spec| {
+        if (std.mem.eql(u8, spec.childTable, "line_items")) {
+            try std.testing.expectEqual(OnDelete.cascade, spec.onDelete);
+        } else {
+            try std.testing.expectEqual(OnDelete.restrict, spec.onDelete);
+        }
+    }
+
+    // Re-adding the same pair under a different refField AND onDelete mode
+    // replaces both in place rather than accumulating a second, now-stale
+    // entry.
+    try reloaded.add("orders", "customer_id", "email", .cascade);
+    try std.testing.expectEqual(@as(usize, 2), reloaded.specs.items.len);
+    var sawOrders = false;
+    for (reloaded.specs.items) |spec| {
+        if (std.mem.eql(u8, spec.childTable, "orders")) {
+            sawOrders = true;
+            try std.testing.expectEqualStrings("email", spec.refField);
+            try std.testing.expectEqual(OnDelete.cascade, spec.onDelete);
+        }
+    }
+    try std.testing.expect(sawOrders);
+
+    try std.testing.expect(reloaded.remove("orders", "customer_id"));
+    try std.testing.expect(!reloaded.remove("orders", "customer_id"));
+    try reloaded.save(&db, "customers");
+
+    var third = try ReferencedBySet.load(allocator, &db, "customers");
+    defer third.deinit();
+    try std.testing.expectEqual(@as(usize, 1), third.specs.items.len);
+    try std.testing.expectEqualStrings("line_items", third.specs.items[0].childTable);
+}
+
+test "CheckConstraintSet add remove save load round trip" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    var set = try CheckConstraintSet.load(allocator, &db, "orders");
+    defer set.deinit();
+    try std.testing.expectEqual(@as(usize, 0), set.specs.items.len);
+
+    try set.add("qty_positive", "qty gt 0");
+    try set.add("qty_positive", "qty gt 100");
+    try std.testing.expectEqual(@as(usize, 1), set.specs.items.len);
+    try set.save(&db, "orders");
+
+    var reloaded = try CheckConstraintSet.load(allocator, &db, "orders");
+    defer reloaded.deinit();
+    try std.testing.expect(reloaded.has("qty_positive"));
+    try std.testing.expect(!reloaded.has("missing"));
+    const spec = reloaded.find("qty_positive").?;
+    try std.testing.expectEqualStrings("qty gt 0", spec.source);
+
+    try std.testing.expect(reloaded.remove("qty_positive"));
+    try std.testing.expect(!reloaded.remove("qty_positive"));
+    try reloaded.save(&db, "orders");
+
+    var third = try CheckConstraintSet.load(allocator, &db, "orders");
+    defer third.deinit();
+    try std.testing.expect(!third.has("qty_positive"));
+}
+
+test "ForeignKeySet, UniqueSet, and IndexSet on the same table never collide" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    var indexes = try IndexSet.load(allocator, &db, "orders");
+    defer indexes.deinit();
+    try indexes.add("customer_id");
+    try indexes.save(&db, "orders");
+
+    var unique = try UniqueSet.load(allocator, &db, "orders");
+    defer unique.deinit();
+    try unique.add("order_number");
+    try unique.save(&db, "orders");
+
+    var fkeys = try ForeignKeySet.load(allocator, &db, "orders");
+    defer fkeys.deinit();
+    try fkeys.add("customer_id", "customers", "__pk", .restrict);
+    try fkeys.save(&db, "orders");
+
+    var checks = try CheckConstraintSet.load(allocator, &db, "orders");
+    defer checks.deinit();
+    try checks.add("qty_positive", "qty gt 0");
+    try checks.save(&db, "orders");
+
+    var reloadedIndexes = try IndexSet.load(allocator, &db, "orders");
+    defer reloadedIndexes.deinit();
+    var reloadedUnique = try UniqueSet.load(allocator, &db, "orders");
+    defer reloadedUnique.deinit();
+    var reloadedFkeys = try ForeignKeySet.load(allocator, &db, "orders");
+    defer reloadedFkeys.deinit();
+    var reloadedChecks = try CheckConstraintSet.load(allocator, &db, "orders");
+    defer reloadedChecks.deinit();
+
+    try std.testing.expect(reloadedIndexes.has("customer_id"));
+    try std.testing.expect(reloadedUnique.has("order_number"));
+    try std.testing.expect(!reloadedUnique.has("customer_id"));
+    try std.testing.expect(reloadedFkeys.has("customer_id"));
+    try std.testing.expect(!reloadedFkeys.has("order_number"));
+    try std.testing.expect(reloadedChecks.has("qty_positive"));
+    try std.testing.expect(!reloadedChecks.has("customer_id"));
+}
+
+test "addEntry scanEq removeEntry round trip" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    try addEntry(&db, allocator, "users", "city", .{ .text = "warsaw" }, .{ .int = 1 });
+    try addEntry(&db, allocator, "users", "city", .{ .text = "warsaw" }, .{ .int = 2 });
+    try addEntry(&db, allocator, "users", "city", .{ .text = "krakow" }, .{ .int = 3 });
+
+    const warsawPks = try scanEq(&db, allocator, "users", "city", .{ .text = "warsaw" });
+    defer {
+        for (warsawPks) |v| v.free(allocator);
+        allocator.free(warsawPks);
+    }
+    try std.testing.expectEqual(@as(usize, 2), warsawPks.len);
+
+    try removeEntry(&db, allocator, "users", "city", .{ .text = "warsaw" }, .{ .int = 1 });
+    const afterRemove = try scanEq(&db, allocator, "users", "city", .{ .text = "warsaw" });
+    defer {
+        for (afterRemove) |v| v.free(allocator);
+        allocator.free(afterRemove);
+    }
+    try std.testing.expectEqual(@as(usize, 1), afterRemove.len);
+    try std.testing.expectEqual(@as(i64, 2), afterRemove[0].int);
+}
+
+test "EqCursor streams the same pks as eager scanEq and can stop early" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    var i: i64 = 0;
+    while (i < 20) : (i += 1) {
+        try addEntry(&db, allocator, "users", "city", .{ .text = "warsaw" }, .{ .int = i });
+    }
+
+    const eager = try scanEq(&db, allocator, "users", "city", .{ .text = "warsaw" });
+    defer {
+        for (eager) |v| v.free(allocator);
+        allocator.free(eager);
+    }
+    try std.testing.expectEqual(@as(usize, 20), eager.len);
+
+    // Pull only the first three through the cursor, then drop it: this must
+    // neither read nor decode the remaining seventeen entries, and the
+    // testing allocator would flag a leak if the partially-consumed
+    // RangeIterator's resources were not released on an early deinit.
+    var cursor = try scanEqCursor(&db, allocator, "users", "city", .{ .text = "warsaw" });
+    defer cursor.deinit();
+    var pulled = std.ArrayList(Value).init(allocator);
+    defer {
+        for (pulled.items) |v| v.free(allocator);
+        pulled.deinit();
+    }
+    var n: usize = 0;
+    while (n < 3) : (n += 1) {
+        const pk = (try cursor.next(allocator)).?;
+        try pulled.append(pk);
+    }
+    try std.testing.expectEqual(@as(usize, 3), pulled.items.len);
+    for (pulled.items, 0..) |v, idx2| {
+        try std.testing.expectEqual(eager[idx2].int, v.int);
+    }
+}
+
+test "RangeCursor streams the same pks as eager scanRange and can stop early" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    var i: i64 = 0;
+    while (i < 30) : (i += 1) {
+        try addEntry(&db, allocator, "events", "score", .{ .int = i }, .{ .int = i });
+    }
+
+    var cursor = try scanRangeCursor(&db, allocator, "events", "score", .{ .value = .{ .int = 5 }, .inclusive = true }, null);
+    defer cursor.deinit();
+    const first = (try cursor.next(allocator)).?;
+    defer first.free(allocator);
+    const second = (try cursor.next(allocator)).?;
+    defer second.free(allocator);
+    try std.testing.expectEqual(@as(i64, 5), first.int);
+    try std.testing.expectEqual(@as(i64, 6), second.int);
+    // cursor and its underlying iterator are dropped by `defer` here without
+    // consuming the other 23 matches.
+}
+
+test "scanRange respects bounds and inclusivity" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    var i: i64 = 0;
+    while (i < 10) : (i += 1) {
+        try addEntry(&db, allocator, "events", "score", .{ .int = i }, .{ .int = i });
+    }
+
+    const all = try scanRange(&db, allocator, "events", "score", null, null);
+    defer {
+        for (all) |v| v.free(allocator);
+        allocator.free(all);
+    }
+    try std.testing.expectEqual(@as(usize, 10), all.len);
+
+    const midInclusive = try scanRange(&db, allocator, "events", "score", .{ .value = .{ .int = 3 }, .inclusive = true }, .{ .value = .{ .int = 6 }, .inclusive = true });
+    defer {
+        for (midInclusive) |v| v.free(allocator);
+        allocator.free(midInclusive);
+    }
+    try std.testing.expectEqual(@as(usize, 4), midInclusive.len);
+    try std.testing.expectEqual(@as(i64, 3), midInclusive[0].int);
+    try std.testing.expectEqual(@as(i64, 6), midInclusive[midInclusive.len - 1].int);
+
+    const midExclusive = try scanRange(&db, allocator, "events", "score", .{ .value = .{ .int = 3 }, .inclusive = false }, .{ .value = .{ .int = 6 }, .inclusive = false });
+    defer {
+        for (midExclusive) |v| v.free(allocator);
+        allocator.free(midExclusive);
+    }
+    try std.testing.expectEqual(@as(usize, 2), midExclusive.len);
+    try std.testing.expectEqual(@as(i64, 4), midExclusive[0].int);
+    try std.testing.expectEqual(@as(i64, 5), midExclusive[1].int);
+
+    const openAbove = try scanRange(&db, allocator, "events", "score", .{ .value = .{ .int = 8 }, .inclusive = true }, null);
+    defer {
+        for (openAbove) |v| v.free(allocator);
+        allocator.free(openAbove);
+    }
+    try std.testing.expectEqual(@as(usize, 2), openAbove.len);
+}
+
+test "CompositeIndexSet add remove save load round trip" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    var set = try CompositeIndexSet.load(allocator, &db, "users");
+    defer set.deinit();
+    try std.testing.expectEqual(@as(usize, 0), set.specs.items.len);
+
+    try set.add("city_age", &.{ "city", "age" });
+    try set.add("city_age", &.{ "city", "age" }); // no-op, already present
+    try std.testing.expectEqual(@as(usize, 1), set.specs.items.len);
+    try set.save(&db, "users");
+
+    var reloaded = try CompositeIndexSet.load(allocator, &db, "users");
+    defer reloaded.deinit();
+    try std.testing.expect(reloaded.has("city_age"));
+    const spec = reloaded.find("city_age").?;
+    try std.testing.expectEqual(@as(usize, 2), spec.fields.len);
+    try std.testing.expectEqualStrings("city", spec.fields[0]);
+    try std.testing.expectEqualStrings("age", spec.fields[1]);
+
+    try std.testing.expect(reloaded.remove("city_age"));
+    try std.testing.expect(!reloaded.remove("city_age"));
+    try reloaded.save(&db, "users");
+
+    var third = try CompositeIndexSet.load(allocator, &db, "users");
+    defer third.deinit();
+    try std.testing.expect(!third.has("city_age"));
+}
+
+test "single-field and composite index metadata never shadow each other" {
+    // Both live under the "M" tag with table-name-suffixed keys that differ
+    // only in "INDEXES" vs "CINDEXES" - this pins down that they stay two
+    // genuinely distinct Db keys, not one overwriting the other.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    var single = try IndexSet.load(allocator, &db, "users");
+    defer single.deinit();
+    try single.add("email");
+    try single.save(&db, "users");
+
+    var composite = try CompositeIndexSet.load(allocator, &db, "users");
+    defer composite.deinit();
+    try composite.add("city_age", &.{ "city", "age" });
+    try composite.save(&db, "users");
+
+    var singleReloaded = try IndexSet.load(allocator, &db, "users");
+    defer singleReloaded.deinit();
+    try std.testing.expect(singleReloaded.has("email"));
+
+    var compositeReloaded = try CompositeIndexSet.load(allocator, &db, "users");
+    defer compositeReloaded.deinit();
+    try std.testing.expect(compositeReloaded.has("city_age"));
+}
+
+test "addCompositeEntry scanCompositeEq removeCompositeEntry round trip" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    try addCompositeEntry(&db, allocator, "users", "city_age", &.{ .{ .text = "warsaw" }, .{ .int = 30 } }, .{ .int = 1 });
+    try addCompositeEntry(&db, allocator, "users", "city_age", &.{ .{ .text = "warsaw" }, .{ .int = 40 } }, .{ .int = 2 });
+    try addCompositeEntry(&db, allocator, "users", "city_age", &.{ .{ .text = "krakow" }, .{ .int = 30 } }, .{ .int = 3 });
+
+    // Full-tuple match: exactly one row.
+    const exact = try scanCompositeEq(&db, allocator, "users", "city_age", &.{ .{ .text = "warsaw" }, .{ .int = 30 } });
+    defer {
+        for (exact) |v| v.free(allocator);
+        allocator.free(exact);
+    }
+    try std.testing.expectEqual(@as(usize, 1), exact.len);
+    try std.testing.expectEqual(@as(i64, 1), exact[0].int);
+
+    // Leftmost-prefix match on just the first column: both warsaw rows,
+    // never the krakow one, even though it wasn't constrained on age at all.
+    const prefixMatch = try scanCompositeEq(&db, allocator, "users", "city_age", &.{.{ .text = "warsaw" }});
+    defer {
+        for (prefixMatch) |v| v.free(allocator);
+        allocator.free(prefixMatch);
+    }
+    try std.testing.expectEqual(@as(usize, 2), prefixMatch.len);
+
+    try removeCompositeEntry(&db, allocator, "users", "city_age", &.{ .{ .text = "warsaw" }, .{ .int = 30 } }, .{ .int = 1 });
+    const afterRemove = try scanCompositeEq(&db, allocator, "users", "city_age", &.{.{ .text = "warsaw" }});
+    defer {
+        for (afterRemove) |v| v.free(allocator);
+        allocator.free(afterRemove);
+    }
+    try std.testing.expectEqual(@as(usize, 1), afterRemove.len);
+    try std.testing.expectEqual(@as(i64, 2), afterRemove[0].int);
+}
+
+test "scanCompositeRangeCursor narrows on the column after the matched prefix" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    // Two cities, ages 20..29 in each - the composite index is (city, age).
+    var age: i64 = 20;
+    while (age < 30) : (age += 1) {
+        try addCompositeEntry(&db, allocator, "users", "city_age", &.{ .{ .text = "warsaw" }, .{ .int = age } }, .{ .int = age });
+        try addCompositeEntry(&db, allocator, "users", "city_age", &.{ .{ .text = "krakow" }, .{ .int = age } }, .{ .int = age + 100 });
+    }
+
+    // city == "warsaw" and 23 <= age <= 26: never crosses into krakow's
+    // bucket even though its ages overlap byte-for-byte with warsaw's.
+    var midCursor = try scanCompositeRangeCursor(&db, allocator, "users", "city_age", &.{.{ .text = "warsaw" }}, .{ .value = .{ .int = 23 }, .inclusive = true }, .{ .value = .{ .int = 26 }, .inclusive = true });
+    var midInclusive = std.ArrayList(Value).init(allocator);
+    defer midInclusive.deinit();
+    while (try midCursor.next(allocator)) |pk| try midInclusive.append(pk);
+    midCursor.deinit();
+    try std.testing.expectEqual(@as(usize, 4), midInclusive.items.len);
+    try std.testing.expectEqual(@as(i64, 23), midInclusive.items[0].int);
+    try std.testing.expectEqual(@as(i64, 26), midInclusive.items[midInclusive.items.len - 1].int);
+
+    // Exclusive both sides: drops the two endpoints.
+    var exclusive = try scanCompositeRangeCursor(&db, allocator, "users", "city_age", &.{.{ .text = "warsaw" }}, .{ .value = .{ .int = 23 }, .inclusive = false }, .{ .value = .{ .int = 26 }, .inclusive = false });
+    defer exclusive.deinit();
+    const first = (try exclusive.next(allocator)).?;
+    defer first.free(allocator);
+    const second = (try exclusive.next(allocator)).?;
+    defer second.free(allocator);
+    try std.testing.expectEqual(@as(i64, 24), first.int);
+    try std.testing.expectEqual(@as(i64, 25), second.int);
+    try std.testing.expectEqual(@as(?Value, null), try exclusive.next(allocator));
+
+    // Open above: age >= 28 within warsaw only, never touching krakow.
+    var openAbove = try scanCompositeRangeCursor(&db, allocator, "users", "city_age", &.{.{ .text = "warsaw" }}, .{ .value = .{ .int = 28 }, .inclusive = true }, null);
+    defer openAbove.deinit();
+    const a1 = (try openAbove.next(allocator)).?;
+    defer a1.free(allocator);
+    const a2 = (try openAbove.next(allocator)).?;
+    defer a2.free(allocator);
+    try std.testing.expectEqual(@as(i64, 28), a1.int);
+    try std.testing.expectEqual(@as(i64, 29), a2.int);
+    try std.testing.expectEqual(@as(?Value, null), try openAbove.next(allocator));
+}
+
+test "dropAllCompositeEntries clears an index without touching another one" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+
+    var db = try Db.open(allocator, dbPath, .{});
+    defer db.close();
+
+    try addCompositeEntry(&db, allocator, "users", "city_age", &.{ .{ .text = "warsaw" }, .{ .int = 30 } }, .{ .int = 1 });
+    try addCompositeEntry(&db, allocator, "users", "other_idx", &.{ .{ .int = 1 }, .{ .int = 2 } }, .{ .int = 1 });
+
+    try dropAllCompositeEntries(&db, allocator, "users", "city_age");
+
+    const cityAge = try scanCompositeEq(&db, allocator, "users", "city_age", &.{.{ .text = "warsaw" }});
+    defer {
+        for (cityAge) |v| v.free(allocator);
+        allocator.free(cityAge);
+    }
+    try std.testing.expectEqual(@as(usize, 0), cityAge.len);
+
+    const other = try scanCompositeEq(&db, allocator, "users", "other_idx", &.{.{ .int = 1 }});
+    defer {
+        for (other) |v| v.free(allocator);
+        allocator.free(other);
+    }
+    try std.testing.expectEqual(@as(usize, 1), other.len);
+}
