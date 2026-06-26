@@ -948,3 +948,165 @@ pub fn addEntry(db: *Db, allocator: Allocator, table: []const u8, field: []const
     try db.put(key, pkBytes);
 }
 
+pub fn removeEntry(db: *Db, allocator: Allocator, table: []const u8, field: []const u8, value: Value, pk: Value) !void {
+    const key = try indexEntryKey(allocator, table, field, value, pk);
+    defer allocator.free(key);
+    try db.delete(key);
+}
+
+/// Deletes every index entry for `table.field`, used when dropping an index.
+pub fn dropAllEntries(db: *Db, allocator: Allocator, table: []const u8, field: []const u8) !void {
+    const prefix = try indexPrefix(allocator, table, field);
+    defer allocator.free(prefix);
+
+    var keys = std.ArrayList([]u8).init(allocator);
+    defer {
+        for (keys.items) |k| allocator.free(k);
+        keys.deinit();
+    }
+
+    var it = try db.scanPrefix(allocator, prefix);
+    defer it.deinit();
+    while (try it.next()) |entry| {
+        try keys.append(try allocator.dupe(u8, entry.key));
+    }
+    for (keys.items) |k| try db.delete(k);
+}
+
+/// Adds one composite index entry mapping the full `values` tuple -> `pk`
+/// under `table`'s index `indexName`. Same stored-value convention as
+/// `addEntry`: the plain (non order-preserving) pk encoding.
+pub fn addCompositeEntry(db: *Db, allocator: Allocator, table: []const u8, indexName: []const u8, values: []const Value, pk: Value) !void {
+    const key = try compositeIndexEntryKey(allocator, table, indexName, values, pk);
+    defer allocator.free(key);
+    const pkBytes = try row.encodeValue(allocator, pk);
+    defer allocator.free(pkBytes);
+    try db.put(key, pkBytes);
+}
+
+pub fn removeCompositeEntry(db: *Db, allocator: Allocator, table: []const u8, indexName: []const u8, values: []const Value, pk: Value) !void {
+    const key = try compositeIndexEntryKey(allocator, table, indexName, values, pk);
+    defer allocator.free(key);
+    try db.delete(key);
+}
+
+/// Deletes every entry for a composite index, used when dropping it.
+pub fn dropAllCompositeEntries(db: *Db, allocator: Allocator, table: []const u8, indexName: []const u8) !void {
+    const prefix = try compositeIndexPrefix(allocator, table, indexName);
+    defer allocator.free(prefix);
+
+    var keys = std.ArrayList([]u8).init(allocator);
+    defer {
+        for (keys.items) |k| allocator.free(k);
+        keys.deinit();
+    }
+
+    var it = try db.scanPrefix(allocator, prefix);
+    defer it.deinit();
+    while (try it.next()) |entry| {
+        try keys.append(try allocator.dupe(u8, entry.key));
+    }
+    for (keys.items) |k| try db.delete(k);
+}
+
+/// Lazy cursor over a leftmost-prefix equality lookup on a composite index:
+/// `valuesPrefix` may cover all of the index's columns or just a leading
+/// subset of them. Streaming for the same reason as `EqCursor`.
+pub const CompositeEqCursor = struct {
+    it: dbmod.RangeIterator,
+
+    pub fn next(self: *CompositeEqCursor, allocator: Allocator) !?Value {
+        const entry = try self.it.next() orelse return null;
+        return try row.decodeValue(allocator, entry.value);
+    }
+
+    pub fn deinit(self: *CompositeEqCursor) void {
+        self.it.deinit();
+    }
+};
+
+pub fn scanCompositeEqCursor(db: *Db, allocator: Allocator, table: []const u8, indexName: []const u8, valuesPrefix: []const Value) !CompositeEqCursor {
+    const prefix = try compositeIndexValueBound(allocator, table, indexName, valuesPrefix);
+    defer allocator.free(prefix);
+    return .{ .it = try db.scanPrefix(allocator, prefix) };
+}
+
+/// Eager counterpart of `scanCompositeEqCursor`, all matching primary keys.
+pub fn scanCompositeEq(db: *Db, allocator: Allocator, table: []const u8, indexName: []const u8, valuesPrefix: []const Value) ![]Value {
+    var cursor = try scanCompositeEqCursor(db, allocator, table, indexName, valuesPrefix);
+    defer cursor.deinit();
+
+    var results = std.ArrayList(Value).init(allocator);
+    errdefer {
+        for (results.items) |v| v.free(allocator);
+        results.deinit();
+    }
+    while (try cursor.next(allocator)) |pk| try results.append(pk);
+    return results.toOwnedSlice();
+}
+
+/// Lazy cursor over a range lookup on the column immediately following a
+/// leftmost-prefix of equality columns on a composite index: `eqValues`
+/// pins the leading columns exactly like `CompositeEqCursor`, `low`/`high`
+/// bound the next column. Columns beyond that one are left unconstrained by
+/// the scan, same leftmost-prefix rule as the equality-only cursor.
+pub const CompositeRangeCursor = struct {
+    it: dbmod.RangeIterator,
+
+    pub fn next(self: *CompositeRangeCursor, allocator: Allocator) !?Value {
+        const entry = try self.it.next() orelse return null;
+        return try row.decodeValue(allocator, entry.value);
+    }
+
+    pub fn deinit(self: *CompositeRangeCursor) void {
+        self.it.deinit();
+    }
+};
+
+pub fn scanCompositeRangeCursor(
+    db: *Db,
+    allocator: Allocator,
+    table: []const u8,
+    indexName: []const u8,
+    eqValues: []const Value,
+    low: ?Bound,
+    high: ?Bound,
+) !CompositeRangeCursor {
+    const prefix = try compositeIndexValueBound(allocator, table, indexName, eqValues);
+    defer allocator.free(prefix);
+
+    var startBuf: ?[]u8 = null;
+    defer if (startBuf) |b| allocator.free(b);
+    var endBuf: ?[]u8 = null;
+    defer if (endBuf) |b| allocator.free(b);
+
+    // Same inclusive/exclusive gap trick as `scanRangeCursor`: a real entry
+    // key is always `compositeIndexRangeBound(eqValues, value) ++ orderedPk`,
+    // a strict byte-extension of the bare per-value bound (pk encodings are
+    // never empty), so a key with value == threshold always sorts after
+    // `compositeIndexRangeBound(eqValues, threshold)` itself.
+    const start = if (low) |b| blk: {
+        const bound = try compositeIndexRangeBound(allocator, table, indexName, eqValues, b.value);
+        if (b.inclusive) {
+            startBuf = bound;
+        } else {
+            defer allocator.free(bound);
+            startBuf = try prefixUpperBound(allocator, bound) orelse try allocator.dupe(u8, bound);
+        }
+        break :blk startBuf.?;
+    } else prefix;
+
+    const end = if (high) |b| blk: {
+        const bound = try compositeIndexRangeBound(allocator, table, indexName, eqValues, b.value);
+        if (b.inclusive) {
+            defer allocator.free(bound);
+            endBuf = try prefixUpperBound(allocator, bound) orelse try allocator.dupe(u8, bound);
+        } else {
+            endBuf = bound;
+        }
+        break :blk endBuf.?;
+    } else blk: {
+        endBuf = try prefixUpperBound(allocator, prefix) orelse try allocator.dupe(u8, prefix);
+        break :blk endBuf.?;
+    };
+
