@@ -477,3 +477,120 @@ test "csv export then import round trips every row and field exactly" {
     try expectRoundTripped(&dstTable);
 }
 
+test "json export then import round trips every row and field exactly" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "people");
+    defer table.deinit();
+    try seedTable(&table);
+
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const exported = try exportJsonWriter(allocator, &table, buf.writer());
+    try testing.expectEqual(@as(usize, 3), exported);
+
+    var dstTmp = std.testing.tmpDir(.{});
+    defer dstTmp.cleanup();
+    var dstDb = try openTemp(&dstTmp, allocator);
+    defer dstDb.close();
+    var dstTable = try Table.open(&dstDb, allocator, "people");
+    defer dstTable.deinit();
+
+    const imported = try importJsonContent(allocator, &dstTable, buf.items);
+    try testing.expectEqual(@as(usize, 3), imported);
+
+    try expectRoundTripped(&dstTable);
+}
+
+test "csv export of an empty table is just a header row and imports back to zero rows" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    var table = try Table.open(&db, allocator, "empty");
+    defer table.deinit();
+
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const exported = try exportCsvWriter(allocator, &table, buf.writer());
+    try testing.expectEqual(@as(usize, 0), exported);
+    try testing.expectEqualStrings("__pk\n", buf.items);
+
+    const imported = try importCsvContent(allocator, &table, buf.items);
+    try testing.expectEqual(@as(usize, 0), imported);
+}
+
+test "csv import rejects a header without the primary key column" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    var table = try Table.open(&db, allocator, "people");
+    defer table.deinit();
+
+    try testing.expectError(error.MissingPrimaryKey, importCsvContent(allocator, &table, "city\ns:warsaw\n"));
+}
+
+test "csv import rejects a record whose field count does not match the header" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    var table = try Table.open(&db, allocator, "people");
+    defer table.deinit();
+
+    try testing.expectError(error.MalformedCsv, importCsvContent(allocator, &table, "__pk,city\ni:1,s:warsaw,s:extra\n"));
+}
+
+test "json import rejects a non-array root and a non-string cell value" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    var table = try Table.open(&db, allocator, "people");
+    defer table.deinit();
+
+    try testing.expectError(error.MalformedJson, importJsonContent(allocator, &table, "{}"));
+    try testing.expectError(error.MalformedJson, importJsonContent(allocator, &table, "[{\"__pk\": 1}]"));
+}
+
+test "export csv and json to real files then import from real files round trips" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    var table = try Table.open(&db, allocator, "people");
+    defer table.deinit();
+    try seedTable(&table);
+
+    const csvPath = "test-dump-people.csv";
+    const jsonPath = "test-dump-people.json";
+    defer std.fs.cwd().deleteFile(csvPath) catch {};
+    defer std.fs.cwd().deleteFile(jsonPath) catch {};
+
+    try testing.expectEqual(@as(usize, 3), try exportCsv(allocator, &table, csvPath));
+    try testing.expectEqual(@as(usize, 3), try exportJson(allocator, &table, jsonPath));
+
+    var dstTmp = std.testing.tmpDir(.{});
+    defer dstTmp.cleanup();
+    var dstDb = try openTemp(&dstTmp, allocator);
+    defer dstDb.close();
+    var csvTable = try Table.open(&dstDb, allocator, "from_csv");
+    defer csvTable.deinit();
+    var jsonTable = try Table.open(&dstDb, allocator, "from_json");
+    defer jsonTable.deinit();
+
+    try testing.expectEqual(@as(usize, 3), try importCsv(allocator, &csvTable, csvPath));
+    try testing.expectEqual(@as(usize, 3), try importJson(allocator, &jsonTable, jsonPath));
+    try expectRoundTripped(&csvTable);
+    try expectRoundTripped(&jsonTable);
+}

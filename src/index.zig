@@ -1,0 +1,950 @@
+const std = @import("std");
+const dbmod = @import("db.zig");
+const row = @import("row.zig");
+
+const Allocator = std.mem.Allocator;
+const Db = dbmod.Db;
+const Value = row.Value;
+
+/// Keyspace layout shared by every table and index living inside a single
+/// Db instance:
+///   "R\x00" table "\x00" orderedPk                 -> encoded Row
+///   "I\x00" table "\x00" field "\x00" orderedValue orderedPk -> encoded pk Value
+///   "J\x00" table "\x00" indexName "\x00" orderedValue1 .. orderedValueN orderedPk -> encoded pk Value
+///   "M\x00INDEXES\x00" table                        -> encoded list of indexed field names
+///   "M\x00CINDEXES\x00" table                       -> encoded list of composite index specs
+///   "M\x00UNIQUE\x00" table                         -> encoded list of UNIQUE-constrained field names
+///   "M\x00FKEYS\x00" table                          -> encoded list of FOREIGN KEY specs (field, refTable, refField)
+///   "M\x00CHECKS\x00" table                         -> encoded list of CHECK constraint specs (name, expr source)
+///   "M\x00REFBY\x00" table                          -> encoded list of reverse FK specs (childTable, childField, refField),
+///                                                       one entry per OTHER table's FOREIGN KEY that names this table+refField
+///
+/// All namespaces share one flat LSM keyspace (there is only one Db), so the
+/// leading tag byte plus NUL separators keep tables, single-field indexes,
+/// composite indexes, and metadata from ever colliding or shadowing each
+/// other during a scan. A composite index entry's value columns are just N
+/// single-column `row.appendOrdered` encodings concatenated in the index's
+/// declared field order ahead of the primary key's - each encoding is
+/// already self-delimiting (fixed width for none/boolean/int/float, a
+/// 0x00 0x00 terminator for text/bytes with 0x00 bytes escaped), so the
+/// concatenation compares byte-for-byte in exactly the same order as
+/// comparing the value tuples component by component. That is what makes a
+/// prefix scan over the leading K of N components ("leftmost prefix" rule,
+/// same as a real multi-column B-tree index) a correct equality lookup on
+/// just those K columns, unconstrained on the rest.
+pub const rowTag: u8 = 'R';
+pub const indexTag: u8 = 'I';
+pub const compositeIndexTag: u8 = 'J';
+pub const metaTag: u8 = 'M';
+const sep: u8 = 0x00;
+
+fn appendSegment(out: *std.ArrayList(u8), segment: []const u8) !void {
+    try out.appendSlice(segment);
+    try out.append(sep);
+}
+
+pub fn rowPrefix(allocator: Allocator, table: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(rowTag);
+    try appendSegment(&out, table);
+    return out.toOwnedSlice();
+}
+
+pub fn rowKey(allocator: Allocator, table: []const u8, pk: Value) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(rowTag);
+    try appendSegment(&out, table);
+    try row.appendOrdered(&out, pk);
+    return out.toOwnedSlice();
+}
+
+pub fn indexPrefix(allocator: Allocator, table: []const u8, field: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(indexTag);
+    try appendSegment(&out, table);
+    try appendSegment(&out, field);
+    return out.toOwnedSlice();
+}
+
+pub fn indexEntryKey(allocator: Allocator, table: []const u8, field: []const u8, value: Value, pk: Value) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(indexTag);
+    try appendSegment(&out, table);
+    try appendSegment(&out, field);
+    try row.appendOrdered(&out, value);
+    try row.appendOrdered(&out, pk);
+    return out.toOwnedSlice();
+}
+
+pub fn indexValueBound(allocator: Allocator, table: []const u8, field: []const u8, value: Value) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(indexTag);
+    try appendSegment(&out, table);
+    try appendSegment(&out, field);
+    try row.appendOrdered(&out, value);
+    return out.toOwnedSlice();
+}
+
+fn metaKey(allocator: Allocator, table: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(metaTag);
+    try appendSegment(&out, "INDEXES");
+    try out.appendSlice(table);
+    return out.toOwnedSlice();
+}
+
+fn compositeMetaKey(allocator: Allocator, table: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(metaTag);
+    try appendSegment(&out, "CINDEXES");
+    try out.appendSlice(table);
+    return out.toOwnedSlice();
+}
+
+fn uniqueMetaKey(allocator: Allocator, table: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(metaTag);
+    try appendSegment(&out, "UNIQUE");
+    try out.appendSlice(table);
+    return out.toOwnedSlice();
+}
+
+fn foreignKeyMetaKey(allocator: Allocator, table: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(metaTag);
+    try appendSegment(&out, "FKEYS");
+    try out.appendSlice(table);
+    return out.toOwnedSlice();
+}
+
+fn checkMetaKey(allocator: Allocator, table: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(metaTag);
+    try appendSegment(&out, "CHECKS");
+    try out.appendSlice(table);
+    return out.toOwnedSlice();
+}
+
+fn referencedByMetaKey(allocator: Allocator, table: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(metaTag);
+    try appendSegment(&out, "REFBY");
+    try out.appendSlice(table);
+    return out.toOwnedSlice();
+}
+
+pub fn compositeIndexPrefix(allocator: Allocator, table: []const u8, indexName: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(compositeIndexTag);
+    try appendSegment(&out, table);
+    try appendSegment(&out, indexName);
+    return out.toOwnedSlice();
+}
+
+pub fn compositeIndexEntryKey(allocator: Allocator, table: []const u8, indexName: []const u8, values: []const Value, pk: Value) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(compositeIndexTag);
+    try appendSegment(&out, table);
+    try appendSegment(&out, indexName);
+    for (values) |v| try row.appendOrdered(&out, v);
+    try row.appendOrdered(&out, pk);
+    return out.toOwnedSlice();
+}
+
+/// Bound for a leftmost-prefix scan of a composite index: `values.len` may
+/// be less than the index's full column count, in which case the scan
+/// matches every entry whose leading columns equal `values` regardless of
+/// what the remaining (unconstrained) columns hold - see the module-level
+/// keyspace comment for why the concatenation makes this a correct prefix.
+pub fn compositeIndexValueBound(allocator: Allocator, table: []const u8, indexName: []const u8, values: []const Value) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(compositeIndexTag);
+    try appendSegment(&out, table);
+    try appendSegment(&out, indexName);
+    for (values) |v| try row.appendOrdered(&out, v);
+    return out.toOwnedSlice();
+}
+
+/// Bound for a composite index scan that pins `eqValues` as the leading
+/// columns (leftmost prefix, same as `compositeIndexValueBound`) and then
+/// appends one more ordered value for a range condition on the very next
+/// column - the byte-extension argument from the module-level keyspace
+/// comment applies here exactly as it does for a bare `indexValueBound`, so
+/// `scanCompositeRangeCursor` can reuse the same inclusive/exclusive
+/// gap trick `scanRangeCursor` uses for single-field indexes.
+fn compositeIndexRangeBound(allocator: Allocator, table: []const u8, indexName: []const u8, eqValues: []const Value, extra: Value) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.append(compositeIndexTag);
+    try appendSegment(&out, table);
+    try appendSegment(&out, indexName);
+    for (eqValues) |v| try row.appendOrdered(&out, v);
+    try row.appendOrdered(&out, extra);
+    return out.toOwnedSlice();
+}
+
+/// Smallest byte string strictly greater than every string with `prefix` as
+/// a prefix, used as the exclusive upper bound of a prefix scan. Returns
+/// null when the prefix is all 0xFF bytes (unbounded above, e.g. empty
+/// table/field names never hit this in practice).
+pub fn prefixUpperBound(allocator: Allocator, prefix: []const u8) !?[]u8 {
+    var end = prefix.len;
+    while (end > 0 and prefix[end - 1] == 0xff) end -= 1;
+    if (end == 0) return null;
+    const upper = try allocator.alloc(u8, end);
+    @memcpy(upper, prefix[0..end]);
+    upper[end - 1] += 1;
+    return upper;
+}
+
+/// Whether a table name or field name is safe to embed as a NUL-delimited
+/// keyspace segment: table/field identifiers may not themselves contain
+/// NUL bytes or they would corrupt the segment boundaries above.
+pub fn validIdentifier(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (c == sep) return false;
+    }
+    return true;
+}
+
+/// Persisted set of field names that have a secondary index on a table.
+/// Loaded once per Table.open and written back to the Db's metadata
+/// namespace whenever an index is created or dropped, so indexes survive
+/// process restarts without any external schema file.
+pub const IndexSet = struct {
+    allocator: Allocator,
+    fields: std.ArrayList([]u8),
+
+    pub fn load(allocator: Allocator, db: *Db, table: []const u8) !IndexSet {
+        const key = try metaKey(allocator, table);
+        defer allocator.free(key);
+
+        var set = IndexSet{ .allocator = allocator, .fields = std.ArrayList([]u8).init(allocator) };
+        errdefer set.deinit();
+
+        const raw = try db.get(allocator, key) orelse return set;
+        defer allocator.free(raw);
+
+        var pos: usize = 0;
+        if (pos + 4 > raw.len) return error.Malformed;
+        const count = std.mem.readInt(u32, raw[pos..][0..4], .little);
+        pos += 4;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            if (pos + 4 > raw.len) return error.Malformed;
+            const len = std.mem.readInt(u32, raw[pos..][0..4], .little);
+            pos += 4;
+            if (pos + len > raw.len) return error.Malformed;
+            const name = try allocator.dupe(u8, raw[pos .. pos + len]);
+            pos += len;
+            try set.fields.append(name);
+        }
+        return set;
+    }
+
+    pub fn save(self: *const IndexSet, db: *Db, table: []const u8) !void {
+        const key = try metaKey(self.allocator, table);
+        defer self.allocator.free(key);
+
+        var out = std.ArrayList(u8).init(self.allocator);
+        defer out.deinit();
+        var countBuf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &countBuf, @intCast(self.fields.items.len), .little);
+        try out.appendSlice(&countBuf);
+        for (self.fields.items) |name| {
+            var lenBuf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &lenBuf, @intCast(name.len), .little);
+            try out.appendSlice(&lenBuf);
+            try out.appendSlice(name);
+        }
+        try db.put(key, out.items);
+    }
+
+    pub fn has(self: *const IndexSet, field: []const u8) bool {
+        for (self.fields.items) |f| {
+            if (std.mem.eql(u8, f, field)) return true;
+        }
+        return false;
+    }
+
+    pub fn add(self: *IndexSet, field: []const u8) !void {
+        if (self.has(field)) return;
+        const copy = try self.allocator.dupe(u8, field);
+        try self.fields.append(copy);
+    }
+
+    /// Returns true if the field was present and has been removed.
+    pub fn remove(self: *IndexSet, field: []const u8) bool {
+        for (self.fields.items, 0..) |f, i| {
+            if (std.mem.eql(u8, f, field)) {
+                self.allocator.free(f);
+                _ = self.fields.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn deinit(self: *IndexSet) void {
+        for (self.fields.items) |f| self.allocator.free(f);
+        self.fields.deinit();
+    }
+};
+
+/// Persisted set of field names carrying a UNIQUE constraint on a table -
+/// same on-disk shape as `IndexSet` (own meta key, own namespace), kept as
+/// a separate type because the two sets have different invariants: every
+/// member of `UniqueSet` is also required to be a member of the table's
+/// `IndexSet` (enforced by `Table.createUniqueIndex`/`Table.dropIndex`),
+/// since `Table.put` detects a colliding value by reusing the field's
+/// regular index entries via `scanEq` rather than a full table scan - a
+/// unique field with no backing index would make every write pay for a
+/// full scan just to check the constraint.
+pub const UniqueSet = struct {
+    allocator: Allocator,
+    fields: std.ArrayList([]u8),
+
+    pub fn load(allocator: Allocator, db: *Db, table: []const u8) !UniqueSet {
+        const key = try uniqueMetaKey(allocator, table);
+        defer allocator.free(key);
+
+        var set = UniqueSet{ .allocator = allocator, .fields = std.ArrayList([]u8).init(allocator) };
+        errdefer set.deinit();
+
+        const raw = try db.get(allocator, key) orelse return set;
+        defer allocator.free(raw);
+
+        var pos: usize = 0;
+        if (pos + 4 > raw.len) return error.Malformed;
+        const count = std.mem.readInt(u32, raw[pos..][0..4], .little);
+        pos += 4;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            if (pos + 4 > raw.len) return error.Malformed;
+            const len = std.mem.readInt(u32, raw[pos..][0..4], .little);
+            pos += 4;
+            if (pos + len > raw.len) return error.Malformed;
+            const name = try allocator.dupe(u8, raw[pos .. pos + len]);
+            pos += len;
+            try set.fields.append(name);
+        }
+        return set;
+    }
+
+    pub fn save(self: *const UniqueSet, db: *Db, table: []const u8) !void {
+        const key = try uniqueMetaKey(self.allocator, table);
+        defer self.allocator.free(key);
+
+        var out = std.ArrayList(u8).init(self.allocator);
+        defer out.deinit();
+        var countBuf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &countBuf, @intCast(self.fields.items.len), .little);
+        try out.appendSlice(&countBuf);
+        for (self.fields.items) |name| {
+            var lenBuf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &lenBuf, @intCast(name.len), .little);
+            try out.appendSlice(&lenBuf);
+            try out.appendSlice(name);
+        }
+        try db.put(key, out.items);
+    }
+
+    pub fn has(self: *const UniqueSet, field: []const u8) bool {
+        for (self.fields.items) |f| {
+            if (std.mem.eql(u8, f, field)) return true;
+        }
+        return false;
+    }
+
+    pub fn add(self: *UniqueSet, field: []const u8) !void {
+        if (self.has(field)) return;
+        const copy = try self.allocator.dupe(u8, field);
+        try self.fields.append(copy);
+    }
+
+    /// Returns true if the field was present and has been removed.
+    pub fn remove(self: *UniqueSet, field: []const u8) bool {
+        for (self.fields.items, 0..) |f, i| {
+            if (std.mem.eql(u8, f, field)) {
+                self.allocator.free(f);
+                _ = self.fields.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn deinit(self: *UniqueSet) void {
+        for (self.fields.items) |f| self.allocator.free(f);
+        self.fields.deinit();
+    }
+};
+
+/// One FOREIGN KEY constraint: `field` on the owning table must, on every
+/// row where it is present and non-none, name a value that exists as
+/// `refField` on `refTable` (SQL's `FOREIGN KEY (field) REFERENCES
+/// refTable(refField)`). `refField` is either `query.pkField` (the
+/// referenced table's primary key, checked via a plain `get`) or a field
+/// carrying its own UNIQUE constraint on `refTable` (checked via `scanEq`) -
+/// `Table.createForeignKey` requires one of the two before installing,
+/// exactly like a real database refusing a foreign key against a column
+/// with no unique/primary-key backing, since otherwise "the value exists"
+/// would not pin down a single unambiguous parent row.
+/// SQL's `ON DELETE` clause: what a FOREIGN KEY does when the row it points
+/// at is deleted. `restrict` (the SQL default, and this codebase's only
+/// behavior before cascading deletes existed) refuses the delete outright
+/// while a referencing row still exists; `cascade` instead deletes every
+/// referencing row too, recursively (a cascaded child can itself have
+/// dependents), before the parent row itself is removed. Stored as a plain
+/// byte in `ForeignKeySpec`/`ReferencedBySpec` rather than a bare bool so a
+/// third mode (e.g. `set_null`) can be added later without another format
+/// bump.
+pub const OnDelete = enum(u8) {
+    restrict = 0,
+    cascade = 1,
+};
+
+fn onDeleteFromByte(b: u8) !OnDelete {
+    return switch (b) {
+        0 => .restrict,
+        1 => .cascade,
+        else => error.Malformed,
+    };
+}
+
+pub const ForeignKeySpec = struct {
+    field: []u8,
+    refTable: []u8,
+    refField: []u8,
+    onDelete: OnDelete,
+};
+
+/// Persisted set of FOREIGN KEY constraints on a table, at most one per
+/// owning field - same on-disk shape family as `IndexSet`/`UniqueSet` (own
+/// meta key, own namespace) but each entry carries two extra strings
+/// (`refTable`/`refField`) plus an `onDelete` mode byte instead of being a
+/// bare field name.
+pub const ForeignKeySet = struct {
+    allocator: Allocator,
+    specs: std.ArrayList(ForeignKeySpec),
+
+    pub fn load(allocator: Allocator, db: *Db, table: []const u8) !ForeignKeySet {
+        const key = try foreignKeyMetaKey(allocator, table);
+        defer allocator.free(key);
+
+        var set = ForeignKeySet{ .allocator = allocator, .specs = std.ArrayList(ForeignKeySpec).init(allocator) };
+        errdefer set.deinit();
+
+        const raw = try db.get(allocator, key) orelse return set;
+        defer allocator.free(raw);
+
+        var pos: usize = 0;
+        if (pos + 4 > raw.len) return error.Malformed;
+        const count = std.mem.readInt(u32, raw[pos..][0..4], .little);
+        pos += 4;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const field = try readLenPrefixed(allocator, raw, &pos);
+            errdefer allocator.free(field);
+            const refTable = try readLenPrefixed(allocator, raw, &pos);
+            errdefer allocator.free(refTable);
+            const refField = try readLenPrefixed(allocator, raw, &pos);
+            errdefer allocator.free(refField);
+            if (pos + 1 > raw.len) return error.Malformed;
+            const onDelete = try onDeleteFromByte(raw[pos]);
+            pos += 1;
+            try set.specs.append(.{ .field = field, .refTable = refTable, .refField = refField, .onDelete = onDelete });
+        }
+        return set;
+    }
+
+    pub fn save(self: *const ForeignKeySet, db: *Db, table: []const u8) !void {
+        const key = try foreignKeyMetaKey(self.allocator, table);
+        defer self.allocator.free(key);
+
+        var out = std.ArrayList(u8).init(self.allocator);
+        defer out.deinit();
+        var countBuf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &countBuf, @intCast(self.specs.items.len), .little);
+        try out.appendSlice(&countBuf);
+        for (self.specs.items) |spec| {
+            try appendLenPrefixed(&out, spec.field);
+            try appendLenPrefixed(&out, spec.refTable);
+            try appendLenPrefixed(&out, spec.refField);
+            try out.append(@intFromEnum(spec.onDelete));
+        }
+        try db.put(key, out.items);
+    }
+
+    pub fn has(self: *const ForeignKeySet, field: []const u8) bool {
+        return self.find(field) != null;
+    }
+
+    pub fn find(self: *const ForeignKeySet, field: []const u8) ?ForeignKeySpec {
+        for (self.specs.items) |spec| {
+            if (std.mem.eql(u8, spec.field, field)) return spec;
+        }
+        return null;
+    }
+
+    pub fn add(self: *ForeignKeySet, field: []const u8, refTable: []const u8, refField: []const u8, onDelete: OnDelete) !void {
+        if (self.has(field)) return;
+        const spec = ForeignKeySpec{
+            .field = try self.allocator.dupe(u8, field),
+            .refTable = try self.allocator.dupe(u8, refTable),
+            .refField = try self.allocator.dupe(u8, refField),
+            .onDelete = onDelete,
+        };
+        try self.specs.append(spec);
+    }
+
+    /// Returns true if a constraint on `field` was present and has been
+    /// removed.
+    pub fn remove(self: *ForeignKeySet, field: []const u8) bool {
+        for (self.specs.items, 0..) |spec, i| {
+            if (std.mem.eql(u8, spec.field, field)) {
+                self.allocator.free(spec.field);
+                self.allocator.free(spec.refTable);
+                self.allocator.free(spec.refField);
+                _ = self.specs.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn deinit(self: *ForeignKeySet) void {
+        for (self.specs.items) |spec| {
+            self.allocator.free(spec.field);
+            self.allocator.free(spec.refTable);
+            self.allocator.free(spec.refField);
+        }
+        self.specs.deinit();
+    }
+};
+
+/// One named CHECK constraint: a caller-chosen `name` (used only as the key
+/// under which the constraint can be dropped again, not part of the
+/// keyspace layout - unlike `CompositeIndexSpec.name`, no index entries are
+/// ever written for a CHECK) paired with the raw `expr.zig` predicate source
+/// text it must evaluate true against. Stored as source rather than a parsed
+/// tree because `index.zig` sits below `query.zig`/`expr.zig` in the
+/// dependency graph and knows nothing about `Predicate` - parsing happens
+/// fresh in whichever layer enforces it (`query.zig`'s `Table.put`,
+/// `txn_table.zig`'s `TableTxn.put`), the same "reparse on every use" cost
+/// `table select`/`table join` already pay for their own expr text.
+pub const CheckConstraintSpec = struct {
+    name: []u8,
+    source: []u8,
+};
+
+/// Persisted set of CHECK constraints on a table, at most one per name -
+/// same on-disk shape family as `ForeignKeySet` (own meta key, own
+/// namespace, two length-prefixed strings per entry).
+pub const CheckConstraintSet = struct {
+    allocator: Allocator,
+    specs: std.ArrayList(CheckConstraintSpec),
+
+    pub fn load(allocator: Allocator, db: *Db, table: []const u8) !CheckConstraintSet {
+        const key = try checkMetaKey(allocator, table);
+        defer allocator.free(key);
+
+        var set = CheckConstraintSet{ .allocator = allocator, .specs = std.ArrayList(CheckConstraintSpec).init(allocator) };
+        errdefer set.deinit();
+
+        const raw = try db.get(allocator, key) orelse return set;
+        defer allocator.free(raw);
+
+        var pos: usize = 0;
+        if (pos + 4 > raw.len) return error.Malformed;
+        const count = std.mem.readInt(u32, raw[pos..][0..4], .little);
+        pos += 4;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const name = try readLenPrefixed(allocator, raw, &pos);
+            errdefer allocator.free(name);
+            const source = try readLenPrefixed(allocator, raw, &pos);
+            try set.specs.append(.{ .name = name, .source = source });
+        }
+        return set;
+    }
+
+    pub fn save(self: *const CheckConstraintSet, db: *Db, table: []const u8) !void {
+        const key = try checkMetaKey(self.allocator, table);
+        defer self.allocator.free(key);
+
+        var out = std.ArrayList(u8).init(self.allocator);
+        defer out.deinit();
+        var countBuf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &countBuf, @intCast(self.specs.items.len), .little);
+        try out.appendSlice(&countBuf);
+        for (self.specs.items) |spec| {
+            try appendLenPrefixed(&out, spec.name);
+            try appendLenPrefixed(&out, spec.source);
+        }
+        try db.put(key, out.items);
+    }
+
+    pub fn has(self: *const CheckConstraintSet, name: []const u8) bool {
+        return self.find(name) != null;
+    }
+
+    pub fn find(self: *const CheckConstraintSet, name: []const u8) ?CheckConstraintSpec {
+        for (self.specs.items) |spec| {
+            if (std.mem.eql(u8, spec.name, name)) return spec;
+        }
+        return null;
+    }
+
+    pub fn add(self: *CheckConstraintSet, name: []const u8, source: []const u8) !void {
+        if (self.has(name)) return;
+        const spec = CheckConstraintSpec{
+            .name = try self.allocator.dupe(u8, name),
+            .source = try self.allocator.dupe(u8, source),
+        };
+        try self.specs.append(spec);
+    }
+
+    /// Returns true if a constraint named `name` was present and has been
+    /// removed.
+    pub fn remove(self: *CheckConstraintSet, name: []const u8) bool {
+        for (self.specs.items, 0..) |spec, i| {
+            if (std.mem.eql(u8, spec.name, name)) {
+                self.allocator.free(spec.name);
+                self.allocator.free(spec.source);
+                _ = self.specs.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn deinit(self: *CheckConstraintSet) void {
+        for (self.specs.items) |spec| {
+            self.allocator.free(spec.name);
+            self.allocator.free(spec.source);
+        }
+        self.specs.deinit();
+    }
+};
+
+/// One reverse FOREIGN KEY entry, recorded on the REFERENCED table rather
+/// than the referencing one: some other table `childTable` has a
+/// `FOREIGN KEY (childField) REFERENCES <this table>(refField)`. This is
+/// the registry `Table.createForeignKey`'s doc comment calls out as
+/// missing ("tables are opened ad hoc by name and never catalogued
+/// anywhere") - without it, deleting a parent row has no way to discover
+/// which other tables might still be pointing at it, since `ForeignKeySet`
+/// is only ever stored on the referencing (child) side.
+pub const ReferencedBySpec = struct {
+    childTable: []u8,
+    childField: []u8,
+    refField: []u8,
+    onDelete: OnDelete,
+};
+
+/// Persisted set of reverse FK entries on a table - same on-disk shape
+/// family as `ForeignKeySet` (own meta key, own namespace, three
+/// length-prefixed strings plus an `onDelete` mode byte per entry), but
+/// populated by a DIFFERENT table's `createForeignKey`/`dropForeignKey`
+/// call rather than by mutations against this table directly. `onDelete`
+/// is duplicated here rather than looked up from the child's own
+/// `ForeignKeySet` on every delete, so `Table.delete`'s cascade planner
+/// (see `query.zig`'s `planCascade`) can decide restrict-vs-cascade
+/// without opening and loading the child a second time just to answer
+/// that. `add` is keyed by the (childTable, childField) pair - a child
+/// field can only ever carry one FOREIGN KEY (enforced by
+/// `ForeignKeySet.has` at the child), so at most one reverse entry per
+/// pair can ever be correct; re-adding the same pair (only reachable by
+/// first dropping and recreating the child's constraint, possibly with a
+/// different `refField`/`onDelete`) replaces it in place instead of
+/// accumulating a stale duplicate.
+pub const ReferencedBySet = struct {
+    allocator: Allocator,
+    specs: std.ArrayList(ReferencedBySpec),
+
+    pub fn load(allocator: Allocator, db: *Db, table: []const u8) !ReferencedBySet {
+        const key = try referencedByMetaKey(allocator, table);
+        defer allocator.free(key);
+
+        var set = ReferencedBySet{ .allocator = allocator, .specs = std.ArrayList(ReferencedBySpec).init(allocator) };
+        errdefer set.deinit();
+
+        const raw = try db.get(allocator, key) orelse return set;
+        defer allocator.free(raw);
+
+        var pos: usize = 0;
+        if (pos + 4 > raw.len) return error.Malformed;
+        const count = std.mem.readInt(u32, raw[pos..][0..4], .little);
+        pos += 4;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const childTable = try readLenPrefixed(allocator, raw, &pos);
+            errdefer allocator.free(childTable);
+            const childField = try readLenPrefixed(allocator, raw, &pos);
+            errdefer allocator.free(childField);
+            const refField = try readLenPrefixed(allocator, raw, &pos);
+            errdefer allocator.free(refField);
+            if (pos + 1 > raw.len) return error.Malformed;
+            const onDelete = try onDeleteFromByte(raw[pos]);
+            pos += 1;
+            try set.specs.append(.{ .childTable = childTable, .childField = childField, .refField = refField, .onDelete = onDelete });
+        }
+        return set;
+    }
+
+    pub fn save(self: *const ReferencedBySet, db: *Db, table: []const u8) !void {
+        const key = try referencedByMetaKey(self.allocator, table);
+        defer self.allocator.free(key);
+
+        var out = std.ArrayList(u8).init(self.allocator);
+        defer out.deinit();
+        var countBuf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &countBuf, @intCast(self.specs.items.len), .little);
+        try out.appendSlice(&countBuf);
+        for (self.specs.items) |spec| {
+            try appendLenPrefixed(&out, spec.childTable);
+            try appendLenPrefixed(&out, spec.childField);
+            try appendLenPrefixed(&out, spec.refField);
+            try out.append(@intFromEnum(spec.onDelete));
+        }
+        try db.put(key, out.items);
+    }
+
+    fn indexOf(self: *const ReferencedBySet, childTable: []const u8, childField: []const u8) ?usize {
+        for (self.specs.items, 0..) |spec, i| {
+            if (std.mem.eql(u8, spec.childTable, childTable) and std.mem.eql(u8, spec.childField, childField)) return i;
+        }
+        return null;
+    }
+
+    pub fn add(self: *ReferencedBySet, childTable: []const u8, childField: []const u8, refField: []const u8, onDelete: OnDelete) !void {
+        const refFieldCopy = try self.allocator.dupe(u8, refField);
+        errdefer self.allocator.free(refFieldCopy);
+        if (self.indexOf(childTable, childField)) |i| {
+            self.allocator.free(self.specs.items[i].refField);
+            self.specs.items[i].refField = refFieldCopy;
+            self.specs.items[i].onDelete = onDelete;
+            return;
+        }
+        const spec = ReferencedBySpec{
+            .childTable = try self.allocator.dupe(u8, childTable),
+            .childField = try self.allocator.dupe(u8, childField),
+            .refField = refFieldCopy,
+            .onDelete = onDelete,
+        };
+        try self.specs.append(spec);
+    }
+
+    /// Returns true if a reverse entry for (childTable, childField) was
+    /// present and has been removed.
+    pub fn remove(self: *ReferencedBySet, childTable: []const u8, childField: []const u8) bool {
+        const i = self.indexOf(childTable, childField) orelse return false;
+        const spec = self.specs.items[i];
+        self.allocator.free(spec.childTable);
+        self.allocator.free(spec.childField);
+        self.allocator.free(spec.refField);
+        _ = self.specs.orderedRemove(i);
+        return true;
+    }
+
+    pub fn deinit(self: *ReferencedBySet) void {
+        for (self.specs.items) |spec| {
+            self.allocator.free(spec.childTable);
+            self.allocator.free(spec.childField);
+            self.allocator.free(spec.refField);
+        }
+        self.specs.deinit();
+    }
+};
+
+fn readLenPrefixed(allocator: Allocator, raw: []const u8, pos: *usize) ![]u8 {
+    if (pos.* + 4 > raw.len) return error.Malformed;
+    const len = std.mem.readInt(u32, raw[pos.*..][0..4], .little);
+    pos.* += 4;
+    if (pos.* + len > raw.len) return error.Malformed;
+    const value = try allocator.dupe(u8, raw[pos.* .. pos.* + len]);
+    pos.* += len;
+    return value;
+}
+
+fn appendLenPrefixed(out: *std.ArrayList(u8), value: []const u8) !void {
+    var lenBuf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &lenBuf, @intCast(value.len), .little);
+    try out.appendSlice(&lenBuf);
+    try out.appendSlice(value);
+}
+
+/// One multi-column ("composite") index: a caller-chosen name (used as the
+/// keyspace discriminator, so it must be a `validIdentifier` like a table or
+/// field name) plus the ordered list of fields it indexes. Field order is
+/// significant - it defines both the on-disk key layout and which leading
+/// ("leftmost") prefix of columns a query can use for a narrowed lookup.
+pub const CompositeIndexSpec = struct {
+    name: []u8,
+    fields: [][]u8,
+
+    fn free(self: *const CompositeIndexSpec, allocator: Allocator) void {
+        allocator.free(self.name);
+        for (self.fields) |f| allocator.free(f);
+        allocator.free(self.fields);
+    }
+};
+
+/// Persisted set of composite indexes on a table, the multi-column
+/// counterpart to `IndexSet`. Stored under a separate metadata key
+/// ("CINDEXES" vs "INDEXES") so single-field and composite indexes never
+/// share or shadow each other's schema record.
+pub const CompositeIndexSet = struct {
+    allocator: Allocator,
+    specs: std.ArrayList(CompositeIndexSpec),
+
+    pub fn load(allocator: Allocator, db: *Db, table: []const u8) !CompositeIndexSet {
+        const key = try compositeMetaKey(allocator, table);
+        defer allocator.free(key);
+
+        var set = CompositeIndexSet{ .allocator = allocator, .specs = std.ArrayList(CompositeIndexSpec).init(allocator) };
+        errdefer set.deinit();
+
+        const raw = try db.get(allocator, key) orelse return set;
+        defer allocator.free(raw);
+
+        var pos: usize = 0;
+        if (pos + 4 > raw.len) return error.Malformed;
+        const specCount = std.mem.readInt(u32, raw[pos..][0..4], .little);
+        pos += 4;
+        var i: u32 = 0;
+        while (i < specCount) : (i += 1) {
+            if (pos + 4 > raw.len) return error.Malformed;
+            const nameLen = std.mem.readInt(u32, raw[pos..][0..4], .little);
+            pos += 4;
+            if (pos + nameLen > raw.len) return error.Malformed;
+            const name = try allocator.dupe(u8, raw[pos .. pos + nameLen]);
+            errdefer allocator.free(name);
+            pos += nameLen;
+
+            if (pos + 4 > raw.len) return error.Malformed;
+            const fieldCount = std.mem.readInt(u32, raw[pos..][0..4], .little);
+            pos += 4;
+            const fields = try allocator.alloc([]u8, fieldCount);
+            var filled: usize = 0;
+            errdefer {
+                for (fields[0..filled]) |f| allocator.free(f);
+                allocator.free(fields);
+            }
+            var j: u32 = 0;
+            while (j < fieldCount) : (j += 1) {
+                if (pos + 4 > raw.len) return error.Malformed;
+                const len = std.mem.readInt(u32, raw[pos..][0..4], .little);
+                pos += 4;
+                if (pos + len > raw.len) return error.Malformed;
+                fields[j] = try allocator.dupe(u8, raw[pos .. pos + len]);
+                filled += 1;
+                pos += len;
+            }
+            try set.specs.append(.{ .name = name, .fields = fields });
+        }
+        return set;
+    }
+
+    pub fn save(self: *const CompositeIndexSet, db: *Db, table: []const u8) !void {
+        const key = try compositeMetaKey(self.allocator, table);
+        defer self.allocator.free(key);
+
+        var out = std.ArrayList(u8).init(self.allocator);
+        defer out.deinit();
+        var countBuf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &countBuf, @intCast(self.specs.items.len), .little);
+        try out.appendSlice(&countBuf);
+        for (self.specs.items) |spec| {
+            var lenBuf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &lenBuf, @intCast(spec.name.len), .little);
+            try out.appendSlice(&lenBuf);
+            try out.appendSlice(spec.name);
+
+            std.mem.writeInt(u32, &lenBuf, @intCast(spec.fields.len), .little);
+            try out.appendSlice(&lenBuf);
+            for (spec.fields) |f| {
+                std.mem.writeInt(u32, &lenBuf, @intCast(f.len), .little);
+                try out.appendSlice(&lenBuf);
+                try out.appendSlice(f);
+            }
+        }
+        try db.put(key, out.items);
+    }
+
+    pub fn find(self: *const CompositeIndexSet, name: []const u8) ?*const CompositeIndexSpec {
+        for (self.specs.items) |*s| {
+            if (std.mem.eql(u8, s.name, name)) return s;
+        }
+        return null;
+    }
+
+    pub fn has(self: *const CompositeIndexSet, name: []const u8) bool {
+        return self.find(name) != null;
+    }
+
+    pub fn add(self: *CompositeIndexSet, name: []const u8, fields: []const []const u8) !void {
+        if (self.has(name)) return;
+        const nameCopy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(nameCopy);
+
+        const fieldsCopy = try self.allocator.alloc([]u8, fields.len);
+        var filled: usize = 0;
+        errdefer {
+            for (fieldsCopy[0..filled]) |f| self.allocator.free(f);
+            self.allocator.free(fieldsCopy);
+        }
+        for (fields, 0..) |f, i| {
+            fieldsCopy[i] = try self.allocator.dupe(u8, f);
+            filled += 1;
+        }
+        try self.specs.append(.{ .name = nameCopy, .fields = fieldsCopy });
+    }
+
+    /// Returns true if a composite index by that name was present and has
+    /// been removed.
+    pub fn remove(self: *CompositeIndexSet, name: []const u8) bool {
+        for (self.specs.items, 0..) |*s, i| {
+            if (std.mem.eql(u8, s.name, name)) {
+                s.free(self.allocator);
+                _ = self.specs.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn deinit(self: *CompositeIndexSet) void {
+        for (self.specs.items) |*s| s.free(self.allocator);
+        self.specs.deinit();
+    }
+};
+
+/// Adds one index entry mapping `value` -> `pk` under `table.field`. The
+/// entry's stored value is the plain (non order-preserving) encoding of the
+/// primary key, so lookups can recover the exact original Value instead of
+/// re-parsing the escaped ordered key bytes.
+pub fn addEntry(db: *Db, allocator: Allocator, table: []const u8, field: []const u8, value: Value, pk: Value) !void {
+    const key = try indexEntryKey(allocator, table, field, value, pk);
+    defer allocator.free(key);
+    const pkBytes = try row.encodeValue(allocator, pk);
+    defer allocator.free(pkBytes);
+    try db.put(key, pkBytes);
+}
+
