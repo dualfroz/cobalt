@@ -1868,6 +1868,179 @@ fn runTable(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: 
                     try printRow(stdout, pair.left);
                     if (pair.right) |r| {
                         try stdout.writeAll("R ");
+                        try printRow(stdout, r);
+                    } else {
+                        try stdout.writeAll("R (nil)\n");
+                    }
+                }
+            },
+            .right => {
+                const joined = cobalt.join.rightOuterJoin(allocator, &left, jargs[1], null, &right, jargs[3], null) catch |err| return fail(stderr, @errorName(err));
+                const paged = cobalt.join.applyPage(cobalt.join.RightOuterJoinedRow, allocator, joined, page) catch |err| return fail(stderr, @errorName(err));
+                defer cobalt.join.freeRightOuterJoined(allocator, paged);
+                for (paged) |pair| {
+                    if (pair.left) |l| {
+                        try stdout.writeAll("L ");
+                        try printRow(stdout, l);
+                    } else {
+                        try stdout.writeAll("L (nil)\n");
+                    }
+                    try stdout.writeAll("R ");
+                    try printRow(stdout, pair.right);
+                }
+            },
+            .full => {
+                const joined = cobalt.join.fullOuterJoin(allocator, &left, jargs[1], null, &right, jargs[3], null) catch |err| return fail(stderr, @errorName(err));
+                const paged = cobalt.join.applyPage(cobalt.join.FullOuterJoinedRow, allocator, joined, page) catch |err| return fail(stderr, @errorName(err));
+                defer cobalt.join.freeFullOuterJoined(allocator, paged);
+                for (paged) |pair| {
+                    if (pair.left) |l| {
+                        try stdout.writeAll("L ");
+                        try printRow(stdout, l);
+                    } else {
+                        try stdout.writeAll("L (nil)\n");
+                    }
+                    if (pair.right) |r| {
+                        try stdout.writeAll("R ");
+                        try printRow(stdout, r);
+                    } else {
+                        try stdout.writeAll("R (nil)\n");
+                    }
+                }
+            },
+        }
+    } else if (std.mem.eql(u8, sub, "aggregate")) {
+        if (args.len < 3) return fail(stderr, "table aggregate needs <table> <groupField|*> <spec>[,<spec>...] [expr...] [having <expr>] [order <field[:desc]>[,field...]] [--limit N] [--offset N]");
+        var table = try cobalt.Table.open(db, allocator, args[0]);
+        defer table.deinit();
+        const groupField = args[1];
+
+        const specs = parseAggSpecs(allocator, args[2]) catch return fail(stderr, "invalid aggregate spec (expected count | count:field | sum:field | avg:field | min:field | max:field | distinct:field, comma-separated)");
+        defer allocator.free(specs);
+
+        const flags = extractPageFlags(allocator, args[3..]) catch return fail(stderr, "invalid --limit/--offset value");
+        defer allocator.free(flags.rest);
+
+        const split = splitAggFilterArgs(flags.rest);
+
+        const exprText = try std.mem.join(allocator, " ", split.whereArgs);
+        defer allocator.free(exprText);
+        var parsed: ?cobalt.expr.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (exprText.len > 0) {
+            parsed = cobalt.expr.parse(allocator, exprText) catch |err| return fail(stderr, @errorName(err));
+        }
+        const pred: ?cobalt.Predicate = if (parsed) |p| p.predicate else null;
+
+        var havingParsed: ?cobalt.expr.Parsed = null;
+        defer if (havingParsed) |*p| p.deinit();
+        var havingPred: ?cobalt.Predicate = null;
+        if (split.havingArgs) |havingArgs| {
+            const havingText = try std.mem.join(allocator, " ", havingArgs);
+            defer allocator.free(havingText);
+            if (havingText.len == 0) return fail(stderr, "having requires an expression");
+            havingParsed = cobalt.expr.parse(allocator, havingText) catch |err| return fail(stderr, @errorName(err));
+            havingPred = havingParsed.?.predicate;
+        }
+
+        var orderBy: []cobalt.query.OrderBy = &.{};
+        defer allocator.free(orderBy);
+        if (split.orderArgs) |orderArgs| {
+            if (orderArgs.len != 1) return fail(stderr, "order requires exactly one comma-separated field list");
+            orderBy = parseOrderByList(allocator, orderArgs[0]) catch return fail(stderr, "invalid order field list");
+        }
+
+        const rows = try table.select(pred);
+        defer cobalt.query.freeRows(allocator, rows);
+
+        if (std.mem.eql(u8, groupField, "*")) {
+            const values = cobalt.aggregate.runGlobal(allocator, rows, specs) catch |err| return fail(stderr, @errorName(err));
+            defer cobalt.aggregate.freeGlobalResult(allocator, values);
+            const matches = if (havingPred) |hp|
+                cobalt.aggregate.globalMatchesHaving(allocator, specs, values, hp) catch |err| return fail(stderr, @errorName(err))
+            else
+                true;
+            if (matches) {
+                for (specs, values, 0..) |spec, v, i| {
+                    if (i > 0) try stdout.writeAll("\t");
+                    try printAggLabel(stdout, spec);
+                    try stdout.writeAll("=");
+                    try printValue(stdout, v);
+                }
+                try stdout.writeAll("\n");
+            }
+        } else {
+            const unpaged = cobalt.aggregate.run(allocator, rows, groupField, specs) catch |err| return fail(stderr, @errorName(err));
+            const filtered = if (havingPred) |hp|
+                cobalt.aggregate.filterHaving(allocator, unpaged, groupField, specs, hp) catch |err| return fail(stderr, @errorName(err))
+            else
+                unpaged;
+            if (orderBy.len > 0) {
+                cobalt.aggregate.sortGroupsBy(allocator, filtered, groupField, specs, orderBy) catch |err| return fail(stderr, @errorName(err));
+            }
+            const groups = cobalt.aggregate.applyPageGroups(allocator, filtered, .{ .offset = flags.page.offset, .limit = flags.page.limit }) catch |err| return fail(stderr, @errorName(err));
+            defer {
+                for (groups) |*g| g.deinit(allocator);
+                allocator.free(groups);
+            }
+            for (groups) |g| {
+                try stdout.writeAll("group=");
+                try printValue(stdout, g.group);
+                for (specs, g.values) |spec, v| {
+                    try stdout.writeAll("\t");
+                    try printAggLabel(stdout, spec);
+                    try stdout.writeAll("=");
+                    try printValue(stdout, v);
+                }
+                try stdout.writeAll("\n");
+            }
+        }
+    } else if (std.mem.eql(u8, sub, "window")) {
+        if (args.len < 2) return fail(stderr, "table window needs <table> <kind[:field]>[,<kind[:field]>...] [expr...] [partition <field>[,field...]] [order <field[:desc]>[,field...]] [--limit N] [--offset N] [--range]");
+        var table = try cobalt.Table.open(db, allocator, args[0]);
+        defer table.deinit();
+
+        const specs = parseWindowSpecs(allocator, args[1]) catch return fail(stderr, "invalid window spec (expected row_number | rank | dense_rank | sum:field | avg:field | count | count:field | count_distinct:field | min:field | max:field | first_value:field | last_value:field | nth_value:field:n[:default] | lag:field[:offset[:default]] | lead:field[:offset[:default]], comma-separated)");
+        defer allocator.free(specs);
+
+        const flags = extractPageFlags(allocator, args[2..]) catch return fail(stderr, "invalid --limit/--offset value");
+        defer allocator.free(flags.rest);
+
+        const rangeFlag = try extractRangeFlag(allocator, flags.rest);
+        defer allocator.free(rangeFlag.rest);
+        const frame: cobalt.window.FrameMode = if (rangeFlag.range) .range else .rows;
+
+        const split = splitWindowArgs(rangeFlag.rest);
+
+        const exprText = try std.mem.join(allocator, " ", split.whereArgs);
+        defer allocator.free(exprText);
+        var parsed: ?cobalt.expr.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (exprText.len > 0) {
+            parsed = cobalt.expr.parse(allocator, exprText) catch |err| return fail(stderr, @errorName(err));
+        }
+        const pred: ?cobalt.Predicate = if (parsed) |p| p.predicate else null;
+
+        var partitionBy: [][]const u8 = &.{};
+        defer allocator.free(partitionBy);
+        if (split.partitionArgs) |partitionArgs| {
+            if (partitionArgs.len != 1) return fail(stderr, "partition requires exactly one comma-separated field list");
+            partitionBy = parsePartitionList(allocator, partitionArgs[0]) catch return fail(stderr, "invalid partition field list");
+        }
+
+        var orderBy: []cobalt.query.OrderBy = &.{};
+        defer allocator.free(orderBy);
+        if (split.orderArgs) |orderArgs| {
+            if (orderArgs.len != 1) return fail(stderr, "order requires exactly one comma-separated field list");
+            orderBy = parseOrderByList(allocator, orderArgs[0]) catch return fail(stderr, "invalid order field list");
+        }
+
+        const rows = try table.select(pred);
+        defer cobalt.query.freeRows(allocator, rows);
+
+        const results = cobalt.window.computeMany(allocator, rows, partitionBy, orderBy, specs, frame) catch |err| return fail(stderr, @errorName(err));
+        defer cobalt.window.freeManyResults(allocator, results);
+
 }
 
 fn runVerify(allocator: std.mem.Allocator, stdout: anytype, dir: []const u8, count: usize) !void {
