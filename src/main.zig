@@ -1695,6 +1695,179 @@ fn runTable(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: 
         }
         const pred: ?cobalt.Predicate = if (parsed) |p| p.predicate else null;
 
+        var plan = try table.explain(allocator, pred);
+        defer plan.deinit(allocator);
+        try printPlan(stdout, plan);
+    } else if (std.mem.eql(u8, sub, "update")) {
+        if (args.len < 1) return fail(stderr, "table update needs <table> --set field=value[,field=value...] [expr...]");
+        var table = try cobalt.Table.open(db, allocator, args[0]);
+        defer table.deinit();
+
+        const setf = extractSetFlag(allocator, args[1..]) catch |err| return fail(stderr, if (err == error.MissingSetFlag)
+            "table update requires --set field=value[,field=value...]"
+        else
+            "invalid --set value");
+        defer allocator.free(setf.sets);
+        defer allocator.free(setf.rest);
+
+        const exprText = try std.mem.join(allocator, " ", setf.rest);
+        defer allocator.free(exprText);
+
+        var parsed: ?cobalt.expr.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (exprText.len > 0) {
+            parsed = cobalt.expr.parse(allocator, exprText) catch |err| return fail(stderr, @errorName(err));
+        }
+        const pred: ?cobalt.Predicate = if (parsed) |p| p.predicate else null;
+
+        const updated = table.updateWhere(pred, setf.sets) catch |err| return fail(stderr, @errorName(err));
+        try stdout.print("{d}\n", .{updated});
+    } else if (std.mem.eql(u8, sub, "delete")) {
+        if (args.len < 1) return fail(stderr, "table delete needs <table> [expr...]");
+        var table = try cobalt.Table.open(db, allocator, args[0]);
+        defer table.deinit();
+
+        const exprText = try std.mem.join(allocator, " ", args[1..]);
+        defer allocator.free(exprText);
+
+        var parsed: ?cobalt.expr.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (exprText.len > 0) {
+            parsed = cobalt.expr.parse(allocator, exprText) catch |err| return fail(stderr, @errorName(err));
+        }
+        const pred: ?cobalt.Predicate = if (parsed) |p| p.predicate else null;
+
+        const deleted = table.deleteWhere(pred) catch |err| return fail(stderr, @errorName(err));
+        try stdout.print("{d}\n", .{deleted});
+    } else if (std.mem.eql(u8, sub, "index")) {
+        if (args.len < 3) return fail(stderr, "table index needs create|drop <table> <field...>");
+        const action = args[0];
+        var positional = std.ArrayList([]const u8).init(allocator);
+        defer positional.deinit();
+        var unique = false;
+        for (args[1..]) |a| {
+            if (std.mem.eql(u8, a, "--unique")) {
+                unique = true;
+            } else {
+                try positional.append(a);
+            }
+        }
+        if (positional.items.len < 2) return fail(stderr, "table index needs create|drop <table> <field...>");
+        var table = try cobalt.Table.open(db, allocator, positional.items[0]);
+        defer table.deinit();
+        const fields = positional.items[1..];
+        if (std.mem.eql(u8, action, "create")) {
+            if (unique) {
+                if (fields.len != 1) return fail(stderr, "--unique only supports a single field, not a composite index");
+                table.createUniqueIndex(fields[0]) catch |err| return fail(stderr, @errorName(err));
+            } else if (fields.len == 1) {
+                table.createIndex(fields[0]) catch |err| return fail(stderr, @errorName(err));
+            } else {
+                const name = try std.mem.join(allocator, "+", fields);
+                defer allocator.free(name);
+                table.createCompositeIndex(name, fields) catch |err| return fail(stderr, @errorName(err));
+            }
+            try stdout.writeAll("OK\n");
+        } else if (std.mem.eql(u8, action, "drop")) {
+            if (fields.len == 1) {
+                try table.dropIndex(fields[0]);
+            } else {
+                const name = try std.mem.join(allocator, "+", fields);
+                defer allocator.free(name);
+                try table.dropCompositeIndex(name);
+            }
+            try stdout.writeAll("OK\n");
+        } else {
+            return fail(stderr, "unknown table index action (expected create/drop)");
+        }
+    } else if (std.mem.eql(u8, sub, "fk")) {
+        if (args.len < 2) return fail(stderr, "table fk needs create|drop <table> ...");
+        const action = args[0];
+        var table = try cobalt.Table.open(db, allocator, args[1]);
+        defer table.deinit();
+        if (std.mem.eql(u8, action, "create")) {
+            if (args.len < 5) return fail(stderr, "table fk create needs <table> <field> <refTable> <refField> [restrict|cascade]");
+            const onDelete: cobalt.index.OnDelete = if (args.len < 6 or std.mem.eql(u8, args[5], "restrict"))
+                .restrict
+            else if (std.mem.eql(u8, args[5], "cascade"))
+                .cascade
+            else
+                return fail(stderr, "table fk create: last argument must be restrict or cascade");
+            table.createForeignKey(args[2], args[3], args[4], onDelete) catch |err| return fail(stderr, @errorName(err));
+            try stdout.writeAll("OK\n");
+        } else if (std.mem.eql(u8, action, "drop")) {
+            if (args.len < 3) return fail(stderr, "table fk drop needs <table> <field>");
+            try table.dropForeignKey(args[2]);
+            try stdout.writeAll("OK\n");
+        } else {
+            return fail(stderr, "unknown table fk action (expected create/drop)");
+        }
+    } else if (std.mem.eql(u8, sub, "check")) {
+        if (args.len < 2) return fail(stderr, "table check needs create|drop <table> ...");
+        const action = args[0];
+        var table = try cobalt.Table.open(db, allocator, args[1]);
+        defer table.deinit();
+        if (std.mem.eql(u8, action, "create")) {
+            if (args.len < 4) return fail(stderr, "table check create needs <table> <name> <expr...>");
+            const source = try std.mem.join(allocator, " ", args[3..]);
+            defer allocator.free(source);
+            table.createCheckConstraint(args[2], source) catch |err| return fail(stderr, @errorName(err));
+            try stdout.writeAll("OK\n");
+        } else if (std.mem.eql(u8, action, "drop")) {
+            if (args.len < 3) return fail(stderr, "table check drop needs <table> <name>");
+            try table.dropCheckConstraint(args[2]);
+            try stdout.writeAll("OK\n");
+        } else {
+            return fail(stderr, "unknown table check action (expected create/drop)");
+        }
+    } else if (std.mem.eql(u8, sub, "join")) {
+        const JoinMode = enum { inner, left, right, full };
+        var mode: JoinMode = .inner;
+        var positional = std.ArrayList([]const u8).init(allocator);
+        defer positional.deinit();
+        for (args) |a| {
+            if (std.mem.eql(u8, a, "--left")) {
+                mode = .left;
+            } else if (std.mem.eql(u8, a, "--right")) {
+                mode = .right;
+            } else if (std.mem.eql(u8, a, "--full")) {
+                mode = .full;
+            } else {
+                try positional.append(a);
+            }
+        }
+        const pf = extractPageFlags(allocator, positional.items) catch return fail(stderr, "invalid --limit/--offset value");
+        defer allocator.free(pf.rest);
+        if (pf.rest.len < 4) return fail(stderr, "table join needs [--left|--right|--full] <leftTable> <leftField> <rightTable> <rightField> [--limit N] [--offset N]");
+        const jargs = pf.rest;
+        const page = cobalt.query.Page{ .offset = pf.page.offset, .limit = pf.page.limit };
+
+        var left = try cobalt.Table.open(db, allocator, jargs[0]);
+        defer left.deinit();
+        var right = try cobalt.Table.open(db, allocator, jargs[2]);
+        defer right.deinit();
+
+        switch (mode) {
+            .inner => {
+                const joined = cobalt.join.innerJoin(allocator, &left, jargs[1], null, &right, jargs[3], null) catch |err| return fail(stderr, @errorName(err));
+                const paged = cobalt.join.applyPage(cobalt.join.JoinedRow, allocator, joined, page) catch |err| return fail(stderr, @errorName(err));
+                defer cobalt.join.freeJoined(allocator, paged);
+                for (paged) |pair| {
+                    try stdout.writeAll("L ");
+                    try printRow(stdout, pair.left);
+                    try stdout.writeAll("R ");
+                    try printRow(stdout, pair.right);
+                }
+            },
+            .left => {
+                const joined = cobalt.join.leftOuterJoin(allocator, &left, jargs[1], null, &right, jargs[3], null) catch |err| return fail(stderr, @errorName(err));
+                const paged = cobalt.join.applyPage(cobalt.join.OuterJoinedRow, allocator, joined, page) catch |err| return fail(stderr, @errorName(err));
+                defer cobalt.join.freeOuterJoined(allocator, paged);
+                for (paged) |pair| {
+                    try stdout.writeAll("L ");
+                    try printRow(stdout, pair.left);
+                    if (pair.right) |r| {
+                        try stdout.writeAll("R ");
 }
 
 fn runVerify(allocator: std.mem.Allocator, stdout: anytype, dir: []const u8, count: usize) !void {
