@@ -2041,6 +2041,1044 @@ fn runTable(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: 
         const results = cobalt.window.computeMany(allocator, rows, partitionBy, orderBy, specs, frame) catch |err| return fail(stderr, @errorName(err));
         defer cobalt.window.freeManyResults(allocator, results);
 
+        // Display/page in the SAME partition-then-order walk `computeMany`
+        // used internally, not raw scan order - see `table window`'s help
+        // text and `window.orderedIndices`'s doc comment for why.
+        const displayOrder = cobalt.window.orderedIndices(allocator, rows, partitionBy, orderBy) catch |err| return fail(stderr, @errorName(err));
+        defer allocator.free(displayOrder);
+
+        const total = displayOrder.len;
+        const start = @min(flags.page.offset, total);
+        const end = if (flags.page.limit == 0) total else @min(start + flags.page.limit, total);
+        var i: usize = start;
+        while (i < end) : (i += 1) {
+            const idx = displayOrder[i];
+            for (rows[idx].fields.items, 0..) |f, j| {
+                if (j > 0) try stdout.writeAll("\t");
+                try stdout.print("{s}=", .{f.name});
+                try printValue(stdout, f.value);
+            }
+            if (rows[idx].fields.items.len > 0) try stdout.writeAll("\t");
+            for (specs, 0..) |spec, specIdx| {
+                if (specIdx > 0) try stdout.writeAll("\t");
+                try printWindowLabel(stdout, spec);
+                try stdout.writeAll("=");
+                try printValue(stdout, results[idx][specIdx]);
+            }
+            try stdout.writeAll("\n");
+        }
+    } else if (std.mem.eql(u8, sub, "export")) {
+        if (args.len < 3) return fail(stderr, "table export needs <table> csv|json <path>");
+        var table = try cobalt.Table.open(db, allocator, args[0]);
+        defer table.deinit();
+        const n = if (std.mem.eql(u8, args[1], "csv"))
+            cobalt.dump.exportCsv(allocator, &table, args[2]) catch |err| return fail(stderr, @errorName(err))
+        else if (std.mem.eql(u8, args[1], "json"))
+            cobalt.dump.exportJson(allocator, &table, args[2]) catch |err| return fail(stderr, @errorName(err))
+        else
+            return fail(stderr, "table export format must be csv or json");
+        try stdout.print("{d}\n", .{n});
+    } else if (std.mem.eql(u8, sub, "import")) {
+        if (args.len < 3) return fail(stderr, "table import needs <table> csv|json <path>");
+        var table = try cobalt.Table.open(db, allocator, args[0]);
+        defer table.deinit();
+        const n = if (std.mem.eql(u8, args[1], "csv"))
+            cobalt.dump.importCsv(allocator, &table, args[2]) catch |err| return fail(stderr, @errorName(err))
+        else if (std.mem.eql(u8, args[1], "json"))
+            cobalt.dump.importJson(allocator, &table, args[2]) catch |err| return fail(stderr, @errorName(err))
+        else
+            return fail(stderr, "table import format must be csv or json");
+        try stdout.print("{d}\n", .{n});
+    } else {
+        return fail(stderr, "unknown table operation");
+    }
+}
+
+/// Runs a script of `put|del <table> <pk> [field=value ...]` lines as one
+/// atomic Transaction via TableTxn: every row/index mutation across every
+/// line becomes visible together on commit, or none of it does. This is the
+/// only place in the CLI multi-row atomicity is reachable at all - `table
+/// put` above writes one row directly to the Db per call, with no atomicity
+/// across rows.
+/// `repl [--script <file>]`: keeps `db` open across many commands instead
+/// of the usual one-process-per-command CLI shape, so `begin`/`commit`/
+/// `rollback` can bracket an interactive `cobalt.Repl` transaction - see
+/// `repl.zig` for the command grammar and why that is more than `txn
+/// <script-file>` with extra steps. With `--script <file>` reads from the
+/// file non-interactively (no prompt, same as `txn`); otherwise reads from
+/// stdin with a `cobalt>`/`cobalt(txn)>` prompt.
+fn runRepl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: *cobalt.Db, rest: []const []const u8) !void {
+    var session = cobalt.Repl.init(allocator, db);
+    defer session.deinit();
+
+    if (rest.len >= 2 and std.mem.eql(u8, rest[0], "--script")) {
+        const contents = std.fs.cwd().readFileAlloc(allocator, rest[1], 16 * 1024 * 1024) catch |err| {
+            try stderr.print("failed to read script '{s}': {s}\n", .{ rest[1], @errorName(err) });
+            std.process.exit(1);
+        };
+        defer allocator.free(contents);
+        var stream = std.io.fixedBufferStream(contents);
+        try session.runFromReader(stream.reader(), stdout, false);
+        return;
+    }
+
+    const stdinReader = std.io.getStdIn().reader();
+    try session.runFromReader(stdinReader, stdout, true);
+}
+
+fn runTxn(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: *cobalt.Db, rest: []const []const u8) !void {
+    if (rest.len < 1) return fail(stderr, "txn needs <script-file>");
+
+    const contents = std.fs.cwd().readFileAlloc(allocator, rest[0], 16 * 1024 * 1024) catch |err| {
+        try stderr.print("failed to read script '{s}': {s}\n", .{ rest[0], @errorName(err) });
+        std.process.exit(1);
+    };
+    defer allocator.free(contents);
+
+    var txn = cobalt.Transaction.begin(db);
+    defer txn.deinit();
+
+    var tables = std.StringHashMap(cobalt.TableTxn).init(allocator);
+    defer {
+        var it = tables.valueIterator();
+        while (it.next()) |t| t.deinit();
+        tables.deinit();
+    }
+
+    var applied: usize = 0;
+    var lineNo: usize = 0;
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |rawLine| {
+        lineNo += 1;
+        const line = std.mem.trim(u8, rawLine, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        var tok = std.mem.tokenizeScalar(u8, line, ' ');
+        const verb = tok.next() orelse continue;
+        const tableName = tok.next() orelse {
+            try stderr.print("line {d}: missing table name\n", .{lineNo});
+            std.process.exit(2);
+        };
+        const pkText = tok.next() orelse {
+            try stderr.print("line {d}: missing primary key\n", .{lineNo});
+            std.process.exit(2);
+        };
+        const pk = parseValue(pkText) catch {
+            try stderr.print("line {d}: invalid primary key '{s}'\n", .{ lineNo, pkText });
+            std.process.exit(2);
+        };
+
+        const gop = try tables.getOrPut(tableName);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = tableName;
+            gop.value_ptr.* = cobalt.TableTxn.open(&txn, allocator, tableName) catch |err| {
+                try stderr.print("line {d}: cannot open table '{s}': {s}\n", .{ lineNo, tableName, @errorName(err) });
+                std.process.exit(2);
+            };
+        }
+        const table = gop.value_ptr;
+
+        if (std.mem.eql(u8, verb, "put")) {
+            var fields = std.ArrayList(Field).init(allocator);
+            defer fields.deinit();
+            while (tok.next()) |raw| {
+                const f = parseField(raw) catch {
+                    try stderr.print("line {d}: invalid field '{s}'\n", .{ lineNo, raw });
+                    std.process.exit(2);
+                };
+                try fields.append(f);
+            }
+            table.put(pk, fields.items) catch |err| {
+                try stderr.print("line {d}: put failed: {s}\n", .{ lineNo, @errorName(err) });
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, verb, "del")) {
+            table.delete(pk) catch |err| {
+                try stderr.print("line {d}: del failed: {s}\n", .{ lineNo, @errorName(err) });
+                std.process.exit(1);
+            };
+        } else {
+            try stderr.print("line {d}: unknown verb '{s}' (expected put/del)\n", .{ lineNo, verb });
+            std.process.exit(2);
+        }
+        applied += 1;
+    }
+
+    if (applied == 0) return fail(stderr, "txn script had no operations");
+
+    txn.commit() catch |err| {
+        try stderr.print("transaction failed, nothing applied: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    try stdout.print("OK: {d} operation(s) committed atomically\n", .{applied});
+}
+
+/// Dispatches `replicate <replica-dir> [--once] [--interval-ms <n>]`: opens
+/// (or creates) a second Db at <replica-dir> and keeps it mirroring `db` by
+/// physically tailing `db`'s wal.log (replicate.zig), recovering via a full
+/// snapshot resync whenever the tailer falls behind a primary flush.
+fn runReplicate(allocator: std.mem.Allocator, stdout: anytype, db: *cobalt.Db, replicaDir: []const u8, rest: []const []const u8) !void {
+    var once = false;
+    var intervalMs: u64 = 200;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        if (std.mem.eql(u8, rest[i], "--once")) {
+            once = true;
+        } else if (std.mem.eql(u8, rest[i], "--interval-ms")) {
+            i += 1;
+            if (i >= rest.len) {
+                try stdout.writeAll("error: --interval-ms needs a value\n");
+                std.process.exit(2);
+            }
+            intervalMs = std.fmt.parseInt(u64, rest[i], 10) catch {
+                try stdout.writeAll("error: --interval-ms needs an integer\n");
+                std.process.exit(2);
+            };
+        } else {
+            try stdout.print("error: unknown replicate flag '{s}'\n", .{rest[i]});
+            std.process.exit(2);
+        }
+    }
+
+    var replica = try cobalt.Db.open(allocator, replicaDir, .{});
+    defer replica.close();
+
+    const resumeState = cobalt.replicate.loadOffset(allocator, replicaDir, db.dirPath) catch |err| switch (err) {
+        cobalt.replicate.StateError.PrimaryMismatch => {
+            try stdout.print("error: replica at '{s}' has persisted state for a different primary than '{s}' - refusing to resume against the wrong primary\n", .{ replicaDir, db.dirPath });
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+
+    var rep = if (resumeState) |state|
+        try cobalt.Replicator.initFromOffset(allocator, db.dirPath, &replica, state.offset, state.generation)
+    else
+        try cobalt.Replicator.init(allocator, db.dirPath, &replica);
+    defer rep.deinit();
+
+    if (resumeState) |state| {
+        try stdout.print("resuming tail from persisted offset={d} generation={d}\n", .{ state.offset, state.generation });
+    } else {
+        const bootstrapped = try rep.fullResync(db, 500);
+        try stdout.print("bootstrap: {d} entries copied from snapshot\n", .{bootstrapped});
+        try cobalt.replicate.saveState(allocator, replicaDir, db.dirPath, rep.offset(), rep.generation());
+    }
+
+    while (true) {
+        const applied = rep.syncOnce() catch |err| switch (err) {
+            cobalt.ReplicateError.WalTruncatedAheadOfTailer, cobalt.ReplicateError.WalGenerationChanged => blk: {
+                const recovered = try rep.fullResync(db, 500);
+                try stdout.print("resync after truncation: {d} entries\n", .{recovered});
+                // fullResync always re-bases the tailer to offset 0 and the
+                // primary's current generation, which must be persisted
+                // immediately even if nothing new was applied afterwards -
+                // otherwise a later process would resume from the stale
+                // pre-truncation offset/generation instead of the fresh one.
+                try cobalt.replicate.saveState(allocator, replicaDir, db.dirPath, rep.offset(), rep.generation());
+                break :blk @as(usize, 0);
+            },
+            else => return err,
+        };
+        if (applied > 0) {
+            try stdout.print("applied {d} record(s), tail offset={d}\n", .{ applied, rep.offset() });
+            try cobalt.replicate.saveState(allocator, replicaDir, db.dirPath, rep.offset(), rep.generation());
+        }
+        if (once) break;
+        std.time.sleep(intervalMs * std.time.ns_per_ms);
+    }
+}
+
+/// Parses a `host:port` string as used by both `serve` (bind address) and
+/// `remote-select` (address to connect to). Exits with usage code 2 on a
+/// malformed address rather than propagating a parse error, matching every
+/// other CLI argument validation in this file.
+fn parseHostPort(stdout: anytype, spec: []const u8) !std.net.Address {
+    const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse {
+        try stdout.print("error: address must be host:port, got '{s}'\n", .{spec});
+        std.process.exit(2);
+    };
+    const host = spec[0..colon];
+    const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch {
+        try stdout.print("error: invalid port in '{s}'\n", .{spec});
+        std.process.exit(2);
+    };
+    return std.net.Address.parseIp(host, port);
+}
+
+const AuthFlags = struct { username: ?[]const u8 = null, password: ?[]const u8 = null, token: ?[]const u8 = null };
+
+/// Pulls `--user NAME` / `--pass PASS` / `--token TOKEN` out of a
+/// `remote-select`/`remote-user` argument list, same shape and same "strip
+/// recognized flags, keep the rest" idea as `extractPageFlags`. `--token`
+/// is the CLI counterpart of `client.authenticateWithToken` - a previously
+/// issued session token (see `serve --session-ttl`) used in place of a
+/// username/password pair. Caller owns and frees `rest`.
+fn extractAuthFlags(allocator: std.mem.Allocator, args: []const []const u8) !struct { auth: AuthFlags, rest: [][]const u8 } {
+    var authFlags = AuthFlags{};
+    var rest = std.ArrayList([]const u8).init(allocator);
+    errdefer rest.deinit();
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const isUser = std.mem.eql(u8, args[i], "--user");
+        const isPass = std.mem.eql(u8, args[i], "--pass");
+        const isToken = std.mem.eql(u8, args[i], "--token");
+        if (isUser or isPass or isToken) {
+            i += 1;
+            if (i >= args.len) return error.InvalidAuthFlag;
+            if (isUser) authFlags.username = args[i] else if (isPass) authFlags.password = args[i] else authFlags.token = args[i];
+        } else {
+            try rest.append(args[i]);
+        }
+    }
+    return .{ .auth = authFlags, .rest = try rest.toOwnedSlice() };
+}
+
+/// Shared by `runRemoteSelect` and `runRemoteUser`: authenticates the
+/// just-connected `client` using whichever credential `authFlags` carried
+/// (a session token takes priority over a username/password pair - a
+/// caller passing both almost certainly means "use the token, the
+/// user/pass was left over from a script template"), or does nothing if
+/// neither was given (server has no --auth enabled, or the op needs none).
+/// A fresh password login against a server with sessions enabled gets a
+/// brand new token back (`client.sessionToken()`) - printed to stderr (kept
+/// out of stdout so scripts piping row/user output are not polluted) so the
+/// caller can pass it to a later invocation via `--token` instead of
+/// re-sending the password. Logging in with `--token` itself never mints a
+/// new one (see `server.zig`'s `handleAuthToken`), so nothing is printed
+/// in that branch.
+fn authenticateIfRequested(client: *cobalt.Client, stderr: anytype, authFlags: AuthFlags) !void {
+    if (authFlags.token) |token| {
+        client.authenticateWithToken(token) catch |err| {
+            try stderr.print("error: token authentication failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    } else if (authFlags.username) |username| {
+        client.authenticate(username, authFlags.password orelse "") catch |err| {
+            try stderr.print("error: authentication failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (client.sessionToken()) |token| {
+            try stderr.print("session token (use with --token): {s}\n", .{token});
+        }
+    }
+}
+
+/// Connects to a remote `cobalt serve` instance and runs `table select`
+/// there instead of against a local Db - the client-side counterpart of
+/// `server.zig`'s `table_select` opcode, so a query engine that was
+/// previously CLI-local-only is now reachable over the wire with the exact
+/// same expression grammar as `table select`. `--user`/`--pass` authenticate
+/// first, needed only against a server started with `serve --auth`.
+fn runRemoteSelect(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 1) return fail(stderr, "remote-select needs <table> [expr...] [--limit N] [--offset N] [--order-by field[:desc][,field[:desc]...]]");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const authFlags = extractAuthFlags(allocator, rest[1..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const sel = extractSelectFlags(allocator, authFlags.rest) catch return fail(stderr, "invalid --limit/--offset/--order-by value");
+    defer allocator.free(sel.rest);
+    defer allocator.free(sel.flags.orderBy);
+
+    const exprText = try std.mem.join(allocator, " ", sel.rest);
+    defer allocator.free(exprText);
+
+    const rows = client.tableSelect(allocator, rest[0], exprText, sel.flags.page.offset, sel.flags.page.limit, sel.flags.orderBy) catch |err| {
+        try stderr.print("error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer cobalt.protocol.freeRows(allocator, rows);
+    for (rows) |r| try printRow(stdout, r);
+}
+
+/// Connects to a remote `cobalt serve` instance and runs `table explain`
+/// there instead of against a local Db - the client-side counterpart of
+/// `server.zig`'s `table_explain` opcode, same shape as `runRemoteSelect`
+/// but reporting a `query.Plan` instead of rows. `--user`/`--pass`/
+/// `--token` authenticate first, needed only against a server started with
+/// `serve --auth`.
+fn runRemoteExplain(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 1) return fail(stderr, "remote-explain needs <table> [expr...]");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const authFlags = extractAuthFlags(allocator, rest[1..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const exprText = try std.mem.join(allocator, " ", authFlags.rest);
+    defer allocator.free(exprText);
+
+    var plan = client.tableExplain(allocator, rest[0], exprText) catch |err| {
+        try stderr.print("error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer plan.deinit(allocator);
+    try printPlan(stdout, plan);
+}
+
+/// Connects to a remote `cobalt serve` instance and runs `table update`
+/// there instead of against a local Db - the client-side counterpart of
+/// `server.zig`'s `table_update` opcode, same shape as `runRemoteExplain`
+/// but taking a `--set` field list and printing the number of rows updated
+/// instead of a plan. `--user`/`--pass`/`--token` authenticate first,
+/// needed only against a server started with `serve --auth`.
+fn runRemoteUpdate(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 1) return fail(stderr, "remote-update needs <table> --set field=value[,field=value...] [expr...]");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const authFlags = extractAuthFlags(allocator, rest[1..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const setf = extractSetFlag(allocator, authFlags.rest) catch |err| return fail(stderr, if (err == error.MissingSetFlag)
+        "remote-update requires --set field=value[,field=value...]"
+    else
+        "invalid --set value");
+    defer allocator.free(setf.sets);
+    defer allocator.free(setf.rest);
+
+    const exprText = try std.mem.join(allocator, " ", setf.rest);
+    defer allocator.free(exprText);
+
+    const updated = client.tableUpdate(rest[0], setf.sets, exprText) catch |err| {
+        try stderr.print("error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    try stdout.print("{d}\n", .{updated});
+}
+
+/// Connects to a remote `cobalt serve` instance and runs `table delete`
+/// there instead of against a local Db - the client-side counterpart of
+/// `server.zig`'s `table_delete` opcode, same shape as `runRemoteExplain`
+/// (no `--set` flag, since a delete has no `SET` clause) but printing the
+/// number of rows deleted instead of a plan. `--user`/`--pass`/`--token`
+/// authenticate first, needed only against a server started with
+/// `serve --auth`.
+fn runRemoteDelete(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 1) return fail(stderr, "remote-delete needs <table> [expr...]");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const authFlags = extractAuthFlags(allocator, rest[1..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const exprText = try std.mem.join(allocator, " ", authFlags.rest);
+    defer allocator.free(exprText);
+
+    const deleted = client.tableDelete(rest[0], exprText) catch |err| {
+        try stderr.print("error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    try stdout.print("{d}\n", .{deleted});
+}
+
+fn parseDumpFormat(stderr: anytype, text: []const u8) !cobalt.protocol.DumpFormat {
+    if (std.mem.eql(u8, text, "csv")) return .csv;
+    if (std.mem.eql(u8, text, "json")) return .json;
+    try fail(stderr, "format must be csv or json");
+    unreachable;
+}
+
+/// Connects to a remote `cobalt serve` instance and runs `table export`
+/// there instead of against a local Db - the client-side counterpart of
+/// `server.zig`'s `table_export` opcode. Unlike every other remote-* op,
+/// the destination `<path>` names a file on THIS machine, not the server:
+/// the server renders the whole table into memory and sends the bytes
+/// back in one frame, and this function is the one that actually creates
+/// `<path>` and writes them - the local `table export` writes straight to
+/// disk itself since it already has a `*Db` handle in-process, but a
+/// remote client only ever gets bytes over the wire. `--user`/`--pass`/
+/// `--token` authenticate first, needed only against a server started
+/// with `serve --auth`.
+fn runRemoteExport(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 1) return fail(stderr, "remote-export needs <table> csv|json <path>");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const authFlags = extractAuthFlags(allocator, rest[1..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const args = authFlags.rest;
+    if (args.len < 2) return fail(stderr, "remote-export needs <table> csv|json <path>");
+    const format = try parseDumpFormat(stderr, args[0]);
+
+    var result = client.tableExport(allocator, rest[0], format) catch |err| {
+        try stderr.print("error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer result.deinit(allocator);
+
+    const file = std.fs.cwd().createFile(args[1], .{ .truncate = true }) catch |err| {
+        try stderr.print("failed to write '{s}': {s}\n", .{ args[1], @errorName(err) });
+        std.process.exit(1);
+    };
+    defer file.close();
+    try file.writeAll(result.content);
+
+    try stdout.print("{d}\n", .{result.rowCount});
+}
+
+/// Connects to a remote `cobalt serve` instance and runs `table import`
+/// there instead of against a local Db - the client-side counterpart of
+/// `server.zig`'s `table_import` opcode. Mirrors `runRemoteExport`: the
+/// source `<path>` is read from THIS machine (the same way `runTxn` reads
+/// a local script file), and its bytes are sent to the server in one
+/// frame. `--user`/`--pass`/`--token` authenticate first, needed only
+/// against a server started with `serve --auth`.
+fn runRemoteImport(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 1) return fail(stderr, "remote-import needs <table> csv|json <path>");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const authFlags = extractAuthFlags(allocator, rest[1..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const args = authFlags.rest;
+    if (args.len < 2) return fail(stderr, "remote-import needs <table> csv|json <path>");
+    const format = try parseDumpFormat(stderr, args[0]);
+
+    const content = std.fs.cwd().readFileAlloc(allocator, args[1], 1 << 30) catch |err| {
+        try stderr.print("failed to read '{s}': {s}\n", .{ args[1], @errorName(err) });
+        std.process.exit(1);
+    };
+    defer allocator.free(content);
+
+    const imported = client.tableImport(rest[0], format, content) catch |err| {
+        try stderr.print("error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    try stdout.print("{d}\n", .{imported});
+}
+
+const JoinCliMode = enum { inner, left, right, full };
+
+/// Pulls `--left`/`--right`/`--full` (mutually exclusive, last one wins,
+/// same as local `table join`'s parsing loop) and `--left-expr E`/
+/// `--right-expr E` out of a `remote-join` argument list, same "strip
+/// recognized flags, keep the rest" shape as `extractPageFlags`/
+/// `extractAuthFlags`. An expr not given defaults to the empty string,
+/// meaning "select every row on that side" - the same convention
+/// `tableSelect`'s empty `exprText` already uses. Caller owns and frees
+/// `rest`.
+fn extractJoinFlags(allocator: std.mem.Allocator, args: []const []const u8) !struct {
+    mode: JoinCliMode,
+    leftExpr: []const u8,
+    rightExpr: []const u8,
+    rest: [][]const u8,
+} {
+    var mode: JoinCliMode = .inner;
+    var leftExpr: []const u8 = "";
+    var rightExpr: []const u8 = "";
+    var rest = std.ArrayList([]const u8).init(allocator);
+    errdefer rest.deinit();
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--left")) {
+            mode = .left;
+        } else if (std.mem.eql(u8, args[i], "--right")) {
+            mode = .right;
+        } else if (std.mem.eql(u8, args[i], "--full")) {
+            mode = .full;
+        } else if (std.mem.eql(u8, args[i], "--left-expr")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidJoinFlag;
+            leftExpr = args[i];
+        } else if (std.mem.eql(u8, args[i], "--right-expr")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidJoinFlag;
+            rightExpr = args[i];
+        } else {
+            try rest.append(args[i]);
+        }
+    }
+    return .{ .mode = mode, .leftExpr = leftExpr, .rightExpr = rightExpr, .rest = try rest.toOwnedSlice() };
+}
+
+/// Connects to a remote `cobalt serve` instance and runs `table join`
+/// there instead of against a local Db - the client-side counterpart of
+/// `server.zig`'s `table_join` opcode, mirroring `runRemoteSelect`'s shape
+/// but for all four of `join.zig`'s equi-join variants instead of a plain
+/// select. `--user`/`--pass`/`--token` authenticate first, needed only
+/// against a server started with `serve --auth`; printing is identical to
+/// the local `table join` command (`L <row>` / `R <row>`, or `L (nil)` /
+/// `R (nil)` for the unmatched side of an outer join).
+fn runRemoteJoin(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const authFlags = extractAuthFlags(allocator, rest) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const jf = extractJoinFlags(allocator, authFlags.rest) catch return fail(stderr, "invalid --left-expr/--right-expr value");
+    defer allocator.free(jf.rest);
+
+    const pf = extractPageFlags(allocator, jf.rest) catch return fail(stderr, "invalid --limit/--offset value");
+    defer allocator.free(pf.rest);
+
+    if (pf.rest.len < 4) return fail(stderr, "remote-join needs [--left|--right|--full] <leftTable> <leftField> <rightTable> <rightField> [--left-expr E] [--right-expr E] [--limit N] [--offset N]");
+
+    const mode: cobalt.protocol.JoinMode = switch (jf.mode) {
+        .inner => .inner,
+        .left => .left,
+        .right => .right,
+        .full => .full,
+    };
+
+    const pairs = client.tableJoin(allocator, mode, pf.rest[0], pf.rest[1], pf.rest[2], pf.rest[3], pf.page.offset, pf.page.limit, jf.leftExpr, jf.rightExpr) catch |err| {
+        try stderr.print("error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer cobalt.protocol.freeJoinPairs(allocator, pairs);
+
+    for (pairs) |p| {
+        if (p.left) |l| {
+            try stdout.writeAll("L ");
+            try printRow(stdout, l);
+        } else {
+            try stdout.writeAll("L (nil)\n");
+        }
+        if (p.right) |r| {
+            try stdout.writeAll("R ");
+            try printRow(stdout, r);
+        } else {
+            try stdout.writeAll("R (nil)\n");
+        }
+    }
+}
+
+/// Connects to a remote `cobalt serve` instance and runs `table aggregate`
+/// there instead of against a local Db - the client-side counterpart of
+/// `server.zig`'s `table_aggregate` opcode, mirroring `runRemoteSelect`'s
+/// shape. Same `*` sentinel as local `table aggregate` for "no GROUP BY"
+/// (dispatches to `client.tableAggregateGlobal` instead of
+/// `tableAggregateGroups`), same comma-separated spec grammar
+/// (`parseAggSpecs`), and the same output format as the local command
+/// (`printAggLabel`/`printValue`). `--limit`/`--offset` window the result
+/// groups server-side (ignored for the `*` global path, same as local
+/// `table aggregate`), same convention as `remote-join`.
+/// `--user`/`--pass`/`--token` authenticate first, needed only against a
+/// server started with `serve --auth`. An optional literal `having <expr>`
+/// after the WHERE-style expr (split out by `splitAggFilterArgs`, the same
+/// helper the local `table aggregate` handler uses) filters the result
+/// groups server-side after aggregation, before `--limit`/`--offset` window
+/// them. An optional literal `order <field[:desc]>[,field...]` after that
+/// sorts the (HAVING-narrowed) result groups server-side before that same
+/// window, ignored for the `*` global path exactly like `--limit`/`--offset`
+/// already are - see `Client.tableAggregateGroups`/`tableAggregateGlobal`.
+fn runRemoteAggregate(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 3) return fail(stderr, "remote-aggregate needs <table> <groupField|*> <spec>[,<spec>...] [expr...] [having <expr>] [order <field[:desc]>[,field...]] [--limit N] [--offset N]");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const table = rest[0];
+    const groupField = rest[1];
+    const specs = parseAggSpecs(allocator, rest[2]) catch return fail(stderr, "invalid aggregate spec (expected count | count:field | sum:field | avg:field | min:field | max:field | distinct:field, comma-separated)");
+    defer allocator.free(specs);
+
+    const authFlags = extractAuthFlags(allocator, rest[3..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const flags = extractPageFlags(allocator, authFlags.rest) catch return fail(stderr, "invalid --limit/--offset value");
+    defer allocator.free(flags.rest);
+
+    const split = splitAggFilterArgs(flags.rest);
+
+    const exprText = try std.mem.join(allocator, " ", split.whereArgs);
+    defer allocator.free(exprText);
+
+    const havingText = if (split.havingArgs) |ha| try std.mem.join(allocator, " ", ha) else try allocator.dupe(u8, "");
+    defer allocator.free(havingText);
+    if (split.havingArgs != null and havingText.len == 0) return fail(stderr, "having requires an expression");
+
+    var orderBy: []cobalt.query.OrderBy = &.{};
+    defer allocator.free(orderBy);
+    if (split.orderArgs) |orderArgs| {
+        if (orderArgs.len != 1) return fail(stderr, "order requires exactly one comma-separated field list");
+        orderBy = parseOrderByList(allocator, orderArgs[0]) catch return fail(stderr, "invalid order field list");
+    }
+
+    if (std.mem.eql(u8, groupField, "*")) {
+        const values = client.tableAggregateGlobal(allocator, table, specs, havingText, exprText) catch |err| {
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer cobalt.protocol.freeAggValues(allocator, values);
+        // `values.len == 0` means the server's HAVING excluded the only
+        // global result (see `Client.tableAggregateGlobal`'s doc) - print
+        // nothing rather than indexing `specs` against a shorter `values`,
+        // which a naive `for (specs, values, ...)` would panic on.
+        if (values.len > 0) {
+            for (specs, values, 0..) |spec, v, i| {
+                if (i > 0) try stdout.writeAll("\t");
+                try printAggLabel(stdout, spec);
+                try stdout.writeAll("=");
+                try printValue(stdout, v);
+            }
+            try stdout.writeAll("\n");
+        }
+    } else {
+        const groups = client.tableAggregateGroups(allocator, table, groupField, specs, flags.page.offset, flags.page.limit, orderBy, havingText, exprText) catch |err| {
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer cobalt.protocol.freeAggGroupRows(allocator, groups);
+        for (groups) |g| {
+            try stdout.writeAll("group=");
+            try printValue(stdout, g.group);
+            for (specs, g.values) |spec, v| {
+                try stdout.writeAll("\t");
+                try printAggLabel(stdout, spec);
+                try stdout.writeAll("=");
+                try printValue(stdout, v);
+            }
+            try stdout.writeAll("\n");
+        }
+    }
+}
+
+/// Connects to a remote `cobalt serve` instance and runs `table window`
+/// there instead of against a local Db - the client-side counterpart of
+/// `server.zig`'s `table_window` opcode, mirroring `runRemoteAggregate`'s
+/// shape. Same comma-separated spec-list grammar as local `table window`
+/// (`parseWindowSpecs`), same `partition <field>[,field...]`/`order
+/// <field[:desc]>[,field...]` clause split (`splitWindowArgs`), and the same
+/// per-row output format as the local command (row fields, then
+/// `<label>=<value>`). Unlike `runRemoteAggregate`, there is no `*`
+/// sentinel or global/grouped branch - a window annotation never collapses
+/// rows, so there is exactly one request/response shape
+/// (`Client.tableWindow`). `--limit`/`--offset` window which rows come back
+/// (server-side, in `window.orderedIndices`' partition-then-order display
+/// sequence, not raw scan order - see `Client.tableWindow`'s doc).
+/// `--user`/`--pass`/`--token` authenticate first, needed only against a
+/// server started with `serve --auth`.
+/// Splits `text` on commas into channel names for `remote-subscribe` - no
+/// identifier validation, unlike `parsePartitionList`, since a pub/sub
+/// channel is an arbitrary string (`pubsub.zig`'s `Hub` keys purely on
+/// byte equality), not a table field name.
+fn parseChannelList(allocator: std.mem.Allocator, text: []const u8) ![][]const u8 {
+    var list = std.ArrayList([]const u8).init(allocator);
+    errdefer list.deinit();
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |ch| {
+        if (ch.len == 0) return error.EmptyChannelName;
+        try list.append(ch);
+    }
+    return list.toOwnedSlice();
+}
+
+/// Connects to a running `cobalt serve` and delivers a message to every
+/// connection currently subscribed to `<channel>` - the client-side
+/// counterpart of `server.zig`'s `publish` opcode. `<message...>` is every
+/// remaining non-flag argument joined with single spaces, the same
+/// "trailing free text" convention `runRemoteWindow`'s `exprText` uses, so a
+/// multi-word message does not need manual quoting tricks beyond the
+/// shell's own.
+fn runRemotePublish(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 2) return fail(stderr, "remote-publish needs <channel> <message...> [--user NAME --pass PASS] [--token TOKEN]");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const channel = rest[0];
+
+    const authFlags = extractAuthFlags(allocator, rest[1..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    if (authFlags.rest.len == 0) return fail(stderr, "remote-publish needs a message");
+    const message = try std.mem.join(allocator, " ", authFlags.rest);
+    defer allocator.free(message);
+
+    const count = client.publish(channel, message) catch |err| {
+        try stderr.print("error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    try stdout.print("{d}\n", .{count});
+}
+
+/// Connects to a running `cobalt serve`, subscribes to every channel in the
+/// comma-separated `<channel>[,channel...]` list, and blocks printing
+/// `<channel>: <message>` for each message that arrives until the
+/// connection ends - the client-side counterpart of `server.zig`'s
+/// `subscribe` opcode and `Client.nextMessage`'s doc comment on why this
+/// connection never sends another request afterward. Prints "subscribed as
+/// <id>" first (the id `remote-unsubscribe`, run from a different terminal
+/// against a different connection, needs to ever name this subscription
+/// again) - closing this process (or the connection) still ends the whole
+/// subscription outright, same as before `remote-unsubscribe` existed.
+fn runRemoteSubscribe(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 1) return fail(stderr, "remote-subscribe needs <channel>[,channel...] [--user NAME --pass PASS] [--token TOKEN]");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const channels = parseChannelList(allocator, rest[0]) catch return fail(stderr, "invalid channel list (empty channel name)");
+    defer allocator.free(channels);
+
+    const authFlags = extractAuthFlags(allocator, rest[1..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const subscriberId = client.subscribe(channels) catch |err| {
+        try stderr.print("error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    try stdout.print("subscribed as {d}\n", .{subscriberId});
+
+    while (try client.nextMessage(allocator)) |msg| {
+        defer msg.deinit(allocator);
+        try stdout.print("{s}: {s}\n", .{ msg.channel, msg.payload });
+    }
+}
+
+/// Connects to a running `cobalt serve` and drops the listed channels from
+/// an already-subscribed connection's set, identified by the
+/// `<subscriber-id>` its `remote-subscribe` printed - the client-side
+/// counterpart of `server.zig`'s `unsubscribe` opcode. Unlike
+/// `remote-subscribe`, this connection is an ordinary request/response
+/// round trip: it prints how many channels were actually removed and
+/// exits, never blocking. `<subscriber-id>` must parse as a `u64` - a
+/// malformed one is reported the same way a malformed `--limit` is
+/// elsewhere in this file, before ever reaching for the network.
+fn runRemoteUnsubscribe(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 2) return fail(stderr, "remote-unsubscribe needs <subscriber-id> <channel>[,channel...] [--user NAME --pass PASS] [--token TOKEN]");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    const subscriberId = std.fmt.parseInt(u64, rest[0], 10) catch return fail(stderr, "invalid <subscriber-id> (expected a non-negative integer)");
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const channels = parseChannelList(allocator, rest[1]) catch return fail(stderr, "invalid channel list (empty channel name)");
+    defer allocator.free(channels);
+
+    const authFlags = extractAuthFlags(allocator, rest[2..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const removed = client.unsubscribe(subscriberId, channels) catch |err| {
+        try stderr.print("error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    try stdout.print("{d}\n", .{removed});
+}
+
+fn runRemoteWindow(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 2) return fail(stderr, "remote-window needs <table> <kind[:field]>[,<kind[:field]>...] [expr...] [partition <field>[,field...]] [order <field[:desc]>[,field...]] [--limit N] [--offset N] [--range]");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const table = rest[0];
+    const specs = parseWindowSpecs(allocator, rest[1]) catch return fail(stderr, "invalid window spec (expected row_number | rank | dense_rank | sum:field | avg:field | count | count:field | count_distinct:field | min:field | max:field | first_value:field | last_value:field | nth_value:field:n[:default] | lag:field[:offset[:default]] | lead:field[:offset[:default]], comma-separated)");
+    defer allocator.free(specs);
+
+    const authFlags = extractAuthFlags(allocator, rest[2..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const flags = extractPageFlags(allocator, authFlags.rest) catch return fail(stderr, "invalid --limit/--offset value");
+    defer allocator.free(flags.rest);
+
+    const rangeFlag = try extractRangeFlag(allocator, flags.rest);
+    defer allocator.free(rangeFlag.rest);
+    const frame: cobalt.window.FrameMode = if (rangeFlag.range) .range else .rows;
+
+    const split = splitWindowArgs(rangeFlag.rest);
+
+    const exprText = try std.mem.join(allocator, " ", split.whereArgs);
+    defer allocator.free(exprText);
+
+    var partitionBy: [][]const u8 = &.{};
+    defer allocator.free(partitionBy);
+    if (split.partitionArgs) |partitionArgs| {
+        if (partitionArgs.len != 1) return fail(stderr, "partition requires exactly one comma-separated field list");
+        partitionBy = parsePartitionList(allocator, partitionArgs[0]) catch return fail(stderr, "invalid partition field list");
+    }
+
+    var orderBy: []cobalt.query.OrderBy = &.{};
+    defer allocator.free(orderBy);
+    if (split.orderArgs) |orderArgs| {
+        if (orderArgs.len != 1) return fail(stderr, "order requires exactly one comma-separated field list");
+        orderBy = parseOrderByList(allocator, orderArgs[0]) catch return fail(stderr, "invalid order field list");
+    }
+
+    const results = client.tableWindow(allocator, table, specs, partitionBy, orderBy, flags.page.offset, flags.page.limit, exprText, frame) catch |err| {
+        try stderr.print("error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer cobalt.protocol.freeWindowRows(allocator, results);
+
+    for (results) |wr| {
+        for (wr.row.fields.items, 0..) |f, j| {
+            if (j > 0) try stdout.writeAll("\t");
+            try stdout.print("{s}=", .{f.name});
+            try printValue(stdout, f.value);
+        }
+        if (wr.row.fields.items.len > 0) try stdout.writeAll("\t");
+        for (specs, 0..) |spec, specIdx| {
+            if (specIdx > 0) try stdout.writeAll("\t");
+            try printWindowLabel(stdout, spec);
+            try stdout.writeAll("=");
+            try printValue(stdout, wr.values[specIdx]);
+        }
+        try stdout.writeAll("\n");
+    }
+}
+
+/// The network counterpart of `runTxn`: parses the exact same
+/// `put|del <table> <pk> [field=value ...]` script format as the local
+/// `txn <script-file>` command, but builds a list of
+/// `protocol.TxnOpEntry` and commits it in one round trip through
+/// `client.zig`'s `txnOp` (the `txn_op` opcode) instead of staging against
+/// a local `TableTxn` directly - so a script that used to require a
+/// process holding the `Db` can now run against a remote `cobalt serve`.
+fn runRemoteTxn(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 1) return fail(stderr, "remote-txn needs <script-file> [--user NAME --pass PASS] [--token TOKEN]");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    const authFlags = extractAuthFlags(allocator, rest[1..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    const contents = std.fs.cwd().readFileAlloc(allocator, rest[0], 16 * 1024 * 1024) catch |err| {
+        try stderr.print("failed to read script '{s}': {s}\n", .{ rest[0], @errorName(err) });
+        std.process.exit(1);
+    };
+    defer allocator.free(contents);
+
+    var entries = std.ArrayList(cobalt.protocol.TxnOpEntry).init(allocator);
+    defer {
+        for (entries.items) |e| allocator.free(e.fields);
+        entries.deinit();
+    }
+
+    var lineNo: usize = 0;
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |rawLine| {
+        lineNo += 1;
+        const line = std.mem.trim(u8, rawLine, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        var tok = std.mem.tokenizeScalar(u8, line, ' ');
+        const verb = tok.next() orelse continue;
+        const tableName = tok.next() orelse {
+            try stderr.print("line {d}: missing table name\n", .{lineNo});
+            std.process.exit(2);
+        };
+        const pkText = tok.next() orelse {
+            try stderr.print("line {d}: missing primary key\n", .{lineNo});
+            std.process.exit(2);
+        };
+        const pk = parseValue(pkText) catch {
+            try stderr.print("line {d}: invalid primary key '{s}'\n", .{ lineNo, pkText });
+            std.process.exit(2);
+        };
+
+        if (std.mem.eql(u8, verb, "put")) {
+            var fields = std.ArrayList(Field).init(allocator);
+            errdefer fields.deinit();
+            while (tok.next()) |raw| {
+                const f = parseField(raw) catch {
+                    try stderr.print("line {d}: invalid field '{s}'\n", .{ lineNo, raw });
+                    std.process.exit(2);
+                };
+                try fields.append(f);
+            }
+            try entries.append(.{ .verb = .put, .table = tableName, .pk = pk, .fields = try fields.toOwnedSlice() });
+        } else if (std.mem.eql(u8, verb, "del")) {
+            try entries.append(.{ .verb = .del, .table = tableName, .pk = pk, .fields = &.{} });
+        } else {
+            try stderr.print("line {d}: unknown verb '{s}' (expected put/del)\n", .{ lineNo, verb });
+            std.process.exit(2);
+        }
+    }
+
+    if (entries.items.len == 0) return fail(stderr, "txn script had no operations");
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
 }
 
 fn runVerify(allocator: std.mem.Allocator, stdout: anytype, dir: []const u8, count: usize) !void {
