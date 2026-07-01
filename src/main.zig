@@ -3079,6 +3079,352 @@ fn runRemoteTxn(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, 
         std.process.exit(1);
     };
     defer client.close();
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const applied = client.txnOp(entries.items) catch |err| {
+        try stderr.print("transaction failed, nothing applied: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    try stdout.print("OK: {d} operation(s) committed atomically\n", .{applied});
+}
+
+/// The network counterpart of `runUser`: dispatches `remote-user <op> ...`
+/// onto `client.zig`'s `admin*` methods (which wire-encode the
+/// `user_admin` opcode) instead of a local `auth.Store`. Bootstrapping the
+/// very first admin account still has to happen locally via `user add`
+/// (see the module doc on `runUser`), but every subsequent user management
+/// operation can go over the wire once that first admin can authenticate.
+fn runRemoteUser(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 1) return fail(stderr, "remote-user needs a subcommand (add/passwd/role/del/list)");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const authFlags = extractAuthFlags(allocator, rest[1..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const op = rest[0];
+    const args = authFlags.rest;
+
+    if (std.mem.eql(u8, op, "add")) {
+        if (args.len < 3) return fail(stderr, "remote-user add needs <username> <password> readonly|readwrite|admin");
+        const role = cobalt.AuthRole.parse(args[2]) catch return fail(stderr, "role must be readonly, readwrite, or admin");
+        client.adminCreateUser(args[0], args[1], role, cobalt.auth.recommendedRounds) catch |err| {
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        try stdout.print("user '{s}' created with role {s}\n", .{ args[0], role.name() });
+    } else if (std.mem.eql(u8, op, "passwd")) {
+        if (args.len < 2) return fail(stderr, "remote-user passwd needs <username> <newpassword>");
+        client.adminSetPassword(args[0], args[1], cobalt.auth.recommendedRounds) catch |err| {
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        try stdout.print("password updated for '{s}'\n", .{args[0]});
+    } else if (std.mem.eql(u8, op, "role")) {
+        if (args.len < 2) return fail(stderr, "remote-user role needs <username> readonly|readwrite|admin");
+        const role = cobalt.AuthRole.parse(args[1]) catch return fail(stderr, "role must be readonly, readwrite, or admin");
+        client.adminSetRole(args[0], role) catch |err| {
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        try stdout.print("role for '{s}' set to {s}\n", .{ args[0], role.name() });
+    } else if (std.mem.eql(u8, op, "del")) {
+        if (args.len < 1) return fail(stderr, "remote-user del needs <username>");
+        client.adminDeleteUser(args[0]) catch |err| {
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        try stdout.print("user '{s}' deleted\n", .{args[0]});
+    } else if (std.mem.eql(u8, op, "list")) {
+        const users = client.adminListUsers(allocator) catch |err| {
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer cobalt.auth.freeUserList(allocator, users);
+        for (users) |u| try stdout.print("{s}\t{s}\n", .{ u.username, u.role.name() });
+    } else {
+        return fail(stderr, "unknown remote-user operation");
+    }
+}
+
+/// The network counterpart of `runTtl`-shaped local commands (`expire`,
+/// `persist`, `ttl`, `expire-sweep`): dispatches `remote-ttl <op> ...` onto
+/// `client.zig`'s `ttl*` methods (which wire-encode the `ttl_op` opcode)
+/// instead of calling `ttl.zig` directly against a local Db, the same
+/// "reuse client.zig, keep the arg parsing local" shape as `runRemoteUser`.
+fn runRemoteTtl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 1) return fail(stderr, "remote-ttl needs a subcommand (expire/persist/ttl/sweep)");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const authFlags = extractAuthFlags(allocator, rest[1..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const op = rest[0];
+    const args = authFlags.rest;
+
+    if (std.mem.eql(u8, op, "expire")) {
+        if (args.len < 2) return fail(stderr, "remote-ttl expire needs <key> <seconds>");
+        const seconds = std.fmt.parseInt(u64, args[1], 10) catch return fail(stderr, "expire needs a whole number of seconds");
+        client.ttlExpire(args[0], seconds) catch |err| {
+            if (err == error.ServerKeyNotFound) return fail(stderr, "no such key");
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    } else if (std.mem.eql(u8, op, "persist")) {
+        if (args.len < 1) return fail(stderr, "remote-ttl persist needs <key>");
+        client.ttlPersist(args[0]) catch |err| {
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    } else if (std.mem.eql(u8, op, "ttl")) {
+        if (args.len < 1) return fail(stderr, "remote-ttl ttl needs <key>");
+        const result = client.ttlQuery(args[0]) catch |err| {
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        switch (result) {
+            .noKey => try stdout.writeAll("-2\n"),
+            .noExpiry => try stdout.writeAll("-1\n"),
+            .seconds => |s| try stdout.print("{d}\n", .{s}),
+        }
+    } else if (std.mem.eql(u8, op, "sweep")) {
+        const reaped = client.ttlSweep() catch |err| {
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        try stdout.print("reaped: {d}\n", .{reaped});
+    } else {
+        return fail(stderr, "unknown remote-ttl operation");
+    }
+}
+
+/// The network counterpart of `runCollTtl`-shaped local commands (`coll
+/// <kind> expire|ttl|persist`, `coll expire-sweep`): dispatches
+/// `remote-coll-ttl sweep` or `remote-coll-ttl <kind> <op> ...` onto
+/// `client.zig`'s `collTtl*` methods (which wire-encode the `coll_ttl_op`
+/// opcode), same "reuse client.zig, keep the arg parsing local" shape as
+/// `runRemoteTtl`. `sweep` has no `<kind>` (it reaps every kind at once,
+/// same as local `coll expire-sweep`), so it is checked before trying to
+/// parse `rest[0]` as a kind.
+fn runRemoteCollTtl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 1) return fail(stderr, "remote-coll-ttl needs sweep or <kind> expire|ttl|persist <name>");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    if (std.mem.eql(u8, rest[0], "sweep")) {
+        const authFlags = extractAuthFlags(allocator, rest[1..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+        defer allocator.free(authFlags.rest);
+        try authenticateIfRequested(&client, stderr, authFlags.auth);
+        const reaped = client.collTtlSweep() catch |err| {
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        try stdout.print("reaped: {d}\n", .{reaped});
+        return;
+    }
+
+    const kind = cobalt.CollectionKind.parse(rest[0]) orelse
+        return fail(stderr, "unknown collection kind (expected counter/hash/set/list/zset)");
+    if (rest.len < 2) return fail(stderr, "remote-coll-ttl <kind> needs expire|ttl|persist <name>");
+
+    const authFlags = extractAuthFlags(allocator, rest[2..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const op = rest[1];
+    const args = authFlags.rest;
+
+    if (std.mem.eql(u8, op, "expire")) {
+        if (args.len < 2) return fail(stderr, "remote-coll-ttl <kind> expire needs <name> <seconds>");
+        const seconds = std.fmt.parseInt(u64, args[1], 10) catch return fail(stderr, "expire needs a whole number of seconds");
+        client.collTtlExpire(kind, args[0], seconds) catch |err| {
+            if (err == error.ServerCollectionNotFound) return fail(stderr, "no such collection");
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    } else if (std.mem.eql(u8, op, "persist")) {
+        if (args.len < 1) return fail(stderr, "remote-coll-ttl <kind> persist needs <name>");
+        client.collTtlPersist(kind, args[0]) catch |err| {
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    } else if (std.mem.eql(u8, op, "ttl")) {
+        if (args.len < 1) return fail(stderr, "remote-coll-ttl <kind> ttl needs <name>");
+        const result = client.collTtlQuery(kind, args[0]) catch |err| {
+            try stderr.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        switch (result) {
+            .noKey => try stdout.writeAll("-2\n"),
+            .noExpiry => try stdout.writeAll("-1\n"),
+            .seconds => |s| try stdout.print("{d}\n", .{s}),
+        }
+    } else {
+        return fail(stderr, "unknown remote-coll-ttl operation");
+    }
+}
+
+/// Prints an `OwnedCollReply` the same way `runColl`'s local dispatch
+/// prints each op's own return value - one shape per reply variant, not
+/// one shape per op, since `client.collOp`'s reply already carries enough
+/// structure to tell them apart (an int reply from `set_ismember` prints
+/// exactly like one from `hash_del`, both booleans-as-0/1, matching
+/// `runColl`'s own `boolFlag` convention).
+fn printCollReply(stdout: anytype, reply: cobalt.protocol.OwnedCollReply) !void {
+    switch (reply) {
+        .nil => try stdout.writeAll("(nil)\n"),
+        .ok => try stdout.writeAll("OK\n"),
+        .int => |v| try stdout.print("{d}\n", .{v}),
+        .real => |v| try stdout.print("{d}\n", .{v}),
+        .bytes => |v| try stdout.print("{s}\n", .{v}),
+        .stringList => |items| for (items) |it| try stdout.print("{s}\n", .{it}),
+        .pairList => |items| for (items) |p| try stdout.print("{s}\t{s}\n", .{ p.field, p.value }),
+        .scorePairList => |items| for (items) |p| try stdout.print("{s}\t{d}\n", .{ p.member, p.score }),
+    }
+}
+
+/// The network counterpart of `runColl`'s local `coll <kind> <op> ...`
+/// (backed by `collections.zig`): parses the exact same
+/// `<kind> <op> [args...]` shape `runColl` does, translates it to a
+/// `protocol.CollAction` plus a name and string-arg list, and sends it
+/// through `client.collOp` instead of calling `collections.zig` directly -
+/// the network counterpart `remote-coll-ttl` already is for `coll <kind>
+/// expire|ttl|persist`. There is no `remote-coll expire-sweep` counterpart:
+/// unlike TTL sweeping (a background maintenance action against the whole
+/// store), the read/write collection operations here always target one
+/// named collection, so there is nothing store-wide to bundle behind this
+/// opcode the way `coll_ttl_op`'s `sweep` action does.
+fn runRemoteColl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    if (rest.len < 2) return fail(stderr, "remote-coll needs <kind> <op> ...");
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const authFlags = extractAuthFlags(allocator, rest[2..]) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const kind = rest[0];
+    const op = rest[1];
+    const args = authFlags.rest;
+
+    const Call = struct { action: cobalt.protocol.CollAction, name: []const u8, callArgs: []const []const u8 };
+
+    const call: Call = blk: {
+        if (std.mem.eql(u8, kind, "counter")) {
+            if (std.mem.eql(u8, op, "get")) {
+                if (args.len < 1) return fail(stderr, "counter get needs <name>");
+                break :blk .{ .action = .counter_get, .name = args[0], .callArgs = &.{} };
+            } else if (std.mem.eql(u8, op, "set")) {
+                if (args.len < 2) return fail(stderr, "counter set needs <name> <value>");
+                break :blk .{ .action = .counter_set, .name = args[0], .callArgs = args[1..2] };
+            } else if (std.mem.eql(u8, op, "incrby")) {
+                if (args.len < 2) return fail(stderr, "counter incrby needs <name> <delta>");
+                break :blk .{ .action = .counter_incrby, .name = args[0], .callArgs = args[1..2] };
+            }
+            return fail(stderr, "unknown counter operation");
+        } else if (std.mem.eql(u8, kind, "hash")) {
+            if (std.mem.eql(u8, op, "set")) {
+                if (args.len < 3) return fail(stderr, "hash set needs <name> <field> <value>");
+                break :blk .{ .action = .hash_set, .name = args[0], .callArgs = args[1..3] };
+            } else if (std.mem.eql(u8, op, "get")) {
+                if (args.len < 2) return fail(stderr, "hash get needs <name> <field>");
+                break :blk .{ .action = .hash_get, .name = args[0], .callArgs = args[1..2] };
+            } else if (std.mem.eql(u8, op, "del")) {
+                if (args.len < 2) return fail(stderr, "hash del needs <name> <field>");
+                break :blk .{ .action = .hash_del, .name = args[0], .callArgs = args[1..2] };
+            } else if (std.mem.eql(u8, op, "len")) {
+                if (args.len < 1) return fail(stderr, "hash len needs <name>");
+                break :blk .{ .action = .hash_len, .name = args[0], .callArgs = &.{} };
+            } else if (std.mem.eql(u8, op, "getall")) {
+                if (args.len < 1) return fail(stderr, "hash getall needs <name>");
+                break :blk .{ .action = .hash_getall, .name = args[0], .callArgs = &.{} };
+            }
+            return fail(stderr, "unknown hash operation");
+        } else if (std.mem.eql(u8, kind, "set")) {
+            if (std.mem.eql(u8, op, "add")) {
+                if (args.len < 2) return fail(stderr, "set add needs <name> <member>");
+                break :blk .{ .action = .set_add, .name = args[0], .callArgs = args[1..2] };
+            } else if (std.mem.eql(u8, op, "rem")) {
+                if (args.len < 2) return fail(stderr, "set rem needs <name> <member>");
+                break :blk .{ .action = .set_rem, .name = args[0], .callArgs = args[1..2] };
+            } else if (std.mem.eql(u8, op, "ismember")) {
+                if (args.len < 2) return fail(stderr, "set ismember needs <name> <member>");
+                break :blk .{ .action = .set_ismember, .name = args[0], .callArgs = args[1..2] };
+            } else if (std.mem.eql(u8, op, "card")) {
+                if (args.len < 1) return fail(stderr, "set card needs <name>");
+                break :blk .{ .action = .set_card, .name = args[0], .callArgs = &.{} };
+            } else if (std.mem.eql(u8, op, "members")) {
+                if (args.len < 1) return fail(stderr, "set members needs <name>");
+                break :blk .{ .action = .set_members, .name = args[0], .callArgs = &.{} };
+            } else if (std.mem.eql(u8, op, "inter")) {
+                if (args.len < 1) return fail(stderr, "set inter needs at least one <name>");
+                break :blk .{ .action = .set_inter, .name = args[0], .callArgs = args[1..] };
+            } else if (std.mem.eql(u8, op, "union")) {
+                if (args.len < 1) return fail(stderr, "set union needs at least one <name>");
+                break :blk .{ .action = .set_union, .name = args[0], .callArgs = args[1..] };
+            } else if (std.mem.eql(u8, op, "diff")) {
+                if (args.len < 2) return fail(stderr, "set diff needs <name> <other...>");
+                break :blk .{ .action = .set_diff, .name = args[0], .callArgs = args[1..] };
+            }
+            return fail(stderr, "unknown set operation");
+        } else if (std.mem.eql(u8, kind, "list")) {
+            if (std.mem.eql(u8, op, "lpush")) {
+                if (args.len < 2) return fail(stderr, "list lpush needs <name> <value>");
+                break :blk .{ .action = .list_lpush, .name = args[0], .callArgs = args[1..2] };
+            } else if (std.mem.eql(u8, op, "rpush")) {
+                if (args.len < 2) return fail(stderr, "list rpush needs <name> <value>");
+                break :blk .{ .action = .list_rpush, .name = args[0], .callArgs = args[1..2] };
+            } else if (std.mem.eql(u8, op, "lpop")) {
+                if (args.len < 1) return fail(stderr, "list lpop needs <name>");
+                break :blk .{ .action = .list_lpop, .name = args[0], .callArgs = &.{} };
+            } else if (std.mem.eql(u8, op, "rpop")) {
+                if (args.len < 1) return fail(stderr, "list rpop needs <name>");
+                break :blk .{ .action = .list_rpop, .name = args[0], .callArgs = &.{} };
+            } else if (std.mem.eql(u8, op, "len")) {
+                if (args.len < 1) return fail(stderr, "list len needs <name>");
+                break :blk .{ .action = .list_len, .name = args[0], .callArgs = &.{} };
+            } else if (std.mem.eql(u8, op, "range")) {
+                if (args.len < 3) return fail(stderr, "list range needs <name> <start> <stop>");
+                break :blk .{ .action = .list_range, .name = args[0], .callArgs = args[1..3] };
+            }
+            return fail(stderr, "unknown list operation");
+        } else if (std.mem.eql(u8, kind, "zset")) {
+            if (std.mem.eql(u8, op, "add")) {
+                if (args.len < 3) return fail(stderr, "zset add needs <name> <member> <score>");
+                break :blk .{ .action = .zset_add, .name = args[0], .callArgs = args[1..3] };
+            } else if (std.mem.eql(u8, op, "score")) {
+                if (args.len < 2) return fail(stderr, "zset score needs <name> <member>");
+                break :blk .{ .action = .zset_score, .name = args[0], .callArgs = args[1..2] };
+            } else if (std.mem.eql(u8, op, "incrby")) {
+                if (args.len < 3) return fail(stderr, "zset incrby needs <name> <member> <delta>");
+                break :blk .{ .action = .zset_incrby, .name = args[0], .callArgs = args[1..3] };
 }
 
 fn runVerify(allocator: std.mem.Allocator, stdout: anytype, dir: []const u8, count: usize) !void {
