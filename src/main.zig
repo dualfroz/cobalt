@@ -3425,6 +3425,217 @@ fn runRemoteColl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype,
             } else if (std.mem.eql(u8, op, "incrby")) {
                 if (args.len < 3) return fail(stderr, "zset incrby needs <name> <member> <delta>");
                 break :blk .{ .action = .zset_incrby, .name = args[0], .callArgs = args[1..3] };
+            } else if (std.mem.eql(u8, op, "rem")) {
+                if (args.len < 2) return fail(stderr, "zset rem needs <name> <member>");
+                break :blk .{ .action = .zset_rem, .name = args[0], .callArgs = args[1..2] };
+            } else if (std.mem.eql(u8, op, "card")) {
+                if (args.len < 1) return fail(stderr, "zset card needs <name>");
+                break :blk .{ .action = .zset_card, .name = args[0], .callArgs = &.{} };
+            } else if (std.mem.eql(u8, op, "rangebyrank")) {
+                if (args.len < 3) return fail(stderr, "zset rangebyrank needs <name> <start> <stop>");
+                break :blk .{ .action = .zset_rangebyrank, .name = args[0], .callArgs = args[1..3] };
+            } else if (std.mem.eql(u8, op, "rangebyscore")) {
+                if (args.len < 3) return fail(stderr, "zset rangebyscore needs <name> <min> <max>");
+                break :blk .{ .action = .zset_rangebyscore, .name = args[0], .callArgs = args[1..3] };
+            } else if (std.mem.eql(u8, op, "rank")) {
+                if (args.len < 2) return fail(stderr, "zset rank needs <name> <member>");
+                break :blk .{ .action = .zset_rank, .name = args[0], .callArgs = args[1..2] };
+            }
+            return fail(stderr, "unknown zset operation");
+        }
+        return fail(stderr, "unknown collection kind (expected counter/hash/set/list/zset)");
+    };
+
+    var reply = client.collOp(allocator, call.action, call.name, call.callArgs) catch |err| {
+        try stderr.print("error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer reply.deinit(allocator);
+    try printCollReply(stdout, reply);
+}
+
+/// The network counterpart of local `stats --prom`: connects to a running
+/// `cobalt serve`, authenticates if credentials were given (same
+/// `--user`/`--pass`/`--token` convention as `remote-select`/`remote-user`),
+/// and prints `client.metricsText` verbatim. Unlike `stats --prom` locally
+/// (which only ever has a `Db` to render, never a `*Server`), this also
+/// carries the server's own request/rate-limit/auth/session counters from
+/// `Server.registerMetrics` - the only way to observe those from outside
+/// the serving process at all.
+fn runRemoteStats(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
+    const address = try parseHostPort(stdout, addressSpec);
+
+    var client = cobalt.Client.connect(allocator, address) catch |err| {
+        try stderr.print("error: could not connect to {s}: {s}\n", .{ addressSpec, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.close();
+
+    const authFlags = extractAuthFlags(allocator, rest) catch return fail(stderr, "invalid --user/--pass/--token value");
+    defer allocator.free(authFlags.rest);
+
+    try authenticateIfRequested(&client, stderr, authFlags.auth);
+
+    const text = client.metricsText(allocator) catch |err| {
+        try stderr.print("error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer allocator.free(text);
+    try stdout.writeAll(text);
+}
+
+fn runServe(allocator: std.mem.Allocator, stdout: anytype, db: *cobalt.Db, bind: []const u8, rest: []const []const u8) !void {
+    const address = try parseHostPort(stdout, bind);
+
+    var server = try cobalt.Server.init(allocator, db, address);
+
+    var sessionTtlSeconds: ?f64 = null;
+    var sessionSweepSeconds: ?f64 = null;
+    var ttlSweepSeconds: ?f64 = null;
+    var collTtlSweepSeconds: ?f64 = null;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        if (std.mem.eql(u8, rest[i], "--rate-limit")) {
+            if (i + 2 >= rest.len) {
+                try stdout.writeAll("error: --rate-limit needs <capacity> <per-second>\n");
+                std.process.exit(2);
+            }
+            const capacity = std.fmt.parseFloat(f64, rest[i + 1]) catch {
+                try stdout.print("error: invalid rate-limit capacity '{s}'\n", .{rest[i + 1]});
+                std.process.exit(2);
+            };
+            const refill = std.fmt.parseFloat(f64, rest[i + 2]) catch {
+                try stdout.print("error: invalid rate-limit per-second '{s}'\n", .{rest[i + 2]});
+                std.process.exit(2);
+            };
+            server.enableRateLimit(capacity, refill);
+            try stdout.print("rate limit enabled: {d} capacity, {d}/sec refill\n", .{ capacity, refill });
+            i += 2;
+        } else if (std.mem.eql(u8, rest[i], "--per-conn-rate-limit")) {
+            if (i + 2 >= rest.len) {
+                try stdout.writeAll("error: --per-conn-rate-limit needs <capacity> <per-second>\n");
+                std.process.exit(2);
+            }
+            const capacity = std.fmt.parseFloat(f64, rest[i + 1]) catch {
+                try stdout.print("error: invalid per-conn-rate-limit capacity '{s}'\n", .{rest[i + 1]});
+                std.process.exit(2);
+            };
+            const refill = std.fmt.parseFloat(f64, rest[i + 2]) catch {
+                try stdout.print("error: invalid per-conn-rate-limit per-second '{s}'\n", .{rest[i + 2]});
+                std.process.exit(2);
+            };
+            server.enablePerConnectionRateLimit(capacity, refill);
+            try stdout.print("per-connection rate limit enabled: {d} capacity, {d}/sec refill\n", .{ capacity, refill });
+            i += 2;
+        } else if (std.mem.eql(u8, rest[i], "--auth")) {
+            const store = cobalt.AuthStore.init(db);
+            if (!(try store.hasAnyAdmin(allocator))) {
+                try stdout.writeAll("error: --auth requires at least one admin user; create one first with `user add <name> <password> admin`\n");
+                std.process.exit(2);
+            }
+            server.enableAuth(store);
+            try stdout.writeAll("auth enabled: every op but ping now requires a prior AUTH\n");
+        } else if (std.mem.eql(u8, rest[i], "--session-ttl")) {
+            if (i + 1 >= rest.len) {
+                try stdout.writeAll("error: --session-ttl needs <seconds>\n");
+                std.process.exit(2);
+            }
+            sessionTtlSeconds = std.fmt.parseFloat(f64, rest[i + 1]) catch {
+                try stdout.print("error: invalid session-ttl '{s}'\n", .{rest[i + 1]});
+                std.process.exit(2);
+            };
+            i += 1;
+        } else if (std.mem.eql(u8, rest[i], "--session-sweep-interval")) {
+            if (i + 1 >= rest.len) {
+                try stdout.writeAll("error: --session-sweep-interval needs <seconds>\n");
+                std.process.exit(2);
+            }
+            sessionSweepSeconds = std.fmt.parseFloat(f64, rest[i + 1]) catch {
+                try stdout.print("error: invalid session-sweep-interval '{s}'\n", .{rest[i + 1]});
+                std.process.exit(2);
+            };
+            i += 1;
+        } else if (std.mem.eql(u8, rest[i], "--ttl-sweep-interval")) {
+            if (i + 1 >= rest.len) {
+                try stdout.writeAll("error: --ttl-sweep-interval needs <seconds>\n");
+                std.process.exit(2);
+            }
+            ttlSweepSeconds = std.fmt.parseFloat(f64, rest[i + 1]) catch {
+                try stdout.print("error: invalid ttl-sweep-interval '{s}'\n", .{rest[i + 1]});
+                std.process.exit(2);
+            };
+            i += 1;
+        } else if (std.mem.eql(u8, rest[i], "--coll-ttl-sweep-interval")) {
+            if (i + 1 >= rest.len) {
+                try stdout.writeAll("error: --coll-ttl-sweep-interval needs <seconds>\n");
+                std.process.exit(2);
+            }
+            collTtlSweepSeconds = std.fmt.parseFloat(f64, rest[i + 1]) catch {
+                try stdout.print("error: invalid coll-ttl-sweep-interval '{s}'\n", .{rest[i + 1]});
+                std.process.exit(2);
+            };
+            i += 1;
+        } else {
+            try stdout.print("error: unknown serve flag '{s}'\n", .{rest[i]});
+            std.process.exit(2);
+        }
+    }
+
+    if (sessionSweepSeconds != null and sessionTtlSeconds == null) {
+        try stdout.writeAll("error: --session-sweep-interval requires --session-ttl\n");
+        std.process.exit(2);
+    }
+
+    var sessionStore: cobalt.SessionStore = undefined;
+    if (sessionTtlSeconds) |seconds| {
+        if (seconds <= 0) {
+            try stdout.writeAll("error: --session-ttl must be a positive number of seconds\n");
+            std.process.exit(2);
+        }
+        if (server.authStore == null) {
+            try stdout.writeAll("error: --session-ttl requires --auth\n");
+            std.process.exit(2);
+        }
+        sessionStore = cobalt.SessionStore.init(allocator);
+        const ttlNanos: i128 = @intFromFloat(seconds * @as(f64, @floatFromInt(std.time.ns_per_s)));
+        server.enableSessions(&sessionStore, ttlNanos);
+        try stdout.print("sessions enabled: AUTH issues a token valid for {d}s\n", .{seconds});
+
+        if (sessionSweepSeconds) |sweepSeconds| {
+            if (sweepSeconds <= 0) {
+                try stdout.writeAll("error: --session-sweep-interval must be a positive number of seconds\n");
+                std.process.exit(2);
+            }
+            const sweepNanos: u64 = @intFromFloat(sweepSeconds * @as(f64, @floatFromInt(std.time.ns_per_s)));
+            server.enableSessionSweep(sweepNanos);
+            try stdout.print("session sweeper enabled: expired sessions dropped every {d}s\n", .{sweepSeconds});
+        }
+    }
+    defer if (sessionTtlSeconds != null) sessionStore.deinit();
+
+    if (ttlSweepSeconds) |seconds| {
+        if (seconds <= 0) {
+            try stdout.writeAll("error: --ttl-sweep-interval must be a positive number of seconds\n");
+            std.process.exit(2);
+        }
+        const nanos: u64 = @intFromFloat(seconds * @as(f64, @floatFromInt(std.time.ns_per_s)));
+        server.enableTtlSweep(nanos);
+        try stdout.print("ttl sweeper enabled: due keys reaped every {d}s\n", .{seconds});
+    }
+
+    if (collTtlSweepSeconds) |seconds| {
+        if (seconds <= 0) {
+            try stdout.writeAll("error: --coll-ttl-sweep-interval must be a positive number of seconds\n");
+            std.process.exit(2);
+        }
+        const nanos: u64 = @intFromFloat(seconds * @as(f64, @floatFromInt(std.time.ns_per_s)));
+        server.enableCollTtlSweep(nanos);
+        try stdout.print("collection ttl sweeper enabled: due collections reaped every {d}s\n", .{seconds});
+    }
+
+    try stdout.print("cobalt server listening on {}\n", .{server.boundAddress()});
+    try server.start();
+    server.wait();
 }
 
 fn runVerify(allocator: std.mem.Allocator, stdout: anytype, dir: []const u8, count: usize) !void {
