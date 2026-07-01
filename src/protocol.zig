@@ -801,3 +801,317 @@ pub const DecodedTxnOpEntry = struct {
     fieldsBytes: []const u8,
 };
 
+pub fn decodeTxnOp(allocator: Allocator, payload: []const u8) ![]DecodedTxnOpEntry {
+    var c = Cursor{ .data = payload };
+    const count = try c.takeU32();
+    var list = try std.ArrayList(DecodedTxnOpEntry).initCapacity(allocator, count);
+    errdefer list.deinit();
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const verb = try TxnVerb.fromByte(try c.takeByte());
+        const table = try c.takeLenPrefixed();
+        const pkBytes = try c.takeLenPrefixed();
+        const fieldsBytes = try c.takeLenPrefixed();
+        list.appendAssumeCapacity(.{ .verb = verb, .table = table, .pkBytes = pkBytes, .fieldsBytes = fieldsBytes });
+    }
+    return list.toOwnedSlice();
+}
+
+/// Encodes the response to a successful `txn_op`: how many operations were
+/// committed - always every entry in the request, since a partial commit is
+/// impossible (`error.Conflict` aborts the whole transaction instead, and
+/// surfaces as `Status.conflict` with no payload, the same shape as
+/// `user_admin`'s `UserExists` conflict).
+pub fn encodeTxnResult(allocator: Allocator, applied: u32) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(applied);
+    return buf.toOwnedSlice();
+}
+
+pub fn decodeTxnResult(payload: []const u8) !u32 {
+    var c = Cursor{ .data = payload };
+    return c.takeU32();
+}
+
+// --- scan / prefix ---
+
+pub const ScanArgs = struct {
+    start: ?[]const u8 = null,
+    end: ?[]const u8 = null,
+    limit: u32 = 0,
+    reverse: bool = false,
+};
+
+const scanFlagHasStart: u8 = 1 << 0;
+const scanFlagHasEnd: u8 = 1 << 1;
+const scanFlagReverse: u8 = 1 << 2;
+
+pub fn encodeScan(allocator: Allocator, args: ScanArgs) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    var flags: u8 = 0;
+    if (args.start != null) flags |= scanFlagHasStart;
+    if (args.end != null) flags |= scanFlagHasEnd;
+    if (args.reverse) flags |= scanFlagReverse;
+    try w.byte(flags);
+    if (args.start) |s| try putLenPrefixed(w, s);
+    if (args.end) |e| try putLenPrefixed(w, e);
+    try w.putU32(args.limit);
+    return buf.toOwnedSlice();
+}
+
+pub fn decodeScan(payload: []const u8) !ScanArgs {
+    var c = Cursor{ .data = payload };
+    const flags = try c.takeByte();
+    var args = ScanArgs{};
+    if (flags & scanFlagHasStart != 0) args.start = try c.takeLenPrefixed();
+    if (flags & scanFlagHasEnd != 0) args.end = try c.takeLenPrefixed();
+    args.reverse = flags & scanFlagReverse != 0;
+    args.limit = try c.takeU32();
+    return args;
+}
+
+pub fn encodePrefix(allocator: Allocator, prefix: []const u8, limit: u32) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(limit);
+    try w.slice(prefix);
+    return buf.toOwnedSlice();
+}
+
+pub const PrefixArgs = struct { prefix: []const u8, limit: u32 };
+
+pub fn decodePrefix(payload: []const u8) !PrefixArgs {
+    var c = Cursor{ .data = payload };
+    const limit = try c.takeU32();
+    const prefix = c.data[c.pos..];
+    return .{ .prefix = prefix, .limit = limit };
+}
+
+// --- entry lists (scan / prefix responses) ---
+
+pub fn encodeEntries(allocator: Allocator, entries: []const dbmod.Entry) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(@intCast(entries.len));
+    for (entries) |e| {
+        try putLenPrefixed(w, e.key);
+        try putLenPrefixed(w, e.value);
+    }
+    return buf.toOwnedSlice();
+}
+
+pub const OwnedEntry = struct {
+    key: []u8,
+    value: []u8,
+
+    pub fn deinit(self: *OwnedEntry, allocator: Allocator) void {
+        allocator.free(self.key);
+        allocator.free(self.value);
+    }
+};
+
+/// Copies every key and value out of `payload` so the caller can free
+/// the frame that carried them and keep the entries alive independently.
+pub fn decodeEntries(allocator: Allocator, payload: []const u8) ![]OwnedEntry {
+    var c = Cursor{ .data = payload };
+    const count = try c.takeU32();
+    var list = try std.ArrayList(OwnedEntry).initCapacity(allocator, count);
+    errdefer {
+        for (list.items) |*e| e.deinit(allocator);
+        list.deinit();
+    }
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const key = try c.takeLenPrefixed();
+        const value = try c.takeLenPrefixed();
+        const ownedKey = try allocator.dupe(u8, key);
+        errdefer allocator.free(ownedKey);
+        const ownedValue = try allocator.dupe(u8, value);
+        list.appendAssumeCapacity(.{ .key = ownedKey, .value = ownedValue });
+    }
+    return list.toOwnedSlice();
+}
+
+pub fn freeOwnedEntries(allocator: Allocator, entries: []OwnedEntry) void {
+    for (entries) |*e| e.deinit(allocator);
+    allocator.free(entries);
+}
+
+// --- batch ---
+
+pub const BatchOp = union(enum) {
+    put: struct { key: []const u8, value: []const u8 },
+    del: []const u8,
+};
+
+const batchKindPut: u8 = 0;
+const batchKindDel: u8 = 1;
+
+pub fn encodeBatch(allocator: Allocator, ops: []const BatchOp) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(@intCast(ops.len));
+    for (ops) |op| {
+        switch (op) {
+            .put => |kv| {
+                try w.byte(batchKindPut);
+                try putLenPrefixed(w, kv.key);
+                try putLenPrefixed(w, kv.value);
+            },
+            .del => |key| {
+                try w.byte(batchKindDel);
+                try putLenPrefixed(w, key);
+            },
+        }
+    }
+    return buf.toOwnedSlice();
+}
+
+pub const DecodedBatchOp = union(enum) {
+    put: struct { key: []const u8, value: []const u8 },
+    del: []const u8,
+};
+
+pub fn decodeBatch(allocator: Allocator, payload: []const u8) ![]DecodedBatchOp {
+    var c = Cursor{ .data = payload };
+    const count = try c.takeU32();
+    var list = try std.ArrayList(DecodedBatchOp).initCapacity(allocator, count);
+    errdefer list.deinit();
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const kind = try c.takeByte();
+        switch (kind) {
+            batchKindPut => {
+                const key = try c.takeLenPrefixed();
+                const value = try c.takeLenPrefixed();
+                list.appendAssumeCapacity(.{ .put = .{ .key = key, .value = value } });
+            },
+            batchKindDel => {
+                const key = try c.takeLenPrefixed();
+                list.appendAssumeCapacity(.{ .del = key });
+            },
+            else => return error.Malformed,
+        }
+    }
+    return list.toOwnedSlice();
+}
+
+// --- table select ---
+
+/// Wire request for a remote `table select`: a table name, the raw text of
+/// an `expr.zig` predicate expression (empty text selects every row, the
+/// same convention `query.Table.select(null)` uses locally), an
+/// offset/limit page window using the same "0 = unlimited" convention as
+/// `ScanArgs.limit` above - so a large remote result can be paged instead
+/// of always coming back in one frame bounded only by `maxFrameBytes` - and
+/// a `query.OrderBy` sort key list (possibly empty) applied server-side via
+/// `Table.selectPageOrdered` before that page window. The order-by count
+/// byte (and each field name/direction pair behind it) sit BEFORE
+/// `exprText` rather than after it, because `exprText` is decoded as
+/// "everything left in the payload" - anything meant to survive decoding
+/// has to come first. A single byte bounds the count to 255 columns, far
+/// more than any real query needs.
+pub fn encodeTableSelect(allocator: Allocator, table: []const u8, exprText: []const u8, offset: u32, limit: u32, orderBy: []const querymod.OrderBy) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, table);
+    try w.putU32(offset);
+    try w.putU32(limit);
+    try w.byte(@intCast(orderBy.len));
+    for (orderBy) |ob| {
+        try w.byte(if (ob.descending) 1 else 0);
+        try putLenPrefixed(w, ob.field);
+    }
+    try w.slice(exprText);
+    return buf.toOwnedSlice();
+}
+
+pub const TableSelectArgs = struct {
+    table: []const u8,
+    exprText: []const u8,
+    offset: u32 = 0,
+    limit: u32 = 0,
+    orderBy: []const querymod.OrderBy = &.{},
+};
+
+/// `table`, `exprText`, and every `orderBy[i].field` are borrowed slices
+/// into `payload` - the same convention `decodeCollOp` uses. Only the
+/// `orderBy` array itself is owned by the caller (free with
+/// `allocator.free`); never its contents.
+pub fn decodeTableSelect(allocator: Allocator, payload: []const u8) !TableSelectArgs {
+    var c = Cursor{ .data = payload };
+    const table = try c.takeLenPrefixed();
+    const offset = try c.takeU32();
+    const limit = try c.takeU32();
+    const count = try c.takeByte();
+    var list = try std.ArrayList(querymod.OrderBy).initCapacity(allocator, count);
+    errdefer list.deinit();
+    var i: u8 = 0;
+    while (i < count) : (i += 1) {
+        const descending = try c.takeByte();
+        const field = try c.takeLenPrefixed();
+        list.appendAssumeCapacity(.{ .field = field, .descending = descending != 0 });
+    }
+    const exprText = c.data[c.pos..];
+    return .{ .table = table, .exprText = exprText, .offset = offset, .limit = limit, .orderBy = try list.toOwnedSlice() };
+}
+
+/// Encodes a `table select` result set as a length-prefixed list of rows,
+/// each row itself encoded with `Row.encode` (the same self-describing
+/// field format a Table stores on disk).
+pub fn encodeRows(allocator: Allocator, rows: []const rowmod.Row) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(@intCast(rows.len));
+    for (rows) |*r| {
+        const encoded = try r.encode(allocator);
+        defer allocator.free(encoded);
+        try putLenPrefixed(w, encoded);
+    }
+    return buf.toOwnedSlice();
+}
+
+/// Decodes a `table select` result set into independently owned Rows -
+/// callers must free each with `Row.deinit` (see `freeRows` below).
+pub fn decodeRows(allocator: Allocator, payload: []const u8) ![]rowmod.Row {
+    var c = Cursor{ .data = payload };
+    const count = try c.takeU32();
+    var list = try std.ArrayList(rowmod.Row).initCapacity(allocator, count);
+    errdefer {
+        for (list.items) |*r| r.deinit();
+        list.deinit();
+    }
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const raw = try c.takeLenPrefixed();
+        const row = rowmod.Row.decode(allocator, raw) catch return error.Malformed;
+        list.appendAssumeCapacity(row);
+    }
+    return list.toOwnedSlice();
+}
+
+pub fn freeRows(allocator: Allocator, rows: []rowmod.Row) void {
+    for (rows) |*r| r.deinit();
+    allocator.free(rows);
+}
+
+// --- table join ---
+
+/// Which of `join.zig`'s four equi-join variants a `table_join` request
+/// wants - the wire counterpart of the CLI's `table join`
+/// `[--left|--right|--full]` flags (no flag means `.inner`).
+pub const JoinMode = enum(u8) {
+    inner = 0,
+    left = 1,
+    right = 2,
+    full = 3,
+
