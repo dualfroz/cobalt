@@ -1115,3 +1115,605 @@ pub const JoinMode = enum(u8) {
     right = 2,
     full = 3,
 
+    pub fn fromByte(b: u8) !JoinMode {
+        return std.meta.intToEnum(JoinMode, b) catch error.UnknownJoinMode;
+    }
+};
+
+/// Wire request for a remote `table join`: which variant (`mode`), the two
+/// tables and the fields they are joined on, and an optional `expr.zig`
+/// predicate text for each side - the same `leftPred`/`rightPred` filter
+/// `join.innerJoin` and its outer variants already take, evaluated exactly
+/// like `table_select`'s `exprText` (empty selects every row on that side).
+pub fn encodeTableJoin(
+    allocator: Allocator,
+    mode: JoinMode,
+    leftTable: []const u8,
+    leftField: []const u8,
+    rightTable: []const u8,
+    rightField: []const u8,
+    offset: u32,
+    limit: u32,
+    leftExprText: []const u8,
+    rightExprText: []const u8,
+) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.byte(@intFromEnum(mode));
+    try putLenPrefixed(w, leftTable);
+    try putLenPrefixed(w, leftField);
+    try putLenPrefixed(w, rightTable);
+    try putLenPrefixed(w, rightField);
+    try w.putU32(offset);
+    try w.putU32(limit);
+    try putLenPrefixed(w, leftExprText);
+    try w.slice(rightExprText);
+    return buf.toOwnedSlice();
+}
+
+pub const TableJoinArgs = struct {
+    mode: JoinMode,
+    leftTable: []const u8,
+    leftField: []const u8,
+    rightTable: []const u8,
+    rightField: []const u8,
+    offset: u32 = 0,
+    limit: u32 = 0,
+    leftExprText: []const u8,
+    rightExprText: []const u8,
+};
+
+pub fn decodeTableJoin(payload: []const u8) !TableJoinArgs {
+    var c = Cursor{ .data = payload };
+    const mode = try JoinMode.fromByte(try c.takeByte());
+    const leftTable = try c.takeLenPrefixed();
+    const leftField = try c.takeLenPrefixed();
+    const rightTable = try c.takeLenPrefixed();
+    const rightField = try c.takeLenPrefixed();
+    const offset = try c.takeU32();
+    const limit = try c.takeU32();
+    const leftExprText = try c.takeLenPrefixed();
+    const rightExprText = c.data[c.pos..];
+    return .{
+        .mode = mode,
+        .leftTable = leftTable,
+        .leftField = leftField,
+        .rightTable = rightTable,
+        .rightField = rightField,
+        .offset = offset,
+        .limit = limit,
+        .leftExprText = leftExprText,
+        .rightExprText = rightExprText,
+    };
+}
+
+/// One row pair from any of `join.zig`'s four variants, flattened to a
+/// single wire shape: `innerJoin` never leaves either side null,
+/// `leftOuterJoin`/`rightOuterJoin` leave exactly one side nullable, and
+/// `fullOuterJoin` allows either - rather than four near-identical wire
+/// encodings, every variant's result is converted to this one shape before
+/// `encodeJoinedRows`, and the CLI decides what "(nil)" means from which
+/// `--left`/`--right`/`--full` flag it sent, exactly like the local `table
+/// join` printer already does per `JoinMode`.
+pub const JoinPair = struct { left: ?rowmod.Row, right: ?rowmod.Row };
+
+fn putOptionalRow(allocator: Allocator, w: encode.ByteWriter, row: ?rowmod.Row) !void {
+    if (row) |*r| {
+        try w.byte(1);
+        const encoded = try r.encode(allocator);
+        defer allocator.free(encoded);
+        try putLenPrefixed(w, encoded);
+    } else {
+        try w.byte(0);
+    }
+}
+
+pub fn encodeJoinedRows(allocator: Allocator, pairs: []const JoinPair) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(@intCast(pairs.len));
+    for (pairs) |p| {
+        try putOptionalRow(allocator, w, p.left);
+        try putOptionalRow(allocator, w, p.right);
+    }
+    return buf.toOwnedSlice();
+}
+
+fn takeOptionalRow(allocator: Allocator, c: *Cursor) !?rowmod.Row {
+    const present = try c.takeByte();
+    if (present == 0) return null;
+    const raw = try c.takeLenPrefixed();
+    return rowmod.Row.decode(allocator, raw) catch return error.Malformed;
+}
+
+/// Decodes a `table_join` result set into independently owned `JoinPair`s -
+/// callers must free each present side with `Row.deinit` (see
+/// `freeJoinPairs` below).
+pub fn decodeJoinedRows(allocator: Allocator, payload: []const u8) ![]JoinPair {
+    var c = Cursor{ .data = payload };
+    const count = try c.takeU32();
+    var list = try std.ArrayList(JoinPair).initCapacity(allocator, count);
+    errdefer {
+        for (list.items) |*p| {
+            if (p.left) |*l| l.deinit();
+            if (p.right) |*r| r.deinit();
+        }
+        list.deinit();
+    }
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const left = try takeOptionalRow(allocator, &c);
+        const right = try takeOptionalRow(allocator, &c);
+        list.appendAssumeCapacity(.{ .left = left, .right = right });
+    }
+    return list.toOwnedSlice();
+}
+
+pub fn freeJoinPairs(allocator: Allocator, pairs: []JoinPair) void {
+    for (pairs) |*p| {
+        if (p.left) |*l| l.deinit();
+        if (p.right) |*r| r.deinit();
+    }
+    allocator.free(pairs);
+}
+
+// --- table aggregate ---
+
+/// Wire request for a remote `table aggregate`: a table name, an optional
+/// GROUP BY field (empty means no grouping - the network counterpart of the
+/// CLI's `*` sentinel for `table aggregate <table> *`, chosen client-side so
+/// the wire itself needs no separate mode byte), the list of
+/// `aggregate.zig` specs to compute, and an `expr.zig` predicate text
+/// filtering rows BEFORE aggregation runs - the same empty-means-every-row
+/// convention `table_select`'s `exprText` already uses.
+/// `offset`/`limit` window the result GROUPS (not the input rows) when
+/// `groupField` is non-empty, the same `join.applyPage`/`Table.selectPage`
+/// convention as `table_join`'s wire format - 0/0 means unlimited. Ignored
+/// server-side when `groupField` is empty (`runGlobal` always produces
+/// exactly one result row, nothing to page).
+/// `orderBy` is a `query.OrderBy` sort key list (possibly empty) applied
+/// server-side to the result GROUPS via `aggregate.sortGroupsBy`, after
+/// HAVING narrows them and before `offset`/`limit` window them - same
+/// convention and wire shape (count byte + descending byte + length-prefixed
+/// field name, per column) as `encodeTableSelect`'s `orderBy`. Each
+/// `orderBy[i].field` must name either `groupField` or one of `specs`'
+/// `specLabel`s (validated server-side by `sortGroupsBy`, not here).
+/// Meaningless (and ignored server-side) for the ungrouped `groupField.len
+/// == 0` path, same as `offset`/`limit` already are - `runGlobal` always
+/// produces exactly one result row, nothing to order.
+///
+/// `havingText` is a second, independent `expr.zig` predicate text
+/// (empty means no HAVING) filtering the result GROUPS AFTER aggregation,
+/// evaluated server-side before `offset`/`limit` window them - the wire
+/// counterpart of the CLI's `having <expr>` suffix. Encoded length-prefixed
+/// (not "rest of payload" like `exprText`) precisely because `exprText`
+/// still needs to occupy that final slot.
+pub fn encodeTableAggregate(allocator: Allocator, table: []const u8, groupField: []const u8, specs: []const aggregatemod.AggSpec, offset: u32, limit: u32, orderBy: []const querymod.OrderBy, havingText: []const u8, exprText: []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, table);
+    try putLenPrefixed(w, groupField);
+    try w.putU32(@intCast(specs.len));
+    for (specs) |spec| {
+        try w.byte(@intFromEnum(spec.kind));
+        try putLenPrefixed(w, spec.field);
+    }
+    try w.putU32(offset);
+    try w.putU32(limit);
+    try w.byte(@intCast(orderBy.len));
+    for (orderBy) |ob| {
+        try w.byte(if (ob.descending) 1 else 0);
+        try putLenPrefixed(w, ob.field);
+    }
+    try putLenPrefixed(w, havingText);
+    try w.slice(exprText);
+    return buf.toOwnedSlice();
+}
+
+pub const TableAggregateArgs = struct {
+    table: []const u8,
+    groupField: []const u8,
+    /// Borrows `field` slices from the decoded payload but owns the slice
+    /// itself - caller frees with `allocator.free(args.specs)`, same shape
+    /// as `decodeBatch`'s returned list.
+    specs: []aggregatemod.AggSpec,
+    offset: u32 = 0,
+    limit: u32 = 0,
+    /// Empty means no ORDER BY - see `encodeTableAggregate`'s doc. Borrows
+    /// `field` slices from the decoded payload but owns the slice itself,
+    /// same convention as `specs`/`TableSelectArgs.orderBy`.
+    orderBy: []const querymod.OrderBy = &.{},
+    /// Empty means no HAVING clause - see `encodeTableAggregate`'s doc.
+    havingText: []const u8,
+    exprText: []const u8,
+};
+
+pub fn decodeTableAggregate(allocator: Allocator, payload: []const u8) !TableAggregateArgs {
+    var c = Cursor{ .data = payload };
+    const table = try c.takeLenPrefixed();
+    const groupField = try c.takeLenPrefixed();
+    const count = try c.takeU32();
+    var specs = try std.ArrayList(aggregatemod.AggSpec).initCapacity(allocator, count);
+    errdefer specs.deinit();
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const kindByte = try c.takeByte();
+        const kind = std.meta.intToEnum(aggregatemod.AggKind, kindByte) catch return error.Malformed;
+        const field = try c.takeLenPrefixed();
+        specs.appendAssumeCapacity(.{ .kind = kind, .field = field });
+    }
+    const offset = try c.takeU32();
+    const limit = try c.takeU32();
+    const orderCount = try c.takeByte();
+    var orderBy = try std.ArrayList(querymod.OrderBy).initCapacity(allocator, orderCount);
+    errdefer orderBy.deinit();
+    var j: u8 = 0;
+    while (j < orderCount) : (j += 1) {
+        const descending = try c.takeByte();
+        const field = try c.takeLenPrefixed();
+        orderBy.appendAssumeCapacity(.{ .field = field, .descending = descending != 0 });
+    }
+    const havingText = try c.takeLenPrefixed();
+    const exprText = c.data[c.pos..];
+    return .{ .table = table, .groupField = groupField, .specs = try specs.toOwnedSlice(), .offset = offset, .limit = limit, .orderBy = try orderBy.toOwnedSlice(), .havingText = havingText, .exprText = exprText };
+}
+
+fn putEncodedValue(allocator: Allocator, w: encode.ByteWriter, value: rowmod.Value) !void {
+    const encoded = try rowmod.encodeValue(allocator, value);
+    defer allocator.free(encoded);
+    try putLenPrefixed(w, encoded);
+}
+
+fn takeDecodedValue(allocator: Allocator, c: *Cursor) !rowmod.Value {
+    const raw = try c.takeLenPrefixed();
+    return rowmod.decodeValue(allocator, raw) catch return error.Malformed;
+}
+
+/// Encodes a `runGlobal` (no `GROUP BY`) result: exactly `specs.len` values,
+/// same order as the request's specs.
+pub fn encodeAggGlobalResult(allocator: Allocator, values: []const rowmod.Value) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(@intCast(values.len));
+    for (values) |v| try putEncodedValue(allocator, w, v);
+    return buf.toOwnedSlice();
+}
+
+/// Decodes a `runGlobal` result into independently owned `Value`s - callers
+/// must free with `freeAggValues`.
+pub fn decodeAggGlobalResult(allocator: Allocator, payload: []const u8) ![]rowmod.Value {
+    var c = Cursor{ .data = payload };
+    const count = try c.takeU32();
+    var list = try std.ArrayList(rowmod.Value).initCapacity(allocator, count);
+    errdefer {
+        for (list.items) |v| v.free(allocator);
+        list.deinit();
+    }
+    var i: u32 = 0;
+    while (i < count) : (i += 1) list.appendAssumeCapacity(try takeDecodedValue(allocator, &c));
+    return list.toOwnedSlice();
+}
+
+pub fn freeAggValues(allocator: Allocator, values: []rowmod.Value) void {
+    for (values) |v| v.free(allocator);
+    allocator.free(values);
+}
+
+/// Encodes a grouped `run` result: one entry per `GroupRow` (the group-key
+/// value, then exactly `specs.len` result values), in the same first-seen
+/// order `GroupBy.finish()` produced them.
+pub fn encodeAggGroupRows(allocator: Allocator, groups: []const aggregatemod.GroupRow) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(@intCast(groups.len));
+    for (groups) |g| {
+        try putEncodedValue(allocator, w, g.group);
+        try w.putU32(@intCast(g.values.len));
+        for (g.values) |v| try putEncodedValue(allocator, w, v);
+    }
+    return buf.toOwnedSlice();
+}
+
+/// Decodes a grouped `run` result into independently owned `GroupRow`s -
+/// callers must free each with `GroupRow.deinit`, then the slice itself
+/// (see `freeAggGroupRows`).
+pub fn decodeAggGroupRows(allocator: Allocator, payload: []const u8) ![]aggregatemod.GroupRow {
+    var c = Cursor{ .data = payload };
+    const count = try c.takeU32();
+    var list = try std.ArrayList(aggregatemod.GroupRow).initCapacity(allocator, count);
+    errdefer {
+        for (list.items) |*g| g.deinit(allocator);
+        list.deinit();
+    }
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const group = try takeDecodedValue(allocator, &c);
+        // Armed for the rest of THIS iteration's block only - Zig disarms an
+        // errdefer once the block it was declared in exits normally, and
+        // `appendAssumeCapacity` below is that block's last statement, so a
+        // later iteration's failure can never reach back and double-free an
+        // already-appended `group` (the exact class of bug `aggregate.zig`'s
+        // `GroupBy.observe` hit and fixed - see its comment for the details).
+        errdefer group.free(allocator);
+        const valueCount = try c.takeU32();
+        var values = try allocator.alloc(rowmod.Value, valueCount);
+        errdefer allocator.free(values);
+        var filled: u32 = 0;
+        errdefer for (values[0..filled]) |v| v.free(allocator);
+        var j: u32 = 0;
+        while (j < valueCount) : (j += 1) {
+            values[j] = try takeDecodedValue(allocator, &c);
+            filled += 1;
+        }
+        list.appendAssumeCapacity(.{ .group = group, .values = values });
+    }
+    return list.toOwnedSlice();
+}
+
+pub fn freeAggGroupRows(allocator: Allocator, groups: []aggregatemod.GroupRow) void {
+    for (groups) |*g| g.deinit(allocator);
+    allocator.free(groups);
+}
+
+// --- table window ---
+
+/// Wire request for a remote `table window`: a table name, the LIST of
+/// `window.zig` `WindowSpec`s to compute (one or more columns sharing the
+/// same `PARTITION BY`/`ORDER BY`/`frame` - `window.computeMany`'s shape,
+/// mirroring `table_aggregate`'s `specs` list), the `PARTITION BY`/`ORDER
+/// BY` field lists (either possibly empty, same "no partition"/"no order"
+/// meaning as local `table window`'s `partitionBy`/`orderBy`), `offset`/
+/// `limit` windowing the PRINTED rows in the same partition-then-order walk
+/// `window.orderedIndices` produces (not raw scan order, not `computeMany`'s
+/// per-row results, which stay aligned 1:1 with every matching row
+/// regardless of paging - see `handleTableWindow`'s doc), and an `expr.zig`
+/// predicate text filtering rows BEFORE annotation (same
+/// empty-means-every-row convention every other `table_*` opcode's
+/// `exprText` already uses). `orderBy` reuses `querymod.OrderBy`'s wire
+/// shape (descending byte + length-prefixed field name) exactly like
+/// `encodeTableAggregate`'s. `specs` is a byte count followed by
+/// `(kind byte, length-prefixed field)` pairs, same shape `partitionBy`
+/// already uses for its own count-prefixed field list. `frame` is a single
+/// byte (`@intFromEnum(windowmod.FrameMode)`) written right before
+/// `exprText` - after every other fixed-size field but before the
+/// unbounded, unprefixed trailing text, same placement
+/// `encodeTableAggregate`'s `havingText` uses relative to ITS trailing
+/// `exprText`.
+/// Writes a `WindowSpec`'s `offset`/`default` fields, shared by `lag`/`lead`
+/// (offset = rows back/forward from the current row) and `nth_value`
+/// (offset = 1-based position within the frame) - both pairs share the same
+/// wire shape, so one writer covers all three `WindowKind`s. `default` uses
+/// the tag+payload shape `row.zig`'s `encodeValue` does, but written
+/// directly (not through `putEncodedValue`, which allocates a throwaway
+/// buffer via `rowmod.encodeValue` only to copy it right back out) since a
+/// `WindowSpec.default` is always a small scalar or short borrowed string,
+/// never worth a heap round trip.
+fn putLagLeadExtra(w: encode.ByteWriter, offset: u64, default: rowmod.Value) !void {
+    try w.putU64(offset);
+    try w.byte(@intFromEnum(@as(rowmod.ValueTag, default)));
+    switch (default) {
+        .none => {},
+        .boolean => |v| try w.byte(if (v) 1 else 0),
+        .int => |v| try w.putU64(@bitCast(v)),
+        .float => |v| try w.putU64(@bitCast(v)),
+        .text, .bytes => |s| try putLenPrefixed(w, s),
+    }
+}
+
+/// Reads back what `putLagLeadExtra` wrote. `.text`/`.bytes` are returned as
+/// slices BORROWED from `c`'s backing payload (never allocated) - the same
+/// convention `WindowSpec.field`/`TableWindowArgs.partitionBy` already use,
+/// safe because the payload buffer outlives the whole request handler.
+fn takeLagLeadExtra(c: *Cursor) !struct { offset: u64, default: rowmod.Value } {
+    const offset = try c.takeU64();
+    const tagByte = try c.takeByte();
+    const tag = std.meta.intToEnum(rowmod.ValueTag, tagByte) catch return error.Malformed;
+    const default: rowmod.Value = switch (tag) {
+        .none => .{ .none = {} },
+        .boolean => .{ .boolean = (try c.takeByte()) != 0 },
+        .int => .{ .int = @bitCast(try c.takeU64()) },
+        .float => .{ .float = @bitCast(try c.takeU64()) },
+        .text => .{ .text = try c.takeLenPrefixed() },
+        .bytes => .{ .bytes = try c.takeLenPrefixed() },
+    };
+    return .{ .offset = offset, .default = default };
+}
+
+pub fn encodeTableWindow(allocator: Allocator, table: []const u8, specs: []const windowmod.WindowSpec, partitionBy: []const []const u8, orderBy: []const querymod.OrderBy, offset: u32, limit: u32, exprText: []const u8, frame: windowmod.FrameMode) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, table);
+    try w.byte(@intCast(specs.len));
+    for (specs) |spec| {
+        try w.byte(@intFromEnum(spec.kind));
+        try putLenPrefixed(w, spec.field);
+        if (spec.kind == .lag or spec.kind == .lead or spec.kind == .nth_value) try putLagLeadExtra(w, spec.offset, spec.default);
+    }
+    try w.byte(@intCast(partitionBy.len));
+    for (partitionBy) |field| try putLenPrefixed(w, field);
+    try w.byte(@intCast(orderBy.len));
+    for (orderBy) |ob| {
+        try w.byte(if (ob.descending) 1 else 0);
+        try putLenPrefixed(w, ob.field);
+    }
+    try w.putU32(offset);
+    try w.putU32(limit);
+    try w.byte(@intFromEnum(frame));
+    try w.slice(exprText);
+    return buf.toOwnedSlice();
+}
+
+pub const TableWindowArgs = struct {
+    table: []const u8,
+    /// Borrows field-name slices from the decoded payload but owns the
+    /// slice itself, same convention as `partitionBy`/`orderBy` below.
+    /// Always non-empty for a well-formed request (`decodeTableWindow`
+    /// itself does not enforce this - `handleTableWindow` rejects an empty
+    /// list as `bad_request`, same as `table_aggregate`'s empty-specs
+    /// check).
+    specs: []const windowmod.WindowSpec = &.{},
+    /// Borrows field-name slices from the decoded payload but owns the
+    /// slice itself, same convention as `TableAggregateArgs.orderBy`. Empty
+    /// means "one implicit partition" (the whole result set), same as local
+    /// `table window`'s default.
+    partitionBy: []const []const u8 = &.{},
+    orderBy: []const querymod.OrderBy = &.{},
+    offset: u32 = 0,
+    limit: u32 = 0,
+    frame: windowmod.FrameMode = .rows,
+    exprText: []const u8,
+};
+
+pub fn decodeTableWindow(allocator: Allocator, payload: []const u8) !TableWindowArgs {
+    var c = Cursor{ .data = payload };
+    const table = try c.takeLenPrefixed();
+    const specCount = try c.takeByte();
+    var specs = try std.ArrayList(windowmod.WindowSpec).initCapacity(allocator, specCount);
+    errdefer specs.deinit();
+    var s: u8 = 0;
+    while (s < specCount) : (s += 1) {
+        const kindByte = try c.takeByte();
+        const kind = std.meta.intToEnum(windowmod.WindowKind, kindByte) catch return error.Malformed;
+        const field = try c.takeLenPrefixed();
+        if (kind == .lag or kind == .lead or kind == .nth_value) {
+            const extra = try takeLagLeadExtra(&c);
+            specs.appendAssumeCapacity(.{ .kind = kind, .field = field, .offset = extra.offset, .default = extra.default });
+        } else {
+            specs.appendAssumeCapacity(.{ .kind = kind, .field = field });
+        }
+    }
+    const partitionCount = try c.takeByte();
+    var partitionBy = try std.ArrayList([]const u8).initCapacity(allocator, partitionCount);
+    errdefer partitionBy.deinit();
+    var i: u8 = 0;
+    while (i < partitionCount) : (i += 1) partitionBy.appendAssumeCapacity(try c.takeLenPrefixed());
+    const orderCount = try c.takeByte();
+    var orderBy = try std.ArrayList(querymod.OrderBy).initCapacity(allocator, orderCount);
+    errdefer orderBy.deinit();
+    var j: u8 = 0;
+    while (j < orderCount) : (j += 1) {
+        const descending = try c.takeByte();
+        const obField = try c.takeLenPrefixed();
+        orderBy.appendAssumeCapacity(.{ .field = obField, .descending = descending != 0 });
+    }
+    const offset = try c.takeU32();
+    const limit = try c.takeU32();
+    const frameByte = try c.takeByte();
+    const frame = std.meta.intToEnum(windowmod.FrameMode, frameByte) catch return error.Malformed;
+    const exprText = c.data[c.pos..];
+    return .{
+        .table = table,
+        .specs = try specs.toOwnedSlice(),
+        .partitionBy = try partitionBy.toOwnedSlice(),
+        .orderBy = try orderBy.toOwnedSlice(),
+        .offset = offset,
+        .limit = limit,
+        .frame = frame,
+        .exprText = exprText,
+    };
+}
+
+/// One annotated row from a `table_window` result: the original row
+/// (unmodified, same fields the request matched) paired with one computed
+/// window value PER requested spec, in the same order as the request's
+/// `specs` list - the network shape of what local `table window` prints per
+/// row (`printRow` fields, then `<label>=<value>` per spec). Already in the
+/// server-paginated partition-then-order display order (see
+/// `handleTableWindow`), so the client prints these in order with no
+/// further sorting.
+pub const WindowRow = struct { row: rowmod.Row, values: []rowmod.Value };
+
+pub fn encodeWindowRows(allocator: Allocator, rows: []const WindowRow) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(@intCast(rows.len));
+    for (rows) |wr| {
+        const encoded = try wr.row.encode(allocator);
+        defer allocator.free(encoded);
+        try putLenPrefixed(w, encoded);
+        try w.putU32(@intCast(wr.values.len));
+        for (wr.values) |v| try putEncodedValue(allocator, w, v);
+    }
+    return buf.toOwnedSlice();
+}
+
+/// Decodes a `table_window` result into independently owned `WindowRow`s -
+/// callers must free each (`.row.deinit()`, each `.values[i].free(allocator)`
+/// then `allocator.free(.values)`), then the slice itself (see
+/// `freeWindowRows`).
+pub fn decodeWindowRows(allocator: Allocator, payload: []const u8) ![]WindowRow {
+    var c = Cursor{ .data = payload };
+    const count = try c.takeU32();
+    var list = try std.ArrayList(WindowRow).initCapacity(allocator, count);
+    errdefer {
+        for (list.items) |*wr| {
+            wr.row.deinit();
+            for (wr.values) |v| v.free(allocator);
+            allocator.free(wr.values);
+        }
+        list.deinit();
+    }
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const raw = try c.takeLenPrefixed();
+        var row = rowmod.Row.decode(allocator, raw) catch return error.Malformed;
+        errdefer row.deinit();
+        const valueCount = try c.takeU32();
+        var values = try allocator.alloc(rowmod.Value, valueCount);
+        errdefer allocator.free(values);
+        var filled: u32 = 0;
+        errdefer for (values[0..filled]) |v| v.free(allocator);
+        var j: u32 = 0;
+        while (j < valueCount) : (j += 1) {
+            values[j] = try takeDecodedValue(allocator, &c);
+            filled += 1;
+        }
+        list.appendAssumeCapacity(.{ .row = row, .values = values });
+    }
+    return list.toOwnedSlice();
+}
+
+pub fn freeWindowRows(allocator: Allocator, rows: []WindowRow) void {
+    for (rows) |*wr| {
+        wr.row.deinit();
+        for (wr.values) |v| v.free(allocator);
+        allocator.free(wr.values);
+    }
+    allocator.free(rows);
+}
+
+// --- pubsub ---
+
+/// Wire request for `subscribe`: the list of channel names to listen on (at
+/// least one - `server.zig`'s `handleSubscribe` rejects an empty list as
+/// malformed rather than opening a subscription that can never receive
+/// anything). Unlike every other opcode in this file, a `subscribe` request
+/// does not get a single reply frame back: after the initial acknowledgment
+/// (see `encodeSubscribeAck`), the connection becomes a one-way stream of
+/// `encodePubSubMessage` frames until it closes - see `pubsub.zig`'s doc
+/// comment on `Hub` and `server.zig`'s `handleSubscribe`.
+pub fn encodeSubscribe(allocator: Allocator, channels: []const []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(@intCast(channels.len));
+    for (channels) |c| try putLenPrefixed(w, c);
+    return buf.toOwnedSlice();
+}
+
+pub const SubscribeArgs = struct {
+    channels: [][]u8,
+
+    pub fn deinit(self: SubscribeArgs, allocator: Allocator) void {
+        for (self.channels) |c| allocator.free(c);
+        allocator.free(self.channels);
+    }
+};
+
