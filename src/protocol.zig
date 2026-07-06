@@ -1717,3 +1717,1581 @@ pub const SubscribeArgs = struct {
     }
 };
 
+/// Decodes a `subscribe` request into independently owned channel-name
+/// copies - free with `SubscribeArgs.deinit`. Owned (rather than borrowed
+/// slices into `payload`, as most other decoders here return) because
+/// `handleSubscribe` hands these straight to `pubsub.Hub.subscribe`, which
+/// keeps its own copies anyway - decoding once into memory that outlives
+/// the request frame avoids a second, redundant copy inside the hub for
+/// every subscribe call.
+pub fn decodeSubscribe(allocator: Allocator, payload: []const u8) !SubscribeArgs {
+    var c = Cursor{ .data = payload };
+    const count = try c.takeU32();
+    var list = try std.ArrayList([]u8).initCapacity(allocator, count);
+    errdefer {
+        for (list.items) |ch| allocator.free(ch);
+        list.deinit();
+    }
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const name = try c.takeLenPrefixed();
+        const owned = try allocator.dupe(u8, name);
+        list.appendAssumeCapacity(owned);
+    }
+    return .{ .channels = try list.toOwnedSlice() };
+}
+
+/// A `subscribe` request's one and only reply frame (status `.ok`, this as
+/// its payload) - sent once the connection is actually registered in the
+/// `pubsub.Hub`, so a client that has received this ack is guaranteed not
+/// to miss a message published right after it returns. Carries the
+/// (deduplicated) channel count purely as a sanity-checkable echo, the same
+/// spirit as `encodeAuthOk` echoing a token back - plus the `pubsub.Hub`-
+/// assigned subscriber id, the only way a later `unsubscribe` request (on a
+/// SEPARATE connection - this one is receive-only from here on, see
+/// `server.zig`'s `handleSubscribe`) can ever name this subscription again.
+pub fn encodeSubscribeAck(allocator: Allocator, subscriberId: u64, channelCount: u32) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU64(subscriberId);
+    try w.putU32(channelCount);
+    return buf.toOwnedSlice();
+}
+
+pub const SubscribeAck = struct { subscriberId: u64, channelCount: u32 };
+
+pub fn decodeSubscribeAck(payload: []const u8) !SubscribeAck {
+    var c = Cursor{ .data = payload };
+    const subscriberId = try c.takeU64();
+    const channelCount = try c.takeU32();
+    return .{ .subscriberId = subscriberId, .channelCount = channelCount };
+}
+
+/// Wire request for `publish`: a channel name and the message bytes (binary
+/// safe, "rest of the payload" like `encodeSet`'s value). Any connection
+/// may publish regardless of whether it has ever subscribed to anything -
+/// publishing and subscribing are independent roles on the same opcode
+/// family, exactly like a `Db` writer and a `Db` reader are independent
+/// roles over the same store.
+pub fn encodePublish(allocator: Allocator, channel: []const u8, message: []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, channel);
+    try w.slice(message);
+    return buf.toOwnedSlice();
+}
+
+pub const PublishArgs = struct { channel: []const u8, message: []const u8 };
+
+pub fn decodePublish(payload: []const u8) !PublishArgs {
+    var c = Cursor{ .data = payload };
+    const channel = try c.takeLenPrefixed();
+    const message = c.data[c.pos..];
+    return .{ .channel = channel, .message = message };
+}
+
+/// A `publish` request's reply payload: how many subscribers `pubsub.Hub`
+/// handed the message to (see `Hub.publish`'s doc comment - 0 is a normal,
+/// non-error outcome for a channel nobody is listening to).
+pub fn encodePublishResult(allocator: Allocator, subscriberCount: u64) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU64(subscriberCount);
+    return buf.toOwnedSlice();
+}
+
+pub fn decodePublishResult(payload: []const u8) !u64 {
+    var c = Cursor{ .data = payload };
+    return c.takeU64();
+}
+
+/// Wire request for `unsubscribe`: the `pubsub.Hub`-assigned subscriber id
+/// (from `encodeSubscribeAck`) plus the list of channel names to drop from
+/// that subscription - the same channel-list shape `encodeSubscribe` uses,
+/// with the id prefixed. Unlike `subscribe`, this is an ordinary
+/// request/response opcode (see `server.zig`'s `handleUnsubscribe`): it is
+/// always sent on a DIFFERENT connection than the one that subscribed,
+/// since that connection became receive-only the moment its subscribe ack
+/// arrived and can never send another request on itself again.
+pub fn encodeUnsubscribe(allocator: Allocator, subscriberId: u64, channels: []const []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU64(subscriberId);
+    try w.putU32(@intCast(channels.len));
+    for (channels) |c| try putLenPrefixed(w, c);
+    return buf.toOwnedSlice();
+}
+
+pub const UnsubscribeArgs = struct {
+    subscriberId: u64,
+    channels: [][]u8,
+
+    pub fn deinit(self: UnsubscribeArgs, allocator: Allocator) void {
+        for (self.channels) |c| allocator.free(c);
+        allocator.free(self.channels);
+    }
+};
+
+/// Decodes an `unsubscribe` request - same owned-copy rationale as
+/// `decodeSubscribe`: `handleUnsubscribe` hands the channel names straight
+/// to `pubsub.Hub.unsubscribe`, which only ever borrows them for the
+/// duration of that call, so decoding into memory this function's caller
+/// frees (via `UnsubscribeArgs.deinit`) avoids a redundant second copy.
+pub fn decodeUnsubscribe(allocator: Allocator, payload: []const u8) !UnsubscribeArgs {
+    var c = Cursor{ .data = payload };
+    const subscriberId = try c.takeU64();
+    const count = try c.takeU32();
+    var list = try std.ArrayList([]u8).initCapacity(allocator, count);
+    errdefer {
+        for (list.items) |ch| allocator.free(ch);
+        list.deinit();
+    }
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const name = try c.takeLenPrefixed();
+        const owned = try allocator.dupe(u8, name);
+        list.appendAssumeCapacity(owned);
+    }
+    return .{ .subscriberId = subscriberId, .channels = try list.toOwnedSlice() };
+}
+
+/// An `unsubscribe` request's reply payload: how many of the requested
+/// channel names were actually removed from the named subscriber's set (see
+/// `pubsub.Hub.unsubscribe`'s doc comment on why naming a channel it was
+/// never on is a harmless no-op that simply does not count here, not an
+/// error).
+pub fn encodeUnsubscribeResult(allocator: Allocator, removedCount: u32) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(removedCount);
+    return buf.toOwnedSlice();
+}
+
+pub fn decodeUnsubscribeResult(payload: []const u8) !u32 {
+    var c = Cursor{ .data = payload };
+    return c.takeU32();
+}
+
+/// One pushed message on an already-open `subscribe` connection: which
+/// channel it arrived on (a client can subscribe to several at once, so the
+/// tag travels with every message) plus the payload bytes. Every frame a
+/// subscribed connection receives after its initial ack uses this shape,
+/// always with status `.ok` - there is no separate framing marker, because
+/// once a client has sent `subscribe` it never sends another request on
+/// that connection and so never has to disambiguate a push from a reply to
+/// something else it asked (see `server.zig`'s `handleSubscribe`).
+pub const PubSubMessage = struct {
+    channel: []u8,
+    payload: []u8,
+
+    pub fn deinit(self: PubSubMessage, allocator: Allocator) void {
+        allocator.free(self.channel);
+        allocator.free(self.payload);
+    }
+};
+
+pub fn encodePubSubMessage(allocator: Allocator, channel: []const u8, payload: []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, channel);
+    try w.slice(payload);
+    return buf.toOwnedSlice();
+}
+
+/// Decodes a pushed message into independently owned copies (the frame
+/// they arrived in is freed right after decoding, in `Client.nextMessage` -
+/// see its doc comment) - free with `PubSubMessage.deinit`.
+pub fn decodePubSubMessage(allocator: Allocator, payload: []const u8) !PubSubMessage {
+    var c = Cursor{ .data = payload };
+    const channel = try c.takeLenPrefixed();
+    const message = c.data[c.pos..];
+    const channelCopy = try allocator.dupe(u8, channel);
+    errdefer allocator.free(channelCopy);
+    const payloadCopy = try allocator.dupe(u8, message);
+    return .{ .channel = channelCopy, .payload = payloadCopy };
+}
+
+// --- table explain ---
+
+/// Wire request for a remote `table explain`: a table name and the raw text
+/// of an `expr.zig` predicate expression (empty text means "no predicate",
+/// the same convention `encodeTableSelect`'s `exprText` uses). No
+/// offset/limit - explain reports a plan, not rows, so there is nothing to
+/// page.
+pub fn encodeTableExplain(allocator: Allocator, table: []const u8, exprText: []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, table);
+    try w.slice(exprText);
+    return buf.toOwnedSlice();
+}
+
+pub const TableExplainArgs = struct { table: []const u8, exprText: []const u8 };
+
+pub fn decodeTableExplain(payload: []const u8) !TableExplainArgs {
+    var c = Cursor{ .data = payload };
+    const table = try c.takeLenPrefixed();
+    const exprText = c.data[c.pos..];
+    return .{ .table = table, .exprText = exprText };
+}
+
+/// Encodes a `query.Plan`. `indexName` uses the empty string as its "null"
+/// sentinel (an index or field name can never itself be empty - `query.zig`
+/// rejects that at `createIndex`/`createCompositeIndex` time) instead of a
+/// separate presence byte, the same economy `exprText`'s "empty means no
+/// predicate" convention already relies on elsewhere in this file.
+pub fn encodePlan(allocator: Allocator, plan: querymod.Plan) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.byte(@intFromEnum(plan.kind));
+    try putLenPrefixed(w, plan.indexName orelse "");
+    try w.putU32(@intCast(plan.matchedFields));
+    try w.putU32(@intCast(plan.totalFields));
+    return buf.toOwnedSlice();
+}
+
+/// Decodes a `query.Plan` - `indexName`, when present, is an owned copy the
+/// caller must free with `Plan.deinit` (see `encodePlan`'s doc comment for
+/// why an empty string decodes back to `null` instead of `""`).
+pub fn decodePlan(allocator: Allocator, payload: []const u8) !querymod.Plan {
+    var c = Cursor{ .data = payload };
+    const kindByte = try c.takeByte();
+    const kind = std.meta.intToEnum(querymod.PlanKind, kindByte) catch return error.Malformed;
+    const rawName = try c.takeLenPrefixed();
+    const indexName = if (rawName.len == 0) null else try allocator.dupe(u8, rawName);
+    errdefer if (indexName) |n| allocator.free(n);
+    const matchedFields = try c.takeU32();
+    const totalFields = try c.takeU32();
+    return .{ .kind = kind, .indexName = indexName, .matchedFields = matchedFields, .totalFields = totalFields };
+}
+
+// --- table update ---
+
+/// Wire request for a remote `table update`: a table name, the `SET`
+/// clause's field list, and the raw text of an `expr.zig` predicate
+/// expression (empty text updates every row, the same convention
+/// `encodeTableSelect`'s `exprText` uses). The field list reuses
+/// `Row.encode` exactly like `encodeTxnOp`'s per-entry `fields` does,
+/// instead of inventing a second name+value framing just for this opcode -
+/// and, like `encodeTableSelect`'s `orderBy`, sits BEFORE `exprText`
+/// because `exprText` is decoded as "everything left in the payload",
+/// so anything meant to survive decoding has to come first.
+pub fn encodeTableUpdate(allocator: Allocator, table: []const u8, sets: []const rowmod.Field, exprText: []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, table);
+
+    var setsRow = rowmod.Row.init(allocator);
+    defer setsRow.deinit();
+    for (sets) |f| try setsRow.set(f.name, f.value);
+    const setsBytes = try setsRow.encode(allocator);
+    defer allocator.free(setsBytes);
+    try putLenPrefixed(w, setsBytes);
+
+    try w.slice(exprText);
+    return buf.toOwnedSlice();
+}
+
+pub const TableUpdateArgs = struct { table: []const u8, setsBytes: []const u8, exprText: []const u8 };
+
+/// `table` and `exprText` are borrowed slices into `payload`, the same
+/// convention `decodeTableExplain` uses. `setsBytes` is also borrowed and
+/// still needs `rowmod.Row.decode` to become a real field list - kept
+/// undecoded here so a malformed table name fails fast without touching
+/// row-decoding at all, the same ownership split `DecodedTxnOpEntry` uses
+/// for its own `fieldsBytes`.
+pub fn decodeTableUpdate(payload: []const u8) !TableUpdateArgs {
+    var c = Cursor{ .data = payload };
+    const table = try c.takeLenPrefixed();
+    const setsBytes = try c.takeLenPrefixed();
+    const exprText = c.data[c.pos..];
+    return .{ .table = table, .setsBytes = setsBytes, .exprText = exprText };
+}
+
+// --- table delete ---
+
+/// Wire request for a remote `table delete`: a table name and the raw text
+/// of an `expr.zig` predicate expression (empty text deletes every row, the
+/// same convention `encodeTableSelect`/`encodeTableExplain`'s `exprText`
+/// uses). Identical wire shape to `encodeTableExplain` - both are just
+/// "table + predicate", no `SET` clause like `encodeTableUpdate` needs - but
+/// kept as its own named pair rather than reused directly, the same
+/// per-opcode-gets-its-own-function precedent every other opcode here
+/// follows even when two shapes coincide.
+pub fn encodeTableDelete(allocator: Allocator, table: []const u8, exprText: []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, table);
+    try w.slice(exprText);
+    return buf.toOwnedSlice();
+}
+
+pub const TableDeleteArgs = struct { table: []const u8, exprText: []const u8 };
+
+/// `table` and `exprText` are borrowed slices into `payload`, the same
+/// convention `decodeTableExplain`/`decodeTableUpdate` use.
+pub fn decodeTableDelete(payload: []const u8) !TableDeleteArgs {
+    var c = Cursor{ .data = payload };
+    const table = try c.takeLenPrefixed();
+    const exprText = c.data[c.pos..];
+    return .{ .table = table, .exprText = exprText };
+}
+
+// --- table export / table import ---
+
+/// Which interchange format a `table_export`/`table_import` request uses -
+/// the wire counterpart of the CLI's `csv`/`json` string argument (see
+/// `main.zig`'s local `table export`/`table import`), carried as one byte
+/// instead of a length-prefixed string since there are only ever two.
+pub const DumpFormat = enum(u8) {
+    csv = 0,
+    json = 1,
+};
+
+/// Wire request for a remote `table export`: a table name and which format
+/// (`dump.zig`'s `exportCsvWriter`/`exportJsonWriter`) to render it in. No
+/// predicate/paging - export always dumps the whole table, matching the
+/// local CLI's `table export <table> csv|json <path>`.
+pub fn encodeTableExport(allocator: Allocator, table: []const u8, format: DumpFormat) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, table);
+    try w.byte(@intFromEnum(format));
+    return buf.toOwnedSlice();
+}
+
+pub const TableExportArgs = struct { table: []const u8, format: DumpFormat };
+
+pub fn decodeTableExport(payload: []const u8) !TableExportArgs {
+    var c = Cursor{ .data = payload };
+    const table = try c.takeLenPrefixed();
+    const formatByte = try c.takeByte();
+    const format = std.meta.intToEnum(DumpFormat, formatByte) catch return error.Malformed;
+    return .{ .table = table, .format = format };
+}
+
+/// Wire response for `table_export`: the row count `dump.zig`'s exporter
+/// reported (so the CLI can print the same count the local `table export`
+/// prints) followed by the rendered content bytes verbatim - a "count then
+/// rest of the payload" shape, the same idea `exprText` fields elsewhere in
+/// this file use for their own trailing variable-length piece.
+pub fn encodeExportResult(allocator: Allocator, rowCount: u64, content: []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU64(rowCount);
+    try w.slice(content);
+    return buf.toOwnedSlice();
+}
+
+pub const ExportResult = struct { rowCount: u64, content: []const u8 };
+
+/// `content` is a borrowed slice into `payload`, the same convention
+/// `decodeTableExplain`'s `exprText` uses - the caller decides whether to
+/// copy it (`client.zig`'s `tableExport` dupes it into an allocation the
+/// caller owns once the response frame itself is about to be freed).
+pub fn decodeExportResult(payload: []const u8) !ExportResult {
+    var c = Cursor{ .data = payload };
+    const rowCount = try c.takeU64();
+    const content = payload[c.pos..];
+    return .{ .rowCount = rowCount, .content = content };
+}
+
+/// Wire request for a remote `table import`: a table name, which format the
+/// following `content` bytes are encoded in, and the content itself.
+/// `content` comes last (decoded as "everything left in the payload", the
+/// same convention every `exprText` field in this file relies on) since it
+/// is arbitrary-length and, unlike `table`, needs no length prefix of its
+/// own.
+pub fn encodeTableImport(allocator: Allocator, table: []const u8, format: DumpFormat, content: []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, table);
+    try w.byte(@intFromEnum(format));
+    try w.slice(content);
+    return buf.toOwnedSlice();
+}
+
+pub const TableImportArgs = struct { table: []const u8, format: DumpFormat, content: []const u8 };
+
+/// `table` and `content` are borrowed slices into `payload`, the same
+/// convention every other decode function in this file uses.
+pub fn decodeTableImport(payload: []const u8) !TableImportArgs {
+    var c = Cursor{ .data = payload };
+    const table = try c.takeLenPrefixed();
+    const formatByte = try c.takeByte();
+    const format = std.meta.intToEnum(DumpFormat, formatByte) catch return error.Malformed;
+    const content = payload[c.pos..];
+    return .{ .table = table, .format = format, .content = content };
+}
+
+// --- stats ---
+
+pub fn encodeStats(allocator: Allocator, stats: dbmod.Stats) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU64(@intCast(stats.memtableEntries));
+    try w.putU64(@intCast(stats.memtableBytes));
+    try w.putU64(@intCast(stats.sstableCount));
+    try w.putU64(stats.liveEntries);
+    try w.putU64(stats.physicalBytes);
+    try w.putU64(stats.cacheHits);
+    try w.putU64(stats.cacheMisses);
+    try w.putU64(stats.nextSeq);
+    for (stats.levels) |level| {
+        try w.putU64(@intCast(level.tables));
+        try w.putU64(level.entries);
+        try w.putU64(level.physicalBytes);
+    }
+    return buf.toOwnedSlice();
+}
+
+pub fn decodeStats(payload: []const u8) !dbmod.Stats {
+    var c = Cursor{ .data = payload };
+    var stats = dbmod.Stats{};
+    stats.memtableEntries = @intCast(try c.takeU64());
+    stats.memtableBytes = @intCast(try c.takeU64());
+    stats.sstableCount = @intCast(try c.takeU64());
+    stats.liveEntries = try c.takeU64();
+    stats.physicalBytes = try c.takeU64();
+    stats.cacheHits = try c.takeU64();
+    stats.cacheMisses = try c.takeU64();
+    stats.nextSeq = try c.takeU64();
+    var i: usize = 0;
+    while (i < stats.levels.len) : (i += 1) {
+        stats.levels[i] = .{
+            .tables = @intCast(try c.takeU64()),
+            .entries = try c.takeU64(),
+            .physicalBytes = try c.takeU64(),
+        };
+    }
+    return stats;
+}
+
+test "frame round trip through an in-memory buffer" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+
+    try writeFrame(buf.writer(), @intFromEnum(Op.get), "hello");
+    var stream = std.io.fixedBufferStream(buf.items);
+    var frame = try readFrame(allocator, stream.reader());
+    defer frame.deinit();
+
+    try std.testing.expectEqual(@intFromEnum(Op.get), frame.tag);
+    try std.testing.expectEqualStrings("hello", frame.payload);
+}
+
+test "frame with empty payload round trips" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+
+    try writeFrame(buf.writer(), @intFromEnum(Op.ping), "");
+    var stream = std.io.fixedBufferStream(buf.items);
+    var frame = try readFrame(allocator, stream.reader());
+    defer frame.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), frame.payload.len);
+}
+
+test "readFrame rejects a length prefix beyond the frame guard" {
+    const allocator = std.testing.allocator;
+    var header: [5]u8 = undefined;
+    header[0] = 0;
+    std.mem.writeInt(u32, header[1..5], maxFrameBytes + 1, encode.endian);
+    var stream = std.io.fixedBufferStream(&header);
+    try std.testing.expectError(error.FrameTooLarge, readFrame(allocator, stream.reader()));
+}
+
+test "readFrame rejects a truncated body" {
+    const allocator = std.testing.allocator;
+    var header: [5]u8 = undefined;
+    header[0] = 0;
+    std.mem.writeInt(u32, header[1..5], 10, encode.endian);
+    var stream = std.io.fixedBufferStream(&header);
+    try std.testing.expectError(error.EndOfStream, readFrame(allocator, stream.reader()));
+}
+
+test "Op.fromByte rejects unknown opcodes" {
+    try std.testing.expectError(error.UnknownOp, Op.fromByte(200));
+    try std.testing.expectEqual(Op.batch, try Op.fromByte(9));
+    try std.testing.expectEqual(Op.table_select, try Op.fromByte(10));
+    try std.testing.expectEqual(Op.auth, try Op.fromByte(11));
+    try std.testing.expectEqual(Op.user_admin, try Op.fromByte(12));
+    try std.testing.expectEqual(Op.auth_token, try Op.fromByte(13));
+    try std.testing.expectEqual(Op.metrics, try Op.fromByte(14));
+    try std.testing.expectEqual(Op.ttl_op, try Op.fromByte(15));
+    try std.testing.expectEqual(Op.coll_ttl_op, try Op.fromByte(16));
+    try std.testing.expectEqual(Op.coll_op, try Op.fromByte(17));
+    try std.testing.expectEqual(Op.txn_op, try Op.fromByte(18));
+    try std.testing.expectEqual(Op.table_join, try Op.fromByte(19));
+    try std.testing.expectEqual(Op.table_aggregate, try Op.fromByte(20));
+    try std.testing.expectEqual(Op.table_explain, try Op.fromByte(21));
+    try std.testing.expectEqual(Op.table_update, try Op.fromByte(22));
+    try std.testing.expectEqual(Op.table_delete, try Op.fromByte(23));
+    try std.testing.expectEqual(Op.table_export, try Op.fromByte(24));
+    try std.testing.expectEqual(Op.table_import, try Op.fromByte(25));
+    try std.testing.expectEqual(Op.table_window, try Op.fromByte(26));
+    try std.testing.expectEqual(Op.subscribe, try Op.fromByte(27));
+    try std.testing.expectEqual(Op.publish, try Op.fromByte(28));
+    try std.testing.expectEqual(Op.unsubscribe, try Op.fromByte(29));
+}
+
+test "Status.fromByte rejects unknown status codes" {
+    try std.testing.expectError(error.UnknownStatus, Status.fromByte(200));
+    try std.testing.expectEqual(Status.internal, try Status.fromByte(5));
+    try std.testing.expectEqual(Status.rate_limited, try Status.fromByte(6));
+    try std.testing.expectEqual(Status.unauthorized, try Status.fromByte(7));
+    try std.testing.expectEqual(Status.forbidden, try Status.fromByte(8));
+}
+
+test "auth payload encodes and decodes username and password" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeAuth(allocator, "alice", "hunter2");
+    defer allocator.free(payload);
+    const args = try decodeAuth(payload);
+    try std.testing.expectEqualStrings("alice", args.username);
+    try std.testing.expectEqualStrings("hunter2", args.password);
+}
+
+test "auth payload handles an empty password" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeAuth(allocator, "alice", "");
+    defer allocator.free(payload);
+    const args = try decodeAuth(payload);
+    try std.testing.expectEqualStrings("alice", args.username);
+    try std.testing.expectEqualStrings("", args.password);
+}
+
+test "encodeAuthOk with no token round trips to an empty payload" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeAuthOk(allocator, null);
+    defer allocator.free(payload);
+    try std.testing.expectEqual(@as(usize, 0), payload.len);
+}
+
+test "encodeAuthOk with a token round trips exactly" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeAuthOk(allocator, "deadbeef");
+    defer allocator.free(payload);
+    try std.testing.expectEqualStrings("deadbeef", payload);
+}
+
+test "auth_token payload round trips the opaque token bytes" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeAuthToken(allocator, "abc123token");
+    defer allocator.free(payload);
+    try std.testing.expectEqualStrings("abc123token", decodeAuthToken(payload));
+}
+
+test "set payload encodes and decodes key and value" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeSet(allocator, "k", "value-bytes");
+    defer allocator.free(payload);
+    const args = try decodeSet(payload);
+    try std.testing.expectEqualStrings("k", args.key);
+    try std.testing.expectEqualStrings("value-bytes", args.value);
+}
+
+test "set payload handles an empty value" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeSet(allocator, "k", "");
+    defer allocator.free(payload);
+    const args = try decodeSet(payload);
+    try std.testing.expectEqualStrings("k", args.key);
+    try std.testing.expectEqualStrings("", args.value);
+}
+
+test "scan args round trip with both bounds" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeScan(allocator, .{ .start = "a", .end = "z", .limit = 42, .reverse = true });
+    defer allocator.free(payload);
+    const args = try decodeScan(payload);
+    try std.testing.expectEqualStrings("a", args.start.?);
+    try std.testing.expectEqualStrings("z", args.end.?);
+    try std.testing.expectEqual(@as(u32, 42), args.limit);
+    try std.testing.expect(args.reverse);
+}
+
+test "scan args round trip with no bounds" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeScan(allocator, .{});
+    defer allocator.free(payload);
+    const args = try decodeScan(payload);
+    try std.testing.expect(args.start == null);
+    try std.testing.expect(args.end == null);
+    try std.testing.expect(!args.reverse);
+}
+
+test "prefix args round trip" {
+    const allocator = std.testing.allocator;
+    const payload = try encodePrefix(allocator, "user:", 7);
+    defer allocator.free(payload);
+    const args = try decodePrefix(payload);
+    try std.testing.expectEqualStrings("user:", args.prefix);
+    try std.testing.expectEqual(@as(u32, 7), args.limit);
+}
+
+test "entries round trip and are independently owned" {
+    const allocator = std.testing.allocator;
+    const entries = [_]dbmod.Entry{
+        .{ .key = "a", .value = "1" },
+        .{ .key = "b", .value = "2" },
+    };
+    const payload = try encodeEntries(allocator, &entries);
+    defer allocator.free(payload);
+
+    const owned = try decodeEntries(allocator, payload);
+    defer freeOwnedEntries(allocator, owned);
+
+    try std.testing.expectEqual(@as(usize, 2), owned.len);
+    try std.testing.expectEqualStrings("a", owned[0].key);
+    try std.testing.expectEqualStrings("1", owned[0].value);
+    try std.testing.expectEqualStrings("b", owned[1].key);
+    try std.testing.expectEqualStrings("2", owned[1].value);
+}
+
+test "empty entry list round trips" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeEntries(allocator, &[_]dbmod.Entry{});
+    defer allocator.free(payload);
+    const owned = try decodeEntries(allocator, payload);
+    defer freeOwnedEntries(allocator, owned);
+    try std.testing.expectEqual(@as(usize, 0), owned.len);
+}
+
+test "batch ops round trip put and delete" {
+    const allocator = std.testing.allocator;
+    const ops = [_]BatchOp{
+        .{ .put = .{ .key = "a", .value = "1" } },
+        .{ .del = "b" },
+    };
+    const payload = try encodeBatch(allocator, &ops);
+    defer allocator.free(payload);
+
+    const decoded = try decodeBatch(allocator, payload);
+    defer allocator.free(decoded);
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.len);
+    try std.testing.expectEqualStrings("a", decoded[0].put.key);
+    try std.testing.expectEqualStrings("1", decoded[0].put.value);
+    try std.testing.expectEqualStrings("b", decoded[1].del);
+}
+
+test "decodeBatch rejects an unknown op kind" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(1);
+    try w.byte(9);
+    try std.testing.expectError(error.Malformed, decodeBatch(allocator, buf.items));
+}
+
+test "stats round trip preserves all fields including per-level detail" {
+    const allocator = std.testing.allocator;
+    var stats = dbmod.Stats{};
+    stats.memtableEntries = 3;
+    stats.memtableBytes = 128;
+    stats.sstableCount = 2;
+    stats.liveEntries = 100;
+    stats.physicalBytes = 4096;
+    stats.cacheHits = 10;
+    stats.cacheMisses = 4;
+    stats.nextSeq = 55;
+    stats.levels[0] = .{ .tables = 1, .entries = 50, .physicalBytes = 2048 };
+    stats.levels[3] = .{ .tables = 2, .entries = 50, .physicalBytes = 2048 };
+
+    const payload = try encodeStats(allocator, stats);
+    defer allocator.free(payload);
+    const decoded = try decodeStats(payload);
+
+    try std.testing.expectEqual(stats.memtableEntries, decoded.memtableEntries);
+    try std.testing.expectEqual(stats.nextSeq, decoded.nextSeq);
+    try std.testing.expectEqual(stats.levels[0].tables, decoded.levels[0].tables);
+    try std.testing.expectEqual(stats.levels[3].entries, decoded.levels[3].entries);
+    try std.testing.expectEqual(@as(f64, decoded.cacheHitRate()), decoded.cacheHitRate());
+}
+
+test "table select args round trip with a non-empty expr" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableSelect(allocator, "users", "city eq s:warsaw", 0, 0, &.{});
+    defer allocator.free(payload);
+    const args = try decodeTableSelect(allocator, payload);
+    defer allocator.free(args.orderBy);
+    try std.testing.expectEqualStrings("users", args.table);
+    try std.testing.expectEqualStrings("city eq s:warsaw", args.exprText);
+    try std.testing.expectEqual(@as(u32, 0), args.offset);
+    try std.testing.expectEqual(@as(u32, 0), args.limit);
+    try std.testing.expectEqual(@as(usize, 0), args.orderBy.len);
+}
+
+test "table select args round trip with an empty expr means select all" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableSelect(allocator, "users", "", 0, 0, &.{});
+    defer allocator.free(payload);
+    const args = try decodeTableSelect(allocator, payload);
+    defer allocator.free(args.orderBy);
+    try std.testing.expectEqualStrings("users", args.table);
+    try std.testing.expectEqualStrings("", args.exprText);
+}
+
+test "table select args round trip with a page window" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableSelect(allocator, "users", "age gt i:10", 5, 3, &.{});
+    defer allocator.free(payload);
+    const args = try decodeTableSelect(allocator, payload);
+    defer allocator.free(args.orderBy);
+    try std.testing.expectEqualStrings("users", args.table);
+    try std.testing.expectEqualStrings("age gt i:10", args.exprText);
+    try std.testing.expectEqual(@as(u32, 5), args.offset);
+    try std.testing.expectEqual(@as(u32, 3), args.limit);
+}
+
+test "table select args round trip with an ascending order-by" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableSelect(allocator, "users", "", 0, 0, &.{.{ .field = "age" }});
+    defer allocator.free(payload);
+    const args = try decodeTableSelect(allocator, payload);
+    defer allocator.free(args.orderBy);
+    try std.testing.expectEqual(@as(usize, 1), args.orderBy.len);
+    try std.testing.expectEqualStrings("age", args.orderBy[0].field);
+    try std.testing.expectEqual(false, args.orderBy[0].descending);
+}
+
+test "table select args round trip with a descending order-by, page, and expr all together" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableSelect(allocator, "users", "city eq s:warsaw", 2, 5, &.{.{ .field = "score", .descending = true }});
+    defer allocator.free(payload);
+    const args = try decodeTableSelect(allocator, payload);
+    defer allocator.free(args.orderBy);
+    try std.testing.expectEqualStrings("users", args.table);
+    try std.testing.expectEqualStrings("city eq s:warsaw", args.exprText);
+    try std.testing.expectEqual(@as(u32, 2), args.offset);
+    try std.testing.expectEqual(@as(u32, 5), args.limit);
+    try std.testing.expectEqualStrings("score", args.orderBy[0].field);
+    try std.testing.expectEqual(true, args.orderBy[0].descending);
+}
+
+test "table select args round trip with two order-by columns in given order" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableSelect(allocator, "users", "", 0, 0, &.{ .{ .field = "city" }, .{ .field = "score", .descending = true } });
+    defer allocator.free(payload);
+    const args = try decodeTableSelect(allocator, payload);
+    defer allocator.free(args.orderBy);
+    try std.testing.expectEqual(@as(usize, 2), args.orderBy.len);
+    try std.testing.expectEqualStrings("city", args.orderBy[0].field);
+    try std.testing.expectEqual(false, args.orderBy[0].descending);
+    try std.testing.expectEqualStrings("score", args.orderBy[1].field);
+    try std.testing.expectEqual(true, args.orderBy[1].descending);
+}
+
+test "decodeTableSelect rejects an order-by count claiming more columns than were actually encoded" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableSelect(allocator, "users", "", 0, 0, &.{.{ .field = "age" }});
+    defer allocator.free(payload);
+    // The count byte sits right after the two u32 page fields: 4 (table
+    // len prefix) + 5 ("users") + 4 (offset) + 4 (limit).
+    const countBytePos = 4 + 5 + 4 + 4;
+    try std.testing.expectEqual(@as(u8, 1), payload[countBytePos]);
+    var corrupted = try allocator.dupe(u8, payload);
+    defer allocator.free(corrupted);
+    corrupted[countBytePos] = 200;
+    try std.testing.expectError(error.Malformed, decodeTableSelect(allocator, corrupted));
+}
+
+test "rows round trip through encode and decode" {
+    const allocator = std.testing.allocator;
+    var rows = [_]rowmod.Row{ rowmod.Row.init(allocator), rowmod.Row.init(allocator) };
+    defer for (&rows) |*r| r.deinit();
+    try rows[0].set("name", .{ .text = "ada" });
+    try rows[0].set("age", .{ .int = 36 });
+    try rows[1].set("name", .{ .text = "bob" });
+    try rows[1].set("age", .{ .int = 24 });
+
+    const payload = try encodeRows(allocator, &rows);
+    defer allocator.free(payload);
+
+    const decoded = try decodeRows(allocator, payload);
+    defer freeRows(allocator, decoded);
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.len);
+    try std.testing.expectEqualStrings("ada", decoded[0].get("name").?.text);
+    try std.testing.expectEqual(@as(i64, 36), decoded[0].get("age").?.int);
+    try std.testing.expectEqualStrings("bob", decoded[1].get("name").?.text);
+    try std.testing.expectEqual(@as(i64, 24), decoded[1].get("age").?.int);
+}
+
+test "empty row list round trips" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeRows(allocator, &[_]rowmod.Row{});
+    defer allocator.free(payload);
+    const decoded = try decodeRows(allocator, payload);
+    defer freeRows(allocator, decoded);
+    try std.testing.expectEqual(@as(usize, 0), decoded.len);
+}
+
+test "JoinMode.fromByte rejects an unknown mode" {
+    try std.testing.expectError(error.UnknownJoinMode, JoinMode.fromByte(9));
+}
+
+test "table_join args round trip mode, tables, fields, and both expr texts" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableJoin(allocator, .left, "customers", "__pk", "orders", "customer_id", 0, 0, "age gt i:10", "total gt i:0");
+    defer allocator.free(payload);
+    const args = try decodeTableJoin(payload);
+    try std.testing.expectEqual(JoinMode.left, args.mode);
+    try std.testing.expectEqualStrings("customers", args.leftTable);
+    try std.testing.expectEqualStrings("__pk", args.leftField);
+    try std.testing.expectEqualStrings("orders", args.rightTable);
+    try std.testing.expectEqualStrings("customer_id", args.rightField);
+    try std.testing.expectEqual(@as(u32, 0), args.offset);
+    try std.testing.expectEqual(@as(u32, 0), args.limit);
+    try std.testing.expectEqualStrings("age gt i:10", args.leftExprText);
+    try std.testing.expectEqualStrings("total gt i:0", args.rightExprText);
+}
+
+test "table_join args round trip with both expr texts empty" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableJoin(allocator, .inner, "a", "x", "b", "y", 0, 0, "", "");
+    defer allocator.free(payload);
+    const args = try decodeTableJoin(payload);
+    try std.testing.expectEqual(JoinMode.inner, args.mode);
+    try std.testing.expectEqualStrings("", args.leftExprText);
+    try std.testing.expectEqualStrings("", args.rightExprText);
+}
+
+test "table_join args round trip a nonzero offset and limit" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableJoin(allocator, .full, "a", "x", "b", "y", 3, 7, "", "");
+    defer allocator.free(payload);
+    const args = try decodeTableJoin(payload);
+    try std.testing.expectEqual(@as(u32, 3), args.offset);
+    try std.testing.expectEqual(@as(u32, 7), args.limit);
+}
+
+test "join pairs round trip a fully matched pair (inner-join shape)" {
+    const allocator = std.testing.allocator;
+    var left = rowmod.Row.init(allocator);
+    defer left.deinit();
+    try left.set("name", .{ .text = "ada" });
+    var right = rowmod.Row.init(allocator);
+    defer right.deinit();
+    try right.set("total", .{ .int = 42 });
+
+    const pairs = [_]JoinPair{.{ .left = left, .right = right }};
+    const payload = try encodeJoinedRows(allocator, &pairs);
+    defer allocator.free(payload);
+
+    const decoded = try decodeJoinedRows(allocator, payload);
+    defer freeJoinPairs(allocator, decoded);
+
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqualStrings("ada", decoded[0].left.?.get("name").?.text);
+    try std.testing.expectEqual(@as(i64, 42), decoded[0].right.?.get("total").?.int);
+}
+
+test "join pairs round trip a nil left side and a nil right side" {
+    const allocator = std.testing.allocator;
+    var right = rowmod.Row.init(allocator);
+    defer right.deinit();
+    try right.set("total", .{ .int = 7 });
+    var left = rowmod.Row.init(allocator);
+    defer left.deinit();
+    try left.set("name", .{ .text = "carol" });
+
+    const pairs = [_]JoinPair{
+        .{ .left = null, .right = right },
+        .{ .left = left, .right = null },
+    };
+    const payload = try encodeJoinedRows(allocator, &pairs);
+    defer allocator.free(payload);
+
+    const decoded = try decodeJoinedRows(allocator, payload);
+    defer freeJoinPairs(allocator, decoded);
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.len);
+    try std.testing.expect(decoded[0].left == null);
+    try std.testing.expectEqual(@as(i64, 7), decoded[0].right.?.get("total").?.int);
+    try std.testing.expectEqualStrings("carol", decoded[1].left.?.get("name").?.text);
+    try std.testing.expect(decoded[1].right == null);
+}
+
+test "empty join pair list round trips" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeJoinedRows(allocator, &[_]JoinPair{});
+    defer allocator.free(payload);
+    const decoded = try decodeJoinedRows(allocator, payload);
+    defer freeJoinPairs(allocator, decoded);
+    try std.testing.expectEqual(@as(usize, 0), decoded.len);
+}
+
+test "table_aggregate args round trip a groupField, several specs, and an expr" {
+    const allocator = std.testing.allocator;
+    const specs = [_]aggregatemod.AggSpec{
+        .{ .field = "", .kind = .count },
+        .{ .field = "total", .kind = .sum },
+        .{ .field = "total", .kind = .max },
+        .{ .field = "city", .kind = .count_distinct },
+    };
+    const payload = try encodeTableAggregate(allocator, "orders", "city", &specs, 0, 0, &.{}, "", "total gt i:10");
+    defer allocator.free(payload);
+    const args = try decodeTableAggregate(allocator, payload);
+    defer allocator.free(args.specs);
+    defer allocator.free(args.orderBy);
+
+    try std.testing.expectEqualStrings("orders", args.table);
+    try std.testing.expectEqualStrings("city", args.groupField);
+    try std.testing.expectEqual(@as(u32, 0), args.offset);
+    try std.testing.expectEqual(@as(u32, 0), args.limit);
+    try std.testing.expectEqualStrings("", args.havingText);
+    try std.testing.expectEqualStrings("total gt i:10", args.exprText);
+    try std.testing.expectEqual(@as(usize, 4), args.specs.len);
+    try std.testing.expectEqual(aggregatemod.AggKind.count, args.specs[0].kind);
+    try std.testing.expectEqualStrings("", args.specs[0].field);
+    try std.testing.expectEqual(aggregatemod.AggKind.sum, args.specs[1].kind);
+    try std.testing.expectEqualStrings("total", args.specs[1].field);
+    try std.testing.expectEqual(aggregatemod.AggKind.max, args.specs[2].kind);
+    try std.testing.expectEqual(aggregatemod.AggKind.count_distinct, args.specs[3].kind);
+    try std.testing.expectEqualStrings("city", args.specs[3].field);
+}
+
+test "table_aggregate args round trip an empty groupField (global, no grouping) and empty expr" {
+    const allocator = std.testing.allocator;
+    const specs = [_]aggregatemod.AggSpec{.{ .field = "", .kind = .count }};
+    const payload = try encodeTableAggregate(allocator, "orders", "", &specs, 0, 0, &.{}, "", "");
+    defer allocator.free(payload);
+    const args = try decodeTableAggregate(allocator, payload);
+    defer allocator.free(args.specs);
+    defer allocator.free(args.orderBy);
+
+    try std.testing.expectEqualStrings("", args.groupField);
+    try std.testing.expectEqualStrings("", args.exprText);
+    try std.testing.expectEqual(@as(usize, 1), args.specs.len);
+}
+
+test "table_aggregate args round trip a nonzero offset and limit" {
+    const allocator = std.testing.allocator;
+    const specs = [_]aggregatemod.AggSpec{.{ .field = "", .kind = .count }};
+    const payload = try encodeTableAggregate(allocator, "orders", "city", &specs, 2, 5, &.{}, "", "");
+    defer allocator.free(payload);
+    const args = try decodeTableAggregate(allocator, payload);
+    defer allocator.free(args.specs);
+    defer allocator.free(args.orderBy);
+
+    try std.testing.expectEqual(@as(u32, 2), args.offset);
+    try std.testing.expectEqual(@as(u32, 5), args.limit);
+}
+
+test "table_aggregate args round trip a non-empty havingText alongside a non-empty exprText" {
+    const allocator = std.testing.allocator;
+    const specs = [_]aggregatemod.AggSpec{
+        .{ .field = "", .kind = .count },
+        .{ .field = "total", .kind = .sum },
+    };
+    const payload = try encodeTableAggregate(allocator, "orders", "city", &specs, 0, 0, &.{}, "sum_total gt i:1000", "total gt i:10");
+    defer allocator.free(payload);
+    const args = try decodeTableAggregate(allocator, payload);
+    defer allocator.free(args.specs);
+    defer allocator.free(args.orderBy);
+
+    try std.testing.expectEqualStrings("sum_total gt i:1000", args.havingText);
+    try std.testing.expectEqualStrings("total gt i:10", args.exprText);
+}
+
+test "table_aggregate args round trip a multi-column orderBy alongside havingText and exprText" {
+    const allocator = std.testing.allocator;
+    const specs = [_]aggregatemod.AggSpec{
+        .{ .field = "", .kind = .count },
+        .{ .field = "total", .kind = .sum },
+    };
+    const orderBy = [_]querymod.OrderBy{
+        .{ .field = "sum_total", .descending = true },
+        .{ .field = "city" },
+    };
+    const payload = try encodeTableAggregate(allocator, "orders", "city", &specs, 0, 0, &orderBy, "sum_total gt i:100", "total gt i:10");
+    defer allocator.free(payload);
+    const args = try decodeTableAggregate(allocator, payload);
+    defer allocator.free(args.specs);
+    defer allocator.free(args.orderBy);
+
+    try std.testing.expectEqual(@as(usize, 2), args.orderBy.len);
+    try std.testing.expectEqualStrings("sum_total", args.orderBy[0].field);
+    try std.testing.expect(args.orderBy[0].descending);
+    try std.testing.expectEqualStrings("city", args.orderBy[1].field);
+    try std.testing.expect(!args.orderBy[1].descending);
+    try std.testing.expectEqualStrings("sum_total gt i:100", args.havingText);
+    try std.testing.expectEqualStrings("total gt i:10", args.exprText);
+}
+
+test "table_aggregate args round trip an empty orderBy the same as before this feature existed" {
+    const allocator = std.testing.allocator;
+    const specs = [_]aggregatemod.AggSpec{.{ .field = "", .kind = .count }};
+    const payload = try encodeTableAggregate(allocator, "orders", "city", &specs, 0, 0, &.{}, "", "");
+    defer allocator.free(payload);
+    const args = try decodeTableAggregate(allocator, payload);
+    defer allocator.free(args.specs);
+    defer allocator.free(args.orderBy);
+
+    try std.testing.expectEqual(@as(usize, 0), args.orderBy.len);
+}
+
+test "decodeTableAggregate rejects an unknown agg kind byte instead of corrupting a spec" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, "orders");
+    try putLenPrefixed(w, "city");
+    try w.putU32(1);
+    try w.byte(200); // not a valid AggKind tag
+    try putLenPrefixed(w, "total");
+
+    try std.testing.expectError(error.Malformed, decodeTableAggregate(allocator, buf.items));
+}
+
+test "agg global result round trips count/sum/max values, including a none from an empty avg" {
+    const allocator = std.testing.allocator;
+    const values = [_]rowmod.Value{
+        .{ .int = 4 },
+        .{ .float = 10.5 },
+        .{ .none = {} },
+        .{ .text = "warsaw" },
+    };
+    const payload = try encodeAggGlobalResult(allocator, &values);
+    defer allocator.free(payload);
+
+    const decoded = try decodeAggGlobalResult(allocator, payload);
+    defer freeAggValues(allocator, decoded);
+
+    try std.testing.expectEqual(@as(usize, 4), decoded.len);
+    try std.testing.expectEqual(@as(i64, 4), decoded[0].int);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.5), decoded[1].float, 1e-9);
+    try std.testing.expectEqual(rowmod.ValueTag.none, @as(rowmod.ValueTag, decoded[2]));
+    try std.testing.expectEqualStrings("warsaw", decoded[3].text);
+}
+
+test "empty agg global result round trips" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeAggGlobalResult(allocator, &[_]rowmod.Value{});
+    defer allocator.free(payload);
+    const decoded = try decodeAggGlobalResult(allocator, payload);
+    defer freeAggValues(allocator, decoded);
+    try std.testing.expectEqual(@as(usize, 0), decoded.len);
+}
+
+test "agg group rows round trip several groups with several values each" {
+    const allocator = std.testing.allocator;
+    const groups = [_]aggregatemod.GroupRow{
+        .{ .group = .{ .text = "warsaw" }, .values = @constCast(&[_]rowmod.Value{ .{ .int = 2 }, .{ .int = 350 } }) },
+        .{ .group = .{ .text = "krakow" }, .values = @constCast(&[_]rowmod.Value{ .{ .int = 1 }, .{ .int = 40 } }) },
+    };
+    const payload = try encodeAggGroupRows(allocator, &groups);
+    defer allocator.free(payload);
+
+    const decoded = try decodeAggGroupRows(allocator, payload);
+    defer freeAggGroupRows(allocator, decoded);
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.len);
+    try std.testing.expectEqualStrings("warsaw", decoded[0].group.text);
+    try std.testing.expectEqual(@as(i64, 2), decoded[0].values[0].int);
+    try std.testing.expectEqual(@as(i64, 350), decoded[0].values[1].int);
+    try std.testing.expectEqualStrings("krakow", decoded[1].group.text);
+    try std.testing.expectEqual(@as(i64, 40), decoded[1].values[1].int);
+}
+
+test "empty agg group rows list round trips" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeAggGroupRows(allocator, &[_]aggregatemod.GroupRow{});
+    defer allocator.free(payload);
+    const decoded = try decodeAggGroupRows(allocator, payload);
+    defer freeAggGroupRows(allocator, decoded);
+    try std.testing.expectEqual(@as(usize, 0), decoded.len);
+}
+
+test "decodeAggGroupRows rejects a corrupted second group without leaking the first" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+
+    var goodGroup = rowmod.Row.init(allocator);
+    defer goodGroup.deinit();
+    // Use rowmod.encodeValue directly for a real, well-formed first group so
+    // the corruption below is unambiguously in the SECOND group only.
+    const goodGroupValue = try rowmod.encodeValue(allocator, .{ .text = "warsaw" });
+    defer allocator.free(goodGroupValue);
+    const goodMemberValue = try rowmod.encodeValue(allocator, .{ .int = 1 });
+    defer allocator.free(goodMemberValue);
+
+    try w.putU32(2); // claims two groups, only one is well-formed
+    try putLenPrefixed(w, goodGroupValue);
+    try w.putU32(1);
+    try putLenPrefixed(w, goodMemberValue);
+    // Second group: a length-prefixed blob whose declared value tag is
+    // invalid - `takeDecodedValue` must surface `error.Malformed` here
+    // rather than fabricating a bogus `Value`.
+    try putLenPrefixed(w, &[_]u8{99});
+
+    try std.testing.expectError(error.Malformed, decodeAggGroupRows(allocator, buf.items));
+}
+
+test "table_explain args round trip a table and an expr" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableExplain(allocator, "users", "city eq s:warsaw");
+    defer allocator.free(payload);
+    const args = try decodeTableExplain(payload);
+    try std.testing.expectEqualStrings("users", args.table);
+    try std.testing.expectEqualStrings("city eq s:warsaw", args.exprText);
+}
+
+test "table_explain args round trip an empty expr" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableExplain(allocator, "users", "");
+    defer allocator.free(payload);
+    const args = try decodeTableExplain(payload);
+    try std.testing.expectEqualStrings("users", args.table);
+    try std.testing.expectEqualStrings("", args.exprText);
+}
+
+test "table_update args round trip a table, set fields, and an expr" {
+    const allocator = std.testing.allocator;
+    const sets = [_]rowmod.Field{
+        .{ .name = "active", .value = .{ .int = 1 } },
+        .{ .name = "city", .value = .{ .text = "krakow" } },
+    };
+    const payload = try encodeTableUpdate(allocator, "users", &sets, "city eq s:warsaw");
+    defer allocator.free(payload);
+    const args = try decodeTableUpdate(payload);
+    try std.testing.expectEqualStrings("users", args.table);
+    try std.testing.expectEqualStrings("city eq s:warsaw", args.exprText);
+
+    var decoded = try rowmod.Row.decode(allocator, args.setsBytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(rowmod.Value{ .int = 1 }, decoded.get("active").?);
+    try std.testing.expectEqualStrings("krakow", decoded.get("city").?.text);
+}
+
+test "table_update args round trip an empty expr, updating every row" {
+    const allocator = std.testing.allocator;
+    const sets = [_]rowmod.Field{.{ .name = "seen", .value = .{ .int = 1 } }};
+    const payload = try encodeTableUpdate(allocator, "users", &sets, "");
+    defer allocator.free(payload);
+    const args = try decodeTableUpdate(payload);
+    try std.testing.expectEqualStrings("users", args.table);
+    try std.testing.expectEqualStrings("", args.exprText);
+
+    var decoded = try rowmod.Row.decode(allocator, args.setsBytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded.count());
+}
+
+test "table_delete args round trip a table and an expr" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableDelete(allocator, "users", "city eq s:warsaw");
+    defer allocator.free(payload);
+    const args = try decodeTableDelete(payload);
+    try std.testing.expectEqualStrings("users", args.table);
+    try std.testing.expectEqualStrings("city eq s:warsaw", args.exprText);
+}
+
+test "table_delete args round trip an empty expr, deleting every row" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableDelete(allocator, "users", "");
+    defer allocator.free(payload);
+    const args = try decodeTableDelete(payload);
+    try std.testing.expectEqualStrings("users", args.table);
+    try std.testing.expectEqualStrings("", args.exprText);
+}
+
+test "table_export args round trip a table and each format" {
+    const allocator = std.testing.allocator;
+
+    const csvPayload = try encodeTableExport(allocator, "users", .csv);
+    defer allocator.free(csvPayload);
+    const csvArgs = try decodeTableExport(csvPayload);
+    try std.testing.expectEqualStrings("users", csvArgs.table);
+    try std.testing.expectEqual(DumpFormat.csv, csvArgs.format);
+
+    const jsonPayload = try encodeTableExport(allocator, "users", .json);
+    defer allocator.free(jsonPayload);
+    const jsonArgs = try decodeTableExport(jsonPayload);
+    try std.testing.expectEqualStrings("users", jsonArgs.table);
+    try std.testing.expectEqual(DumpFormat.json, jsonArgs.format);
+}
+
+test "table_export rejects a format byte outside the DumpFormat enum" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, "users");
+    try w.byte(99);
+    try std.testing.expectError(error.Malformed, decodeTableExport(buf.items));
+}
+
+test "export result round trips a row count and content bytes" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeExportResult(allocator, 3, "__pk\ni:1\ni:2\ni:3\n");
+    defer allocator.free(payload);
+    const result = try decodeExportResult(payload);
+    try std.testing.expectEqual(@as(u64, 3), result.rowCount);
+    try std.testing.expectEqualStrings("__pk\ni:1\ni:2\ni:3\n", result.content);
+}
+
+test "export result round trips a zero row count with empty content" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeExportResult(allocator, 0, "");
+    defer allocator.free(payload);
+    const result = try decodeExportResult(payload);
+    try std.testing.expectEqual(@as(u64, 0), result.rowCount);
+    try std.testing.expectEqualStrings("", result.content);
+}
+
+test "table_import args round trip a table, format, and content" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTableImport(allocator, "users", .json, "[{\"__pk\": \"i:1\"}]");
+    defer allocator.free(payload);
+    const args = try decodeTableImport(payload);
+    try std.testing.expectEqualStrings("users", args.table);
+    try std.testing.expectEqual(DumpFormat.json, args.format);
+    try std.testing.expectEqualStrings("[{\"__pk\": \"i:1\"}]", args.content);
+}
+
+test "table_import rejects a format byte outside the DumpFormat enum" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, "users");
+    try w.byte(7);
+    try w.slice("ignored");
+    try std.testing.expectError(error.Malformed, decodeTableImport(buf.items));
+}
+
+test "Plan round trips full_scan with a null indexName" {
+    const allocator = std.testing.allocator;
+    const payload = try encodePlan(allocator, .{ .kind = .full_scan });
+    defer allocator.free(payload);
+    var decoded = try decodePlan(allocator, payload);
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqual(querymod.PlanKind.full_scan, decoded.kind);
+    try std.testing.expect(decoded.indexName == null);
+    try std.testing.expectEqual(@as(usize, 0), decoded.matchedFields);
+    try std.testing.expectEqual(@as(usize, 0), decoded.totalFields);
+}
+
+test "Plan round trips index_range with an indexName and field counts" {
+    const allocator = std.testing.allocator;
+    const payload = try encodePlan(allocator, .{ .kind = .index_range, .indexName = "score", .matchedFields = 1, .totalFields = 1 });
+    defer allocator.free(payload);
+    var decoded = try decodePlan(allocator, payload);
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqual(querymod.PlanKind.index_range, decoded.kind);
+    try std.testing.expectEqualStrings("score", decoded.indexName.?);
+    try std.testing.expectEqual(@as(usize, 1), decoded.matchedFields);
+    try std.testing.expectEqual(@as(usize, 1), decoded.totalFields);
+}
+
+test "Plan round trips composite_eq with a strict prefix match" {
+    const allocator = std.testing.allocator;
+    const payload = try encodePlan(allocator, .{ .kind = .composite_eq, .indexName = "city_age", .matchedFields = 1, .totalFields = 2 });
+    defer allocator.free(payload);
+    var decoded = try decodePlan(allocator, payload);
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqual(querymod.PlanKind.composite_eq, decoded.kind);
+    try std.testing.expectEqualStrings("city_age", decoded.indexName.?);
+    try std.testing.expectEqual(@as(usize, 1), decoded.matchedFields);
+    try std.testing.expectEqual(@as(usize, 2), decoded.totalFields);
+}
+
+test "decodePlan rejects an unknown PlanKind byte instead of corrupting a plan" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.byte(200); // not a valid PlanKind tag
+    try putLenPrefixed(w, "");
+    try w.putU32(0);
+    try w.putU32(0);
+
+    try std.testing.expectError(error.Malformed, decodePlan(allocator, buf.items));
+}
+
+test "decodeRows rejects a corrupted row payload without leaking prior rows" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    var goodRow = rowmod.Row.init(allocator);
+    defer goodRow.deinit();
+    try goodRow.set("a", .{ .int = 1 });
+    const encoded = try goodRow.encode(allocator);
+    defer allocator.free(encoded);
+
+    try w.putU32(2);
+    try putLenPrefixed(w, encoded);
+    try putLenPrefixed(w, &.{ 9, 9, 9 });
+
+    try std.testing.expectError(error.Malformed, decodeRows(allocator, buf.items));
+}
+
+test "Cursor.takeLenPrefixed rejects a length that overruns the buffer" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(100);
+    try w.slice("short");
+    var c = Cursor{ .data = buf.items };
+    try std.testing.expectError(error.Malformed, c.takeLenPrefixed());
+}
+
+test "UserAdminAction.fromByte rejects an unknown action" {
+    try std.testing.expectError(error.Malformed, UserAdminAction.fromByte(200));
+    try std.testing.expectEqual(UserAdminAction.list, try UserAdminAction.fromByte(4));
+}
+
+test "user_admin create payload round trips role and rounds" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeUserAdmin(allocator, .create, "alice", "hunter2", .admin, 100_000);
+    defer allocator.free(payload);
+    const args = try decodeUserAdmin(payload);
+    try std.testing.expectEqual(UserAdminAction.create, args.action);
+    try std.testing.expectEqualStrings("alice", args.username);
+    try std.testing.expectEqualStrings("hunter2", args.password);
+    try std.testing.expectEqual(@intFromEnum(authmod.Role.admin), args.roleByte);
+    try std.testing.expectEqual(@as(u32, 100_000), args.rounds);
+}
+
+test "user_admin delete payload carries only the username" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeUserAdmin(allocator, .delete, "bob", "", .readonly, 0);
+    defer allocator.free(payload);
+    const args = try decodeUserAdmin(payload);
+    try std.testing.expectEqual(UserAdminAction.delete, args.action);
+    try std.testing.expectEqualStrings("bob", args.username);
+    try std.testing.expectEqualStrings("", args.password);
+}
+
+test "user_admin list payload round trips with an empty username" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeUserAdmin(allocator, .list, "", "", .readonly, 0);
+    defer allocator.free(payload);
+    const args = try decodeUserAdmin(payload);
+    try std.testing.expectEqual(UserAdminAction.list, args.action);
+    try std.testing.expectEqualStrings("", args.username);
+}
+
+test "user list round trips every username with its role" {
+    const allocator = std.testing.allocator;
+    const users = [_]authmod.UserInfo{
+        .{ .username = @constCast("alice"), .role = .readonly },
+        .{ .username = @constCast("root"), .role = .admin },
+    };
+    const payload = try encodeUserList(allocator, &users);
+    defer allocator.free(payload);
+
+    const decoded = try decodeUserList(allocator, payload);
+    defer authmod.freeUserList(allocator, decoded);
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.len);
+    try std.testing.expectEqualStrings("alice", decoded[0].username);
+    try std.testing.expectEqual(authmod.Role.readonly, decoded[0].role);
+    try std.testing.expectEqualStrings("root", decoded[1].username);
+    try std.testing.expectEqual(authmod.Role.admin, decoded[1].role);
+}
+
+test "empty user list round trips" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeUserList(allocator, &[_]authmod.UserInfo{});
+    defer allocator.free(payload);
+    const decoded = try decodeUserList(allocator, payload);
+    defer authmod.freeUserList(allocator, decoded);
+    try std.testing.expectEqual(@as(usize, 0), decoded.len);
+}
+
+test "decodeUserList rejects an unknown role byte" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(1);
+    try putLenPrefixed(w, "ghost");
+    try w.byte(200);
+    try std.testing.expectError(error.Malformed, decodeUserList(allocator, buf.items));
+}
+
+test "TtlAction.fromByte rejects an unknown action" {
+    try std.testing.expectError(error.Malformed, TtlAction.fromByte(200));
+    try std.testing.expectEqual(TtlAction.sweep, try TtlAction.fromByte(3));
+}
+
+test "ttl_op expire payload round trips key and seconds" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTtlOp(allocator, .expire, "session:1", 30);
+    defer allocator.free(payload);
+    const args = try decodeTtlOp(payload);
+    try std.testing.expectEqual(TtlAction.expire, args.action);
+    try std.testing.expectEqualStrings("session:1", args.key);
+    try std.testing.expectEqual(@as(u64, 30), args.seconds);
+}
+
+test "ttl_op sweep payload carries an empty key and zero seconds" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTtlOp(allocator, .sweep, "", 0);
+    defer allocator.free(payload);
+    const args = try decodeTtlOp(payload);
+    try std.testing.expectEqual(TtlAction.sweep, args.action);
+    try std.testing.expectEqualStrings("", args.key);
+    try std.testing.expectEqual(@as(u64, 0), args.seconds);
+}
+
+test "ttl result round trips noKey, noExpiry, and seconds" {
+    const allocator = std.testing.allocator;
+
+    const noKeyPayload = try encodeTtlResult(allocator, .noKey);
+    defer allocator.free(noKeyPayload);
+    try std.testing.expectEqual(ttlmod.TtlResult.noKey, try decodeTtlResult(noKeyPayload));
+
+    const noExpiryPayload = try encodeTtlResult(allocator, .noExpiry);
+    defer allocator.free(noExpiryPayload);
+    try std.testing.expectEqual(ttlmod.TtlResult.noExpiry, try decodeTtlResult(noExpiryPayload));
+
+    const secondsPayload = try encodeTtlResult(allocator, .{ .seconds = 42 });
+    defer allocator.free(secondsPayload);
+    const decoded = try decodeTtlResult(secondsPayload);
+    try std.testing.expectEqual(@as(u64, 42), decoded.seconds);
+}
+
+test "decodeTtlResult rejects an unknown kind byte" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.byte(200);
+    try std.testing.expectError(error.Malformed, decodeTtlResult(buf.items));
+}
+
+test "ttl sweep count round trips" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeTtlSweepCount(allocator, 7);
+    defer allocator.free(payload);
+    try std.testing.expectEqual(@as(u64, 7), try decodeTtlSweepCount(payload));
+}
+
+test "coll_ttl_op expire payload round trips action, kind, name and seconds" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeCollTtlOp(allocator, .expire, .hash, "profile", 30);
+    defer allocator.free(payload);
+    const args = try decodeCollTtlOp(payload);
+    try std.testing.expectEqual(TtlAction.expire, args.action);
+    try std.testing.expectEqual(collmod.Kind.hash, args.kind);
+    try std.testing.expectEqualStrings("profile", args.name);
+    try std.testing.expectEqual(@as(u64, 30), args.seconds);
+}
+
+test "coll_ttl_op round trips every kind's tag byte" {
+    const allocator = std.testing.allocator;
+    const kinds = [_]collmod.Kind{ .counter, .hash, .set, .list, .zset };
+    for (kinds) |k| {
+        const payload = try encodeCollTtlOp(allocator, .query, k, "n", 0);
+        defer allocator.free(payload);
+        const args = try decodeCollTtlOp(payload);
+        try std.testing.expectEqual(k, args.kind);
+    }
+}
+
+test "coll_ttl_op sweep payload carries an empty name and zero seconds" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeCollTtlOp(allocator, .sweep, .counter, "", 0);
+    defer allocator.free(payload);
+    const args = try decodeCollTtlOp(payload);
+    try std.testing.expectEqual(TtlAction.sweep, args.action);
+    try std.testing.expectEqualStrings("", args.name);
+    try std.testing.expectEqual(@as(u64, 0), args.seconds);
+}
+
+test "decodeCollTtlOp rejects an unknown kind byte" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.byte(@intFromEnum(TtlAction.query));
+    try w.byte('?');
+    try w.putU64(0);
+    try std.testing.expectError(error.Malformed, decodeCollTtlOp(buf.items));
+}
+
+test "decodeCollTtlOp rejects an unknown action byte before the kind byte is even read" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.byte(200);
+    try w.byte('H');
+    try w.putU64(0);
+    try std.testing.expectError(error.Malformed, decodeCollTtlOp(buf.items));
+}
+
+test "CollAction.fromByte rejects an unknown action" {
+    try std.testing.expectError(error.Malformed, CollAction.fromByte(200));
+    try std.testing.expectEqual(CollAction.zset_rank, try CollAction.fromByte(29));
+}
+
+test "CollAction.kind groups every action under its collection kind" {
+    try std.testing.expectEqual(collmod.Kind.counter, CollAction.counter_incrby.kind());
+    try std.testing.expectEqual(collmod.Kind.hash, CollAction.hash_getall.kind());
+    try std.testing.expectEqual(collmod.Kind.set, CollAction.set_diff.kind());
+    try std.testing.expectEqual(collmod.Kind.list, CollAction.list_range.kind());
+    try std.testing.expectEqual(collmod.Kind.zset, CollAction.zset_rangebyscore.kind());
+}
+
+test "CollAction.isReadOnly separates reads from writes" {
+    try std.testing.expect(CollAction.counter_get.isReadOnly());
+    try std.testing.expect(!CollAction.counter_set.isReadOnly());
+    try std.testing.expect(CollAction.zset_rank.isReadOnly());
+    try std.testing.expect(!CollAction.zset_add.isReadOnly());
+    try std.testing.expect(CollAction.set_inter.isReadOnly());
+    try std.testing.expect(!CollAction.list_lpush.isReadOnly());
+}
+
+test "coll_op payload round trips action, name, and a variable arg list" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "alice", "10" };
+    const payload = try encodeCollOp(allocator, .zset_add, "leaderboard", &args);
+    defer allocator.free(payload);
+    const decoded = try decodeCollOp(allocator, payload);
+    defer allocator.free(decoded.args);
+    try std.testing.expectEqual(CollAction.zset_add, decoded.action);
+    try std.testing.expectEqualStrings("leaderboard", decoded.name);
+    try std.testing.expectEqual(@as(usize, 2), decoded.args.len);
+    try std.testing.expectEqualStrings("alice", decoded.args[0]);
+    try std.testing.expectEqualStrings("10", decoded.args[1]);
+}
+
+test "coll_op payload round trips a zero-arg action" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeCollOp(allocator, .hash_getall, "profile", &.{});
+    defer allocator.free(payload);
+    const decoded = try decodeCollOp(allocator, payload);
+    defer allocator.free(decoded.args);
+    try std.testing.expectEqual(CollAction.hash_getall, decoded.action);
+    try std.testing.expectEqualStrings("profile", decoded.name);
+    try std.testing.expectEqual(@as(usize, 0), decoded.args.len);
+}
+
