@@ -1909,3 +1909,159 @@ test "selectPageOrdered sorts text fields lexically and is stable on ties" {
     var db = try openTemp(&tmp, allocator);
     defer db.close();
 
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    // Two "warsaw" rows (pk 1 and 3) tie on `city` - a stable sort must keep
+    // them in scan order (1 before 3) relative to each other even though
+    // "krakow" (pk 2) sorts between them lexically... except it doesn't,
+    // "krakow" < "warsaw", so both warsaw rows land after it, still in
+    // their original relative order (1 then 3).
+    try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+    try table.put(.{ .int = 2 }, &.{.{ .name = "city", .value = .{ .text = "krakow" } }});
+    try table.put(.{ .int = 3 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+
+    const rows = try table.selectPageOrdered(null, .{}, &.{.{ .field = "city" }});
+    defer freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expectEqualStrings("krakow", rows[0].get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 2), rows[0].get(pkField).?.int);
+    try std.testing.expectEqualStrings("warsaw", rows[1].get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 1), rows[1].get(pkField).?.int);
+    try std.testing.expectEqualStrings("warsaw", rows[2].get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 3), rows[2].get(pkField).?.int);
+}
+
+test "selectPageOrdered groups rows missing the sort field at the front" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.put(.{ .int = 1 }, &.{.{ .name = "score", .value = .{ .int = 5 } }});
+    try table.put(.{ .int = 2 }, &.{});
+    try table.put(.{ .int = 3 }, &.{.{ .name = "score", .value = .{ .int = 1 } }});
+
+    const rows = try table.selectPageOrdered(null, .{}, &.{.{ .field = "score" }});
+    defer freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(i64, 2), rows[0].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 3), rows[1].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 1), rows[2].get(pkField).?.int);
+}
+
+test "selectPageOrdered on an indexed predicate still uses the index, not a full scan" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createIndex("city");
+    var pk: i64 = 1;
+    while (pk <= 20) : (pk += 1) {
+        const city: []const u8 = if (@mod(pk, 2) == 0) "warsaw" else "krakow";
+        try table.put(.{ .int = pk }, &.{
+            .{ .name = "city", .value = .{ .text = city } },
+            .{ .name = "score", .value = .{ .int = 100 - pk } },
+        });
+    }
+    const pred = Predicate{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } };
+
+    // Cross-check against `explain` (same predicate shape it already tests
+    // elsewhere): `selectAllMatches` must still pick the `city` index, only
+    // skipping the early-stop, not falling back to a full scan.
+    var plan = try table.explain(allocator, pred);
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(PlanKind.index_eq, plan.kind);
+
+    const rows = try table.selectPageOrdered(pred, .{}, &.{.{ .field = "score" }});
+    defer freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 10), rows.len);
+    var lastScore: i64 = std.math.minInt(i64);
+    for (rows) |r| {
+        const s = r.get("score").?.int;
+        try std.testing.expect(s >= lastScore);
+        lastScore = s;
+        try std.testing.expectEqualStrings("warsaw", r.get("city").?.text);
+    }
+}
+
+test "selectPageOrdered with two columns sorts by the first, breaking ties with the second" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "people");
+    defer table.deinit();
+    // Two cities, each with scores NOT already grouped or sorted by pk -
+    // a single-column sort on `city` alone would leave each city's rows in
+    // scan order (which happens to already be reverse-score here), so
+    // this only passes if `score` is truly applied as a tiebreaker.
+    try table.put(.{ .int = 1 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "score", .value = .{ .int = 30 } } });
+    try table.put(.{ .int = 2 }, &.{ .{ .name = "city", .value = .{ .text = "krakow" } }, .{ .name = "score", .value = .{ .int = 20 } } });
+    try table.put(.{ .int = 3 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "score", .value = .{ .int = 10 } } });
+    try table.put(.{ .int = 4 }, &.{ .{ .name = "city", .value = .{ .text = "krakow" } }, .{ .name = "score", .value = .{ .int = 40 } } });
+
+    const rows = try table.selectPageOrdered(null, .{}, &.{ .{ .field = "city" }, .{ .field = "score" } });
+    defer freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 4), rows.len);
+    // krakow (score 20, 40) before warsaw (score 10, 30), each group
+    // internally ascending by score regardless of pk/insertion order.
+    try std.testing.expectEqual(@as(i64, 2), rows[0].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 4), rows[1].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 3), rows[2].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 1), rows[3].get(pkField).?.int);
+}
+
+test "selectPageOrdered with two columns honors independent directions per column" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "people");
+    defer table.deinit();
+    try table.put(.{ .int = 1 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "score", .value = .{ .int = 10 } } });
+    try table.put(.{ .int = 2 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "score", .value = .{ .int = 20 } } });
+    try table.put(.{ .int = 3 }, &.{ .{ .name = "city", .value = .{ .text = "krakow" } }, .{ .name = "score", .value = .{ .int = 5 } } });
+
+    // city ascending, score DESCENDING - a comparator that only flips the
+    // whole tuple's sign (instead of applying `descending` per column)
+    // would get the city order right but the within-city score order
+    // backwards.
+    const rows = try table.selectPageOrdered(null, .{}, &.{ .{ .field = "city" }, .{ .field = "score", .descending = true } });
+    defer freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(i64, 3), rows[0].get(pkField).?.int); // krakow
+    try std.testing.expectEqual(@as(i64, 2), rows[1].get(pkField).?.int); // warsaw score 20
+    try std.testing.expectEqual(@as(i64, 1), rows[2].get(pkField).?.int); // warsaw score 10
+}
+
+test "selectPageOrdered with an empty order-by falls through to selectPage's early-stop behavior" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "people");
+    defer table.deinit();
+    var pk: i64 = 1;
+    while (pk <= 5) : (pk += 1) {
+        try table.put(.{ .int = pk }, &.{});
+    }
+
+    const ordered = try table.selectPageOrdered(null, .{ .limit = 2 }, &.{});
+    defer freeRows(allocator, ordered);
+    const plain = try table.selectPage(null, .{ .limit = 2 });
+    defer freeRows(allocator, plain);
+    try std.testing.expectEqual(plain.len, ordered.len);
+    for (ordered, plain) |o, p| try std.testing.expectEqual(o.get(pkField).?.int, p.get(pkField).?.int);
+}
+
