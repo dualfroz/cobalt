@@ -945,3 +945,492 @@ pub const Table = struct {
         const matches = try self.selectAllMatches(pred);
         defer freeRows(self.allocator, matches);
 
+        for (matches) |*row| {
+            const pk = row.get(pkField) orelse continue;
+            try self.delete(pk);
+        }
+        return matches.len;
+    }
+
+    /// Full table scan decoding every row, oldest key order. Callers own the
+    /// returned slice and each Row in it (see freeRows).
+    pub fn scanAll(self: *Table) ![]Row {
+        const prefix = try idx.rowPrefix(self.allocator, self.name);
+        defer self.allocator.free(prefix);
+
+        var results = std.ArrayList(Row).init(self.allocator);
+        errdefer {
+            for (results.items) |*r| r.deinit();
+            results.deinit();
+        }
+
+        var it = try self.db.scanPrefix(self.allocator, prefix);
+        defer it.deinit();
+        while (try it.next()) |entry| {
+            const decoded = try Row.decode(self.allocator, entry.value);
+            try results.append(decoded);
+        }
+        return results.toOwnedSlice();
+    }
+
+    /// Selects rows matching `pred` (or every row, if null). When `pred` is
+    /// a single indexed condition, or an And containing one, the matching
+    /// index is used to build a narrowed candidate set before the full
+    /// predicate is re-checked against each candidate row - so results are
+    /// always correct even though the optimization only ever inspects one
+    /// conjunct's index.
+    pub fn select(self: *Table, pred: ?Predicate) ![]Row {
+        return self.selectPage(pred, .{});
+    }
+
+    /// Same as `select`, but skips the first `page.offset` matches and stops
+    /// once `page.limit` matches have been collected (0 = unlimited, the
+    /// same convention `protocol.ScanArgs` uses). Both the full-scan and
+    /// index-narrowed paths stop iterating as soon as the limit is met
+    /// instead of materializing the whole match set first - a real
+    /// efficiency win for `LIMIT`-bounded queries against large tables, not
+    /// just a post-hoc slice of an already-full result.
+    pub fn selectPage(self: *Table, pred: ?Predicate, page: Page) ![]Row {
+        if (pred) |p| {
+            if (self.findCompositeMatch(p)) |match| {
+                const cursor = try self.compositeCursorForMatch(match);
+                return self.selectByIndexPage(p, cursor, page);
+            }
+            if (self.findIndexableLeaf(p)) |leaf| {
+                const cursor = try self.cursorForLeaf(leaf);
+                return self.selectByIndexPage(p, cursor, page);
+            }
+        }
+        return self.scanFilteredPage(pred, page);
+    }
+
+    /// Same as `selectPage`, but sorts the matches by `orderBy` (when
+    /// non-empty, one or more columns applied left to right - see
+    /// `OrderBy`'s doc comment) before applying `page`'s offset/limit
+    /// window. `selectPage`'s early-stop optimization (dropping a full scan
+    /// or index cursor the moment `page.limit` matches are collected) is
+    /// only correct when results come out in the strategy's natural order -
+    /// sorting requires the full match set first, so an `orderBy` request
+    /// materializes every match via `selectAllMatches` (still using
+    /// whichever index `explain` would report, just without the early
+    /// stop), sorts it, then slices the requested window with
+    /// `applyRowPage`. An empty `orderBy` falls straight through to
+    /// `selectPage`, keeping the early-stop behavior unchanged for the
+    /// common unordered case.
+    pub fn selectPageOrdered(self: *Table, pred: ?Predicate, page: Page, orderBy: []const OrderBy) ![]Row {
+        if (orderBy.len == 0) return self.selectPage(pred, page);
+        const all = try self.selectAllMatches(pred);
+        errdefer freeRows(self.allocator, all);
+        sortRowsBy(all, orderBy);
+        return applyRowPage(self.allocator, all, page);
+    }
+
+    /// Collects every row matching `pred`, unpaged - the same
+    /// index-vs-full-scan strategy choice `selectPage`/`explain` make,
+    /// just always run to completion instead of stopping at a page limit.
+    fn selectAllMatches(self: *Table, pred: ?Predicate) ![]Row {
+        if (pred) |p| {
+            if (self.findCompositeMatch(p)) |match| {
+                const cursor = try self.compositeCursorForMatch(match);
+                return self.selectByIndexPage(p, cursor, .{});
+            }
+            if (self.findIndexableLeaf(p)) |leaf| {
+                const cursor = try self.cursorForLeaf(leaf);
+                return self.selectByIndexPage(p, cursor, .{});
+            }
+        }
+        return self.scanFilteredPage(pred, .{});
+    }
+
+    /// Reports which strategy `selectPage` would pick for `pred` without
+    /// running it - the exact same decision ladder (composite match first,
+    /// then a single-field indexable leaf, then a full scan), just stopping
+    /// one step short of building a cursor. Exists so a caller (the CLI's
+    /// `table explain`, its network/repl mirrors) can answer "would this
+    /// query use an index" without materializing rows or mutating anything,
+    /// which is why this takes `*const Table` unlike `selectPage`.
+    pub fn explain(self: *const Table, allocator: Allocator, pred: ?Predicate) !Plan {
+        if (pred) |p| {
+            if (self.findCompositeMatch(p)) |match| {
+                const spec = self.composite.specs.items[match.specIdx];
+                const isRange = match.rangeLow != null or match.rangeHigh != null;
+                return .{
+                    .kind = if (isRange) .composite_range else .composite_eq,
+                    .indexName = try allocator.dupe(u8, spec.name),
+                    .matchedFields = match.matchedLen,
+                    .totalFields = spec.fields.len,
+                };
+            }
+            if (self.findIndexableLeaf(p)) |leaf| {
+                const field = switch (leaf) {
+                    .eq, .lt, .lte, .gt, .gte => |c| c.field,
+                    else => unreachable,
+                };
+                const isRange = switch (leaf) {
+                    .lt, .lte, .gt, .gte => true,
+                    else => false,
+                };
+                return .{
+                    .kind = if (isRange) .index_range else .index_eq,
+                    .indexName = try allocator.dupe(u8, field),
+                    .matchedFields = 1,
+                    .totalFields = 1,
+                };
+            }
+        }
+        return .{ .kind = .full_scan };
+    }
+
+    fn scanFilteredPage(self: *Table, pred: ?Predicate, page: Page) ![]Row {
+        const prefix = try idx.rowPrefix(self.allocator, self.name);
+        defer self.allocator.free(prefix);
+
+        var results = std.ArrayList(Row).init(self.allocator);
+        errdefer {
+            for (results.items) |*r| r.deinit();
+            results.deinit();
+        }
+
+        var skipped: usize = 0;
+        var it = try self.db.scanPrefix(self.allocator, prefix);
+        defer it.deinit();
+        while (try it.next()) |entry| {
+            var decoded = try Row.decode(self.allocator, entry.value);
+            const matches = if (pred) |p| p.evaluate(&decoded) else true;
+            if (!matches) {
+                decoded.deinit();
+                continue;
+            }
+            if (skipped < page.offset) {
+                skipped += 1;
+                decoded.deinit();
+                continue;
+            }
+            try results.append(decoded);
+            if (page.limit != 0 and results.items.len >= page.limit) break;
+        }
+        return results.toOwnedSlice();
+    }
+
+    /// Streams primary keys straight from the index cursor instead of first
+    /// materializing the whole candidate list (see `idx.EqCursor`/
+    /// `idx.RangeCursor`): once `page.limit` rows are collected the
+    /// underlying `Db` scan is simply dropped without decoding or even
+    /// reading whatever index entries would have come after it, which
+    /// matters when the indexed value has far more matches than the page
+    /// being asked for.
+    fn selectByIndexPage(self: *Table, p: Predicate, cursorIn: IndexCursor, page: Page) ![]Row {
+        var cursor = cursorIn;
+        defer cursor.deinit();
+
+        var results = std.ArrayList(Row).init(self.allocator);
+        errdefer {
+            for (results.items) |*r| r.deinit();
+            results.deinit();
+        }
+        var skipped: usize = 0;
+        while (try cursor.next(self.allocator)) |pk| {
+            defer pk.free(self.allocator);
+            var r = try self.get(pk) orelse continue;
+            if (!p.evaluate(&r)) {
+                r.deinit();
+                continue;
+            }
+            if (skipped < page.offset) {
+                skipped += 1;
+                r.deinit();
+                continue;
+            }
+            try results.append(r);
+            if (page.limit != 0 and results.items.len >= page.limit) break;
+        }
+        return results.toOwnedSlice();
+    }
+
+    fn findIndexableLeaf(self: *const Table, p: Predicate) ?Predicate {
+        switch (p) {
+            .eq, .lt, .lte, .gt, .gte => |c| {
+                if (self.indexes.has(c.field)) return p;
+                return null;
+            },
+            .and_ => |preds| {
+                for (preds) |sub| {
+                    if (self.findIndexableLeaf(sub)) |found| return found;
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    /// Streaming counterpart of the old `pksForLeaf` (which returned a fully
+    /// materialized `[]Value`): wraps whichever `idx` cursor constructor
+    /// matches the leaf's comparison so `selectByIndexPage` can decode and
+    /// discard candidates one at a time.
+    const IndexCursor = union(enum) {
+        eq: idx.EqCursor,
+        range: idx.RangeCursor,
+        compositeEq: idx.CompositeEqCursor,
+        compositeRange: idx.CompositeRangeCursor,
+
+        fn next(self: *IndexCursor, allocator: Allocator) !?Value {
+            return switch (self.*) {
+                .eq => |*c| c.next(allocator),
+                .range => |*c| c.next(allocator),
+                .compositeEq => |*c| c.next(allocator),
+                .compositeRange => |*c| c.next(allocator),
+            };
+        }
+
+        fn deinit(self: *IndexCursor) void {
+            switch (self.*) {
+                .eq => |*c| c.deinit(),
+                .range => |*c| c.deinit(),
+                .compositeEq => |*c| c.deinit(),
+                .compositeRange => |*c| c.deinit(),
+            }
+        }
+    };
+
+    fn cursorForLeaf(self: *Table, leaf: Predicate) !IndexCursor {
+        return switch (leaf) {
+            .eq => |c| .{ .eq = try idx.scanEqCursor(self.db, self.allocator, self.name, c.field, c.value) },
+            .lt => |c| .{ .range = try idx.scanRangeCursor(self.db, self.allocator, self.name, c.field, null, .{ .value = c.value, .inclusive = false }) },
+            .lte => |c| .{ .range = try idx.scanRangeCursor(self.db, self.allocator, self.name, c.field, null, .{ .value = c.value, .inclusive = true }) },
+            .gt => |c| .{ .range = try idx.scanRangeCursor(self.db, self.allocator, self.name, c.field, .{ .value = c.value, .inclusive = false }, null) },
+            .gte => |c| .{ .range = try idx.scanRangeCursor(self.db, self.allocator, self.name, c.field, .{ .value = c.value, .inclusive = true }, null) },
+            else => unreachable,
+        };
+    }
+
+    const CompositeMatch = struct {
+        specIdx: usize,
+        values: [maxCompositeFields]Value,
+        matchedLen: usize,
+        // A range condition on the column immediately after the matched
+        // eq prefix (spec.fields[matchedLen]), if the predicate has one -
+        // same leftmost-prefix rule a real multi-column B-tree range scan
+        // follows: only the column right after the pinned prefix can be
+        // range-bound by the index, anything further is unconstrained.
+        rangeLow: ?idx.Bound = null,
+        rangeHigh: ?idx.Bound = null,
+    };
+
+    /// Looks for a composite index whose leading ("leftmost") columns are
+    /// all pinned down by a top-level `eq` conjunct somewhere in `p` (an
+    /// `and_`, in any order - unlike a real SQL planner this does not
+    /// recurse into nested and_/or_, matching `findIndexableLeaf`'s scope).
+    /// The match may cover a strict prefix of the index's columns, not
+    /// necessarily all of them: a query naming only the first K of N
+    /// indexed fields still gets a narrowed lookup, same leftmost-prefix
+    /// rule a multi-column B-tree index gives you. When the column right
+    /// after the matched prefix also has a top-level lt/lte/gt/gte conjunct
+    /// on it, that becomes a range bound narrowing the scan further instead
+    /// of leaving it unconstrained. `selectByIndexPage` re-evaluates the
+    /// full predicate against every candidate row regardless, so an
+    /// unmatched suffix of columns (or any other conjunct entirely) never
+    /// affects correctness, only how much the index narrows the scan.
+    fn findCompositeMatch(self: *const Table, p: Predicate) ?CompositeMatch {
+        const preds = switch (p) {
+            .and_ => |ps| ps,
+            else => return null,
+        };
+        for (self.composite.specs.items, 0..) |spec, si| {
+            var values: [maxCompositeFields]Value = undefined;
+            var matched: usize = 0;
+            for (spec.fields) |f| {
+                const found = for (preds) |leaf| {
+                    if (leaf == .eq and std.mem.eql(u8, leaf.eq.field, f)) break leaf.eq.value;
+                } else null;
+                const v = found orelse break;
+                values[matched] = v;
+                matched += 1;
+            }
+            if (matched == 0) continue;
+
+            var rangeLow: ?idx.Bound = null;
+            var rangeHigh: ?idx.Bound = null;
+            if (matched < spec.fields.len) {
+                const nextField = spec.fields[matched];
+                for (preds) |leaf| {
+                    switch (leaf) {
+                        .gt => |c| if (std.mem.eql(u8, c.field, nextField)) {
+                            rangeLow = .{ .value = c.value, .inclusive = false };
+                        },
+                        .gte => |c| if (std.mem.eql(u8, c.field, nextField)) {
+                            rangeLow = .{ .value = c.value, .inclusive = true };
+                        },
+                        .lt => |c| if (std.mem.eql(u8, c.field, nextField)) {
+                            rangeHigh = .{ .value = c.value, .inclusive = false };
+                        },
+                        .lte => |c| if (std.mem.eql(u8, c.field, nextField)) {
+                            rangeHigh = .{ .value = c.value, .inclusive = true };
+                        },
+                        else => {},
+                    }
+                }
+            }
+            return .{ .specIdx = si, .values = values, .matchedLen = matched, .rangeLow = rangeLow, .rangeHigh = rangeHigh };
+        }
+        return null;
+    }
+
+    fn compositeCursorForMatch(self: *Table, match: CompositeMatch) !IndexCursor {
+        const spec = self.composite.specs.items[match.specIdx];
+        const eqValues = match.values[0..match.matchedLen];
+        if (match.rangeLow != null or match.rangeHigh != null) {
+            return .{ .compositeRange = try idx.scanCompositeRangeCursor(self.db, self.allocator, self.name, spec.name, eqValues, match.rangeLow, match.rangeHigh) };
+        }
+        return .{ .compositeEq = try idx.scanCompositeEqCursor(self.db, self.allocator, self.name, spec.name, eqValues) };
+    }
+};
+
+fn valueTupleEql(a: []const Value, b: []const Value) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |av, bv| {
+        if (!Value.eql(av, bv)) return false;
+    }
+    return true;
+}
+
+pub fn freeRows(allocator: Allocator, rows: []Row) void {
+    for (rows) |*r| r.deinit();
+    allocator.free(rows);
+}
+
+/// Stable in-place sort of `rows` by `order`, using `rowmod.compare`'s
+/// total order across value types (see `OrderBy`'s doc comment for how a
+/// missing field sorts). Columns are compared left to right: the first
+/// entry decides unless it ties (`.eq`), in which case the next entry
+/// breaks the tie, and so on - a plain lexicographic comparator chain, the
+/// same rule SQL's `ORDER BY a, b, c` follows. `std.sort.block` rather than
+/// the faster unstable `std.sort.pdq` specifically so ties that survive
+/// every column preserve scan order, matching what `OrderBy`'s doc comment
+/// promises callers.
+fn sortRowsBy(rows: []Row, order: []const OrderBy) void {
+    const Ctx = struct {
+        order: []const OrderBy,
+
+        fn lessThan(ctx: @This(), a: Row, b: Row) bool {
+            for (ctx.order) |ob| {
+                const av = a.get(ob.field) orelse Value{ .none = {} };
+                const bv = b.get(ob.field) orelse Value{ .none = {} };
+                const cmp = rowmod.compare(av, bv);
+                if (cmp == .eq) continue;
+                return if (ob.descending) cmp == .gt else cmp == .lt;
+            }
+            return false;
+        }
+    };
+    std.sort.block(Row, rows, Ctx{ .order = order }, Ctx.lessThan);
+}
+
+/// Slices an already-materialized, unpaged match set (as `selectAllMatches`
+/// returns) down to `page`'s offset/limit window, freeing every row that
+/// falls outside it and the original backing allocation - the ordered
+/// counterpart of the early-stop windowing `selectByIndexPage`/
+/// `scanFilteredPage` do inline while scanning. `rows` must not be used
+/// after this call regardless of error (see `errdefer` at the call site).
+fn applyRowPage(allocator: Allocator, rows: []Row, page: Page) ![]Row {
+    const start = @min(page.offset, rows.len);
+    const end = if (page.limit == 0) rows.len else @min(rows.len, start + page.limit);
+    for (rows[0..start]) |*r| r.deinit();
+    for (rows[end..]) |*r| r.deinit();
+    const kept = rows[start..end];
+    const out = try allocator.alloc(Row, kept.len);
+    @memcpy(out, kept);
+    allocator.free(rows);
+    return out;
+}
+
+fn openTemp(tmp: *std.testing.TmpDir, allocator: Allocator) !Db {
+    const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dbPath);
+    return Db.open(allocator, dbPath, .{});
+}
+
+test "table put get delete round trip" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "name", .value = .{ .text = "ada" } },
+        .{ .name = "age", .value = .{ .int = 36 } },
+    });
+
+    var got = (try table.get(.{ .int = 1 })).?;
+    defer got.deinit();
+    try std.testing.expectEqualStrings("ada", got.get("name").?.text);
+    try std.testing.expectEqual(@as(i64, 36), got.get("age").?.int);
+    try std.testing.expectEqual(@as(i64, 1), got.get(pkField).?.int);
+
+    try table.delete(.{ .int = 1 });
+    try std.testing.expect((try table.get(.{ .int = 1 })) == null);
+}
+
+test "table put replaces whole row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "name", .value = .{ .text = "ada" } },
+        .{ .name = "age", .value = .{ .int = 36 } },
+    });
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "name", .value = .{ .text = "ada" } },
+    });
+
+    var got = (try table.get(.{ .int = 1 })).?;
+    defer got.deinit();
+    try std.testing.expect(got.get("age") == null);
+    try std.testing.expectEqualStrings("ada", got.get("name").?.text);
+}
+
+test "createIndex backfills then eq select uses index" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+
+    try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+    try table.put(.{ .int = 2 }, &.{.{ .name = "city", .value = .{ .text = "krakow" } }});
+    try table.put(.{ .int = 3 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+
+    try table.createIndex("city");
+    try std.testing.expect(table.hasIndex("city"));
+
+    const results = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
+    defer freeRows(allocator, results);
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "like predicate filters by pattern and never uses an index on that field" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    // Index the very field the like-predicate targets: `like` must still
+    // fall back to a full scan (`Value.compare`-based index entries have no
+    // notion of substring matching), never mistake this for an eq lookup.
+    try table.createIndex("name");
+
