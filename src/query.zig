@@ -2701,3 +2701,800 @@ test "updateWhere keeps a composite index in sync across leading and trailing co
         try std.testing.expectEqualStrings(exp.name, rows[0].get("name").?.text);
     }
 
+    const everyone = try table.select(null);
+    defer freeRows(allocator, everyone);
+    try std.testing.expectEqual(@as(usize, 4), everyone.len);
+}
+
+test "deleteWhere removes every matching row and reports the count" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+    try table.put(.{ .int = 2 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+    try table.put(.{ .int = 3 }, &.{.{ .name = "city", .value = .{ .text = "krakow" } }});
+
+    const pred = Predicate{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } };
+    const deleted = try table.deleteWhere(pred);
+    try std.testing.expectEqual(@as(usize, 2), deleted);
+
+    try std.testing.expectEqual(@as(?Row, null), try table.get(.{ .int = 1 }));
+    try std.testing.expectEqual(@as(?Row, null), try table.get(.{ .int = 2 }));
+
+    var row3 = (try table.get(.{ .int = 3 })).?;
+    defer row3.deinit();
+    try std.testing.expectEqualStrings("krakow", row3.get("city").?.text);
+}
+
+test "deleteWhere with a null predicate empties the table" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "counters");
+    defer table.deinit();
+    try table.put(.{ .int = 1 }, &.{.{ .name = "n", .value = .{ .int = 5 } }});
+    try table.put(.{ .int = 2 }, &.{.{ .name = "n", .value = .{ .int = 7 } }});
+
+    const deleted = try table.deleteWhere(null);
+    try std.testing.expectEqual(@as(usize, 2), deleted);
+
+    const everyone = try table.select(null);
+    defer freeRows(allocator, everyone);
+    try std.testing.expectEqual(@as(usize, 0), everyone.len);
+}
+
+test "deleteWhere with no matches deletes nothing and leaves the table untouched" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+
+    const deleted = try table.deleteWhere(.{ .eq = .{ .field = "city", .value = .{ .text = "gdansk" } } });
+    try std.testing.expectEqual(@as(usize, 0), deleted);
+
+    var row = (try table.get(.{ .int = 1 })).?;
+    defer row.deinit();
+    try std.testing.expectEqualStrings("warsaw", row.get("city").?.text);
+}
+
+test "deleteWhere removes stale secondary index entries so a fresh row can reuse the value" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createIndex("city");
+    try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+
+    const deleted = try table.deleteWhere(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
+    try std.testing.expectEqual(@as(usize, 1), deleted);
+
+    // The old index entry for pk 1 under "warsaw" must be gone, not just the
+    // row - otherwise a later put of a *different* pk under the same "warsaw"
+    // value would find a phantom sibling in the index.
+    const stale = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
+    defer freeRows(allocator, stale);
+    try std.testing.expectEqual(@as(usize, 0), stale.len);
+
+    try table.put(.{ .int = 2 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+    const fresh = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
+    defer freeRows(allocator, fresh);
+    try std.testing.expectEqual(@as(usize, 1), fresh.len);
+    try std.testing.expectEqual(@as(i64, 2), fresh[0].get(pkField).?.int);
+
+    const constTable: *const Table = &table;
+    var plan = try constTable.explain(allocator, .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(PlanKind.index_eq, plan.kind);
+}
+
+test "deleteWhere removes stale composite index entries across matched equality prefix" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createCompositeIndex("city_age", &.{ "city", "age" });
+
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 30 } },
+    });
+    try table.put(.{ .int = 2 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 31 } },
+    });
+    try table.put(.{ .int = 3 }, &.{
+        .{ .name = "city", .value = .{ .text = "krakow" } },
+        .{ .name = "age", .value = .{ .int = 30 } },
+    });
+
+    const preds = [_]Predicate{
+        .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+        .{ .eq = .{ .field = "age", .value = .{ .int = 30 } } },
+    };
+    const deleted = try table.deleteWhere(.{ .and_ = &preds });
+    try std.testing.expectEqual(@as(usize, 1), deleted);
+
+    const gone = try table.select(.{ .and_ = &preds });
+    defer freeRows(allocator, gone);
+    try std.testing.expectEqual(@as(usize, 0), gone.len);
+
+    // The composite index must still correctly serve the two untouched rows,
+    // proving the deleted row's entry was surgically removed, not the whole
+    // (city="warsaw") or (age=30) bucket.
+    const survivors = [_]struct { pk: i64, city: []const u8, age: i64 }{
+        .{ .pk = 2, .city = "warsaw", .age = 31 },
+        .{ .pk = 3, .city = "krakow", .age = 30 },
+    };
+    for (survivors) |exp| {
+        const survivorPreds = [_]Predicate{
+            .{ .eq = .{ .field = "city", .value = .{ .text = exp.city } } },
+            .{ .eq = .{ .field = "age", .value = .{ .int = exp.age } } },
+        };
+        const rows = try table.select(.{ .and_ = &survivorPreds });
+        defer freeRows(allocator, rows);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqual(exp.pk, rows[0].get(pkField).?.int);
+
+        const constTable: *const Table = &table;
+        var plan = try constTable.explain(allocator, .{ .and_ = &survivorPreds });
+        defer plan.deinit(allocator);
+        try std.testing.expectEqual(PlanKind.composite_eq, plan.kind);
+    }
+}
+
+test "createUniqueIndex backfills the plain index and rejects a colliding insert" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.put(.{ .int = 1 }, &.{.{ .name = "email", .value = .{ .text = "a@x.com" } }});
+
+    try table.createUniqueIndex("email");
+    try std.testing.expect(table.hasUniqueIndex("email"));
+    try std.testing.expect(table.hasIndex("email"));
+
+    try std.testing.expectError(error.UniqueViolation, table.put(.{ .int = 2 }, &.{
+        .{ .name = "email", .value = .{ .text = "a@x.com" } },
+    }));
+
+    try table.put(.{ .int = 2 }, &.{.{ .name = "email", .value = .{ .text = "b@x.com" } }});
+    const rows = try table.scanAll();
+    defer freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+}
+
+test "createUniqueIndex refuses to install over data that already has a duplicate" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.put(.{ .int = 1 }, &.{.{ .name = "email", .value = .{ .text = "dup@x.com" } }});
+    try table.put(.{ .int = 2 }, &.{.{ .name = "email", .value = .{ .text = "dup@x.com" } }});
+
+    try std.testing.expectError(error.UniqueViolation, table.createUniqueIndex("email"));
+    try std.testing.expect(!table.hasUniqueIndex("email"));
+    // Refused install must not have left a half-installed plain index either.
+    try std.testing.expect(!table.hasIndex("email"));
+}
+
+test "createUniqueIndex over an already-indexed field reuses the index instead of duplicating entries" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createIndex("email");
+    try table.put(.{ .int = 1 }, &.{.{ .name = "email", .value = .{ .text = "a@x.com" } }});
+
+    try table.createUniqueIndex("email");
+    try std.testing.expect(table.hasUniqueIndex("email"));
+
+    try std.testing.expectError(error.UniqueViolation, table.put(.{ .int = 2 }, &.{
+        .{ .name = "email", .value = .{ .text = "a@x.com" } },
+    }));
+
+    const preds = Predicate{ .eq = .{ .field = "email", .value = .{ .text = "a@x.com" } } };
+    const rows = try table.select(preds);
+    defer freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+}
+
+test "unique constraint does not block updating a row's own value or an unrelated field" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "email", .value = .{ .text = "a@x.com" } },
+        .{ .name = "age", .value = .{ .int = 30 } },
+    });
+    try table.createUniqueIndex("email");
+
+    // Re-writing the same email on the same row must not conflict with itself.
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "email", .value = .{ .text = "a@x.com" } },
+        .{ .name = "age", .value = .{ .int = 31 } },
+    });
+
+    var row = (try table.get(.{ .int = 1 })).?;
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 31), row.get("age").?.int);
+}
+
+test "unique constraint frees a value for reuse once the owning row is deleted" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createUniqueIndex("email");
+    try table.put(.{ .int = 1 }, &.{.{ .name = "email", .value = .{ .text = "a@x.com" } }});
+    try std.testing.expectError(error.UniqueViolation, table.put(.{ .int = 2 }, &.{
+        .{ .name = "email", .value = .{ .text = "a@x.com" } },
+    }));
+
+    try table.delete(.{ .int = 1 });
+    try table.put(.{ .int = 2 }, &.{.{ .name = "email", .value = .{ .text = "a@x.com" } }});
+
+    var row = (try table.get(.{ .int = 2 })).?;
+    defer row.deinit();
+    try std.testing.expectEqualStrings("a@x.com", row.get("email").?.text);
+}
+
+test "dropIndex on a unique field also drops the unique constraint" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createUniqueIndex("email");
+    try table.put(.{ .int = 1 }, &.{.{ .name = "email", .value = .{ .text = "a@x.com" } }});
+
+    try table.dropIndex("email");
+    try std.testing.expect(!table.hasUniqueIndex("email"));
+    try std.testing.expect(!table.hasIndex("email"));
+
+    // With no constraint left, a colliding value must now be accepted.
+    try table.put(.{ .int = 2 }, &.{.{ .name = "email", .value = .{ .text = "a@x.com" } }});
+    const rows = try table.scanAll();
+    defer freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+}
+
+test "unique constraint survives a table reopen (persisted across process restart)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    {
+        var table = try Table.open(&db, allocator, "users");
+        defer table.deinit();
+        try table.createUniqueIndex("email");
+        try table.put(.{ .int = 1 }, &.{.{ .name = "email", .value = .{ .text = "a@x.com" } }});
+    }
+
+    var reopened = try Table.open(&db, allocator, "users");
+    defer reopened.deinit();
+    try std.testing.expect(reopened.hasUniqueIndex("email"));
+    try std.testing.expectError(error.UniqueViolation, reopened.put(.{ .int = 2 }, &.{
+        .{ .name = "email", .value = .{ .text = "a@x.com" } },
+    }));
+}
+
+test "createUniqueIndex rejects a bad field identifier" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try std.testing.expectError(error.InvalidIdentifier, table.createUniqueIndex("bad\x00field"));
+}
+
+test "rows missing the unique field entirely never collide with each other" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.put(.{ .int = 1 }, &.{.{ .name = "age", .value = .{ .int = 20 } }});
+    try table.put(.{ .int = 2 }, &.{.{ .name = "age", .value = .{ .int = 21 } }});
+
+    try table.createUniqueIndex("email");
+    try table.put(.{ .int = 3 }, &.{.{ .name = "age", .value = .{ .int = 22 } }});
+    const rows = try table.scanAll();
+    defer freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+}
+
+test "createForeignKey against the primary key rejects a dangling reference and accepts a real one" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var customers = try Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+    try customers.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "Ada" } }});
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createForeignKey("customer_id", "customers", pkField, .restrict);
+    try std.testing.expect(orders.hasForeignKey("customer_id"));
+
+    try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
+
+    try std.testing.expectError(error.ForeignKeyViolation, orders.put(.{ .int = 101 }, &.{
+        .{ .name = "customer_id", .value = .{ .int = 999 } },
+    }));
+}
+
+test "createForeignKey against a UNIQUE non-pk field works, and refuses a target with no unique backing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var products = try Table.open(&db, allocator, "products");
+    defer products.deinit();
+    try products.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "SKU-1" } }});
+
+    var lineItems = try Table.open(&db, allocator, "line_items");
+    defer lineItems.deinit();
+
+    // "sku" has no unique constraint on products yet.
+    try std.testing.expectError(error.ForeignKeyRequiresUniqueTarget, lineItems.createForeignKey("product_sku", "products", "sku", .restrict));
+
+    try products.createUniqueIndex("sku");
+    try lineItems.createForeignKey("product_sku", "products", "sku", .restrict);
+
+    try lineItems.put(.{ .int = 1 }, &.{.{ .name = "product_sku", .value = .{ .text = "SKU-1" } }});
+    try std.testing.expectError(error.ForeignKeyViolation, lineItems.put(.{ .int = 2 }, &.{
+        .{ .name = "product_sku", .value = .{ .text = "NOPE" } },
+    }));
+}
+
+test "createForeignKey refuses to install over a child row that already dangles" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var customers = try Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.put(.{ .int = 1 }, &.{.{ .name = "customer_id", .value = .{ .int = 42 } }});
+
+    try std.testing.expectError(error.ForeignKeyViolation, orders.createForeignKey("customer_id", "customers", pkField, .restrict));
+    try std.testing.expect(!orders.hasForeignKey("customer_id"));
+}
+
+test "a row with no value for the foreign key field is exempt from the constraint" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var customers = try Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createForeignKey("customer_id", "customers", pkField, .restrict);
+
+    // No "customer_id" field at all - a nullable foreign key, not a violation.
+    try orders.put(.{ .int = 1 }, &.{.{ .name = "note", .value = .{ .text = "guest checkout" } }});
+    var row = (try orders.get(.{ .int = 1 })).?;
+    defer row.deinit();
+    try std.testing.expect(row.get("customer_id") == null);
+}
+
+test "dropForeignKey lifts the constraint" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var customers = try Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createForeignKey("customer_id", "customers", pkField, .restrict);
+
+    try std.testing.expectError(error.ForeignKeyViolation, orders.put(.{ .int = 1 }, &.{
+        .{ .name = "customer_id", .value = .{ .int = 42 } },
+    }));
+
+    try orders.dropForeignKey("customer_id");
+    try std.testing.expect(!orders.hasForeignKey("customer_id"));
+    try orders.put(.{ .int = 1 }, &.{.{ .name = "customer_id", .value = .{ .int = 42 } }});
+}
+
+test "deleting a parent row is restricted while a child still references it via the primary key" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var customers = try Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+    try customers.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "Ada" } }});
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createForeignKey("customer_id", "customers", pkField, .restrict);
+    try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
+
+    try std.testing.expectError(error.ForeignKeyInUse, customers.delete(.{ .int = 1 }));
+    // Restricted, not silently ignored: the row is still there afterwards.
+    var stillThere = (try customers.get(.{ .int = 1 })).?;
+    stillThere.deinit();
+
+    // Once the referencing child row is gone, the parent can be deleted.
+    try orders.delete(.{ .int = 100 });
+    try customers.delete(.{ .int = 1 });
+    try std.testing.expect((try customers.get(.{ .int = 1 })) == null);
+}
+
+test "deleteWhere on a parent table stops at the first row a child still references" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var customers = try Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+    try customers.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "Ada" } }});
+    try customers.put(.{ .int = 2 }, &.{.{ .name = "name", .value = .{ .text = "Boris" } }});
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createForeignKey("customer_id", "customers", pkField, .restrict);
+    try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 2 } }});
+
+    try std.testing.expectError(error.ForeignKeyInUse, customers.deleteWhere(null));
+    // customer 1 had no children and was already removed by the time
+    // deleteWhere hit customer 2's violation - deleteWhere has no
+    // per-batch atomicity (see its own doc comment), so a partial effect
+    // here is expected, not a bug this test is trying to hide.
+    try std.testing.expect((try customers.get(.{ .int = 1 })) == null);
+    var stillThere = (try customers.get(.{ .int = 2 })).?;
+    stillThere.deinit();
+}
+
+test "dropForeignKey lifts the delete restriction on the table it pointed at" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var customers = try Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+    try customers.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "Ada" } }});
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createForeignKey("customer_id", "customers", pkField, .restrict);
+    try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
+    try std.testing.expectError(error.ForeignKeyInUse, customers.delete(.{ .int = 1 }));
+
+    try orders.dropForeignKey("customer_id");
+    try customers.delete(.{ .int = 1 });
+    try std.testing.expect((try customers.get(.{ .int = 1 })) == null);
+}
+
+test "delete restriction works through a UNIQUE non-pk foreign key target too" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var products = try Table.open(&db, allocator, "products");
+    defer products.deinit();
+    try products.createUniqueIndex("sku");
+    try products.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "WIDGET-1" } }});
+
+    var lineItems = try Table.open(&db, allocator, "line_items");
+    defer lineItems.deinit();
+    try lineItems.createForeignKey("product_sku", "products", "sku", .restrict);
+    try lineItems.put(.{ .int = 1 }, &.{.{ .name = "product_sku", .value = .{ .text = "WIDGET-1" } }});
+
+    try std.testing.expectError(error.ForeignKeyInUse, products.delete(.{ .int = 1 }));
+
+    try lineItems.delete(.{ .int = 1 });
+    try products.delete(.{ .int = 1 });
+    try std.testing.expect((try products.get(.{ .int = 1 })) == null);
+}
+
+test "a self-referencing foreign key restricts deleting a manager with reports, but not a childless leaf" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var employees = try Table.open(&db, allocator, "employees");
+    defer employees.deinit();
+    try employees.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "CEO" } }});
+    try employees.createForeignKey("manager_id", "employees", pkField, .restrict);
+    try employees.put(.{ .int = 2 }, &.{
+        .{ .name = "name", .value = .{ .text = "VP" } },
+        .{ .name = "manager_id", .value = .{ .int = 1 } },
+    });
+
+    try std.testing.expectError(error.ForeignKeyInUse, employees.delete(.{ .int = 1 }));
+    // The leaf (no reports) deletes cleanly - and does not restrict its
+    // own deletion against itself despite scanning the same table.
+    try employees.delete(.{ .int = 2 });
+    try employees.delete(.{ .int = 1 });
+    try std.testing.expect((try employees.get(.{ .int = 1 })) == null);
+}
+
+test "foreign key constraint survives a table reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    {
+        var customers = try Table.open(&db, allocator, "customers");
+        defer customers.deinit();
+        var orders = try Table.open(&db, allocator, "orders");
+        defer orders.deinit();
+        try orders.createForeignKey("customer_id", "customers", pkField, .restrict);
+    }
+
+    var reopened = try Table.open(&db, allocator, "orders");
+    defer reopened.deinit();
+    try std.testing.expect(reopened.hasForeignKey("customer_id"));
+    try std.testing.expectError(error.ForeignKeyViolation, reopened.put(.{ .int = 1 }, &.{
+        .{ .name = "customer_id", .value = .{ .int = 7 } },
+    }));
+}
+
+test "createForeignKey rejects bad identifiers for field, refTable, and refField" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try std.testing.expectError(error.InvalidIdentifier, orders.createForeignKey("bad\x00field", "customers", pkField, .restrict));
+    try std.testing.expectError(error.InvalidIdentifier, orders.createForeignKey("customer_id", "bad\x00table", pkField, .restrict));
+    try std.testing.expectError(error.InvalidIdentifier, orders.createForeignKey("customer_id", "customers", "bad\x00field", .restrict));
+}
+
+test "a self-referencing foreign key enforces a tree structure against the table's own primary key" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var employees = try Table.open(&db, allocator, "employees");
+    defer employees.deinit();
+    try employees.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "CEO" } }});
+    try employees.createForeignKey("manager_id", "employees", pkField, .restrict);
+
+    // A row with no manager (the root of the tree) is exempt.
+    try employees.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "CEO" } }});
+    // A report naming an existing manager is fine.
+    try employees.put(.{ .int = 2 }, &.{
+        .{ .name = "name", .value = .{ .text = "VP" } },
+        .{ .name = "manager_id", .value = .{ .int = 1 } },
+    });
+    try std.testing.expectError(error.ForeignKeyViolation, employees.put(.{ .int = 3 }, &.{
+        .{ .name = "name", .value = .{ .text = "Ghost report" } },
+        .{ .name = "manager_id", .value = .{ .int = 999 } },
+    }));
+}
+
+test "deleting a referenced parent is blocked before it can leave a child's foreign key dangling" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var customers = try Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+    try customers.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "Ada" } }});
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createForeignKey("customer_id", "customers", pkField, .restrict);
+    try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
+
+    // This used to be the one gap `updateWhere`'s own per-row FK re-check
+    // existed to catch after the fact: a bare `customers.delete` leaving
+    // orders#100's reference dangling even though it was valid when first
+    // written (see createForeignKey's OLD doc comment). `Table.delete`'s
+    // ON DELETE RESTRICT check (backed by `ReferencedBySet`) now closes it
+    // at the source instead - the dangling state this test used to
+    // construct is no longer reachable through delete at all.
+    try std.testing.expectError(error.ForeignKeyInUse, customers.delete(.{ .int = 1 }));
+
+    // updateWhere re-writes the row through put with every field carried
+    // over unchanged, including "customer_id" - it has nothing to catch,
+    // because the reference was never allowed to go dangling in the first
+    // place.
+    try std.testing.expectEqual(@as(usize, 1), try orders.updateWhere(null, &.{
+        .{ .name = "note", .value = .{ .text = "touch" } },
+    }));
+}
+
+test "put is restricted from changing a UNIQUE foreign key target still referenced by a child" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var products = try Table.open(&db, allocator, "products");
+    defer products.deinit();
+    try products.createUniqueIndex("sku");
+    try products.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "WIDGET-1" } }});
+
+    var lineItems = try Table.open(&db, allocator, "line_items");
+    defer lineItems.deinit();
+    try lineItems.createForeignKey("product_sku", "products", "sku", .restrict);
+    try lineItems.put(.{ .int = 1 }, &.{.{ .name = "product_sku", .value = .{ .text = "WIDGET-1" } }});
+
+    // Renaming the sku out from under the still-live line item must not
+    // silently strand it - the same RESTRICT a delete would get.
+    try std.testing.expectError(error.ForeignKeyInUse, products.put(.{ .int = 1 }, &.{
+        .{ .name = "sku", .value = .{ .text = "WIDGET-2" } },
+    }));
+    var stillThere = (try products.get(.{ .int = 1 })).?;
+    defer stillThere.deinit();
+    try std.testing.expectEqualStrings("WIDGET-1", stillThere.get("sku").?.text);
+
+    // Rewriting the same value back (or any other unrelated field) is not
+    // a change and is always exempt, mirroring the UNIQUE check's own
+    // "unchanged is safe" exemption.
+    try products.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "WIDGET-1" } }});
+
+    // Once the reference is gone, the rename goes through.
+    try lineItems.delete(.{ .int = 1 });
+    try products.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "WIDGET-2" } }});
+    var renamed = (try products.get(.{ .int = 1 })).?;
+    defer renamed.deinit();
+    try std.testing.expectEqualStrings("WIDGET-2", renamed.get("sku").?.text);
+}
+
+test "updateWhere is restricted from pulling a UNIQUE foreign key target out from under a child" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var products = try Table.open(&db, allocator, "products");
+    defer products.deinit();
+    try products.createUniqueIndex("sku");
+    try products.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "WIDGET-1" } }});
+
+    var lineItems = try Table.open(&db, allocator, "line_items");
+    defer lineItems.deinit();
+    try lineItems.createForeignKey("product_sku", "products", "sku", .restrict);
+    try lineItems.put(.{ .int = 1 }, &.{.{ .name = "product_sku", .value = .{ .text = "WIDGET-1" } }});
+
+    try std.testing.expectError(error.ForeignKeyInUse, products.updateWhere(null, &.{
+        .{ .name = "sku", .value = .{ .text = "WIDGET-2" } },
+    }));
+
+    // A bulk update that leaves the referenced field untouched has
+    // nothing to restrict.
+    try std.testing.expectEqual(@as(usize, 1), try products.updateWhere(null, &.{
+        .{ .name = "note", .value = .{ .text = "touch" } },
+    }));
+}
+
+test "a self-referencing foreign key restricts renaming a UNIQUE field still targeted by a report, but not by itself" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var employees = try Table.open(&db, allocator, "employees");
+    defer employees.deinit();
+    try employees.createUniqueIndex("badge");
+    try employees.createForeignKey("manager_badge", "employees", "badge", .restrict);
+    try employees.put(.{ .int = 1 }, &.{.{ .name = "badge", .value = .{ .text = "B1" } }});
+    try employees.put(.{ .int = 2 }, &.{
+        .{ .name = "badge", .value = .{ .text = "B2" } },
+        .{ .name = "manager_badge", .value = .{ .text = "B1" } },
+    });
+
+    // Employee 2 still points at "B1" - renaming employee 1's own badge
+    // must be restricted.
+    try std.testing.expectError(error.ForeignKeyInUse, employees.put(.{ .int = 1 }, &.{
+        .{ .name = "badge", .value = .{ .text = "B1-NEW" } },
+    }));
+
+    // Employee 2 renaming its OWN badge (not the field being referenced by
+    // anyone) is unaffected - and does not restrict against itself despite
+    // the scan covering the same table.
+    try employees.put(.{ .int = 2 }, &.{
+        .{ .name = "badge", .value = .{ .text = "B2-NEW" } },
+        .{ .name = "manager_badge", .value = .{ .text = "B1" } },
+    });
+
+    // Once the report's manager_badge field is dropped (a row with no
+    // value for the FK field is exempt from the constraint, so this is a
+    // valid way to stop referencing anything), the manager's badge can be
+    // renamed.
+    try employees.put(.{ .int = 2 }, &.{
+        .{ .name = "badge", .value = .{ .text = "B2-NEW" } },
+    });
+    try employees.put(.{ .int = 1 }, &.{.{ .name = "badge", .value = .{ .text = "B1-NEW" } }});
+    var renamed = (try employees.get(.{ .int = 1 })).?;
+    defer renamed.deinit();
+    try std.testing.expectEqualStrings("B1-NEW", renamed.get("badge").?.text);
+}
+
