@@ -159,3 +159,309 @@ pub const Repl = struct {
         return ReplError.UnknownCommand;
     }
 
+    fn cmdBegin(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len != 0) return ReplError.WrongArgCount;
+        if (self.txn != null) return ReplError.TransactionAlreadyActive;
+        self.txn = Transaction.begin(self.db);
+        try writer.writeAll("OK\n");
+    }
+
+    fn cmdCommit(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len != 0) return ReplError.WrongArgCount;
+        if (self.txn == null) return ReplError.NoActiveTransaction;
+        try self.txn.?.commit();
+        self.discardTxnState();
+        try writer.writeAll("OK\n");
+    }
+
+    fn cmdRollback(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len != 0) return ReplError.WrongArgCount;
+        if (self.txn == null) return ReplError.NoActiveTransaction;
+        self.discardTxnState();
+        try writer.writeAll("OK\n");
+    }
+
+    fn cmdPut(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len != 2) return ReplError.WrongArgCount;
+        if (self.txn) |*t| {
+            try t.put(args[0], args[1]);
+        } else {
+            try self.db.put(args[0], args[1]);
+        }
+        try writer.writeAll("OK\n");
+    }
+
+    fn cmdGet(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len != 1) return ReplError.WrongArgCount;
+        const value = if (self.txn) |*t|
+            try t.get(self.allocator, args[0])
+        else
+            try self.db.get(self.allocator, args[0]);
+        defer if (value) |v| self.allocator.free(v);
+        if (value) |v| {
+            try writer.print("{s}\n", .{v});
+        } else {
+            try writer.writeAll("(nil)\n");
+        }
+    }
+
+    fn cmdDel(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len != 1) return ReplError.WrongArgCount;
+        if (self.txn) |*t| {
+            try t.delete(args[0]);
+        } else {
+            try self.db.delete(args[0]);
+        }
+        try writer.writeAll("OK\n");
+    }
+
+    fn cmdScan(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len > 1) return ReplError.WrongArgCount;
+        const prefix = if (args.len == 1) args[0] else "";
+        var iter = try self.db.scanPrefix(self.allocator, prefix);
+        defer iter.deinit();
+        while (try iter.next()) |entry| {
+            try writer.print("{s}\t{s}\n", .{ entry.key, entry.value });
+        }
+    }
+
+    /// `expire`/`persist`/`ttl`/`expire-sweep` mirror the one-shot CLI's
+    /// same-named commands (main.zig) over `ttl.zig`'s flat-key TTL layer.
+    /// Like `scan` above, these always act on the live, already-committed
+    /// `Db` regardless of any open transaction: a TTL marker lives under its
+    /// own keyspace tag, set/cleared directly against `self.db`, never
+    /// staged through `Transaction` - there is no OCC-safe way to make
+    /// "expire this key in N seconds" conditional on a commit that hasn't
+    /// happened yet, so (deliberately, like `coll`'s ops) this bypasses the
+    /// active transaction entirely rather than pretending to participate in
+    /// it.
+    fn cmdExpire(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len != 2) return ReplError.WrongArgCount;
+        const seconds = std.fmt.parseInt(u64, args[1], 10) catch return ReplError.InvalidArgument;
+        const existing = try self.db.get(self.allocator, args[0]) orelse return ReplError.NoSuchKey;
+        self.allocator.free(existing);
+        try ttlmod.setExpireSeconds(self.db, self.allocator, args[0], std.time.nanoTimestamp(), seconds);
+        try writer.writeAll("OK\n");
+    }
+
+    fn cmdPersist(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len != 1) return ReplError.WrongArgCount;
+        try ttlmod.clearExpire(self.db, self.allocator, args[0]);
+        try writer.writeAll("OK\n");
+    }
+
+    fn cmdTtl(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len != 1) return ReplError.WrongArgCount;
+        switch (try ttlmod.remaining(self.db, self.allocator, args[0], std.time.nanoTimestamp())) {
+            .noKey => try writer.writeAll("-2\n"),
+            .noExpiry => try writer.writeAll("-1\n"),
+            .seconds => |s| try writer.print("{d}\n", .{s}),
+        }
+    }
+
+    fn cmdExpireSweep(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len != 0) return ReplError.WrongArgCount;
+        const reaped = try ttlmod.sweepExpired(self.db, self.allocator, std.time.nanoTimestamp());
+        try writer.print("reaped: {d}\n", .{reaped});
+    }
+
+    fn cmdStats(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len != 0) return ReplError.WrongArgCount;
+        try self.db.stats().print(writer);
+    }
+
+    fn cmdFlush(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len != 0) return ReplError.WrongArgCount;
+        try self.db.flush();
+        try writer.writeAll("OK\n");
+    }
+
+    fn cmdCompact(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len != 0) return ReplError.WrongArgCount;
+        try self.db.compact();
+        try writer.writeAll("OK\n");
+    }
+
+    fn cmdTable(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len < 1) return ReplError.WrongArgCount;
+        const op = args[0];
+        const rest = args[1..];
+
+        if (std.mem.eql(u8, op, "select")) return self.cmdTableSelect(rest, writer);
+        if (std.mem.eql(u8, op, "explain")) return self.cmdTableExplain(rest, writer);
+        if (std.mem.eql(u8, op, "update")) return self.cmdTableUpdate(rest, writer);
+        if (std.mem.eql(u8, op, "delete")) return self.cmdTableDelete(rest, writer);
+        if (std.mem.eql(u8, op, "join")) return self.cmdTableJoin(rest, writer);
+        if (std.mem.eql(u8, op, "aggregate")) return self.cmdTableAggregate(rest, writer);
+        if (std.mem.eql(u8, op, "window")) return self.cmdTableWindow(rest, writer);
+
+        if (rest.len < 2) return ReplError.WrongArgCount;
+        const tableName = rest[0];
+        const pk = try Value.parseCli(rest[1]);
+
+        if (std.mem.eql(u8, op, "put")) {
+            var fields = std.ArrayList(Field).init(self.allocator);
+            defer fields.deinit();
+            for (rest[2..]) |raw| try fields.append(try parseField(raw));
+            try self.tablePut(tableName, pk, fields.items);
+            try writer.writeAll("OK\n");
+        } else if (std.mem.eql(u8, op, "get")) {
+            if (rest.len != 2) return ReplError.WrongArgCount;
+            var row = try self.tableGet(tableName, pk) orelse {
+                try writer.writeAll("(nil)\n");
+                return;
+            };
+            defer row.deinit();
+            try printRow(writer, row);
+        } else if (std.mem.eql(u8, op, "del")) {
+            if (rest.len != 2) return ReplError.WrongArgCount;
+            try self.tableDel(tableName, pk);
+            try writer.writeAll("OK\n");
+        } else {
+            return ReplError.UnknownCommand;
+        }
+    }
+
+    /// `table select <table> [expr...] [--limit N] [--offset N] [--order-by
+    /// field[:desc][,field[:desc]...]]`: interactive counterpart of the
+    /// one-shot CLI's `table select` (main.zig's `runTable`) over
+    /// query.zig's `Table.selectPageOrdered`, same expr grammar (expr.zig)
+    /// and `--limit`/`--offset`/`--order-by` conventions.
+    fn cmdTableSelect(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len < 1) return ReplError.WrongArgCount;
+        var table = try Table.open(self.db, self.allocator, args[0]);
+        defer table.deinit();
+
+        const sel = try extractSelectFlags(self.allocator, args[1..]);
+        defer self.allocator.free(sel.rest);
+        defer self.allocator.free(sel.flags.orderBy);
+
+        const exprText = try std.mem.join(self.allocator, " ", sel.rest);
+        defer self.allocator.free(exprText);
+
+        var parsed: ?exprmod.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (exprText.len > 0) {
+            parsed = try exprmod.parse(self.allocator, exprText);
+        }
+        const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
+
+        const rows = try table.selectPageOrdered(pred, .{ .offset = sel.flags.page.offset, .limit = sel.flags.page.limit }, sel.flags.orderBy);
+        defer querymod.freeRows(self.allocator, rows);
+        for (rows) |r| try printRow(writer, r);
+    }
+
+    /// `table explain <table> [expr...]`: interactive counterpart of the
+    /// one-shot CLI's `table explain` (main.zig's `runTable`), reporting
+    /// which strategy `table select` would use for the same predicate
+    /// without running it - `query.Table.explain` over the same expr
+    /// grammar `cmdTableSelect` already uses.
+    fn cmdTableExplain(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len < 1) return ReplError.WrongArgCount;
+        var table = try Table.open(self.db, self.allocator, args[0]);
+        defer table.deinit();
+
+        const exprText = try std.mem.join(self.allocator, " ", args[1..]);
+        defer self.allocator.free(exprText);
+
+        var parsed: ?exprmod.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (exprText.len > 0) {
+            parsed = try exprmod.parse(self.allocator, exprText);
+        }
+        const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
+
+        var plan = try table.explain(self.allocator, pred);
+        defer plan.deinit(self.allocator);
+        try printPlan(writer, plan);
+    }
+
+    /// `table update <table> --set field=value[,field=value...] [expr...]`:
+    /// interactive counterpart of the one-shot CLI's `table update`
+    /// (main.zig's `runTable`) over `query.Table.updateWhere`, same
+    /// `--set`/expr grammar. Prints the number of rows updated.
+    fn cmdTableUpdate(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len < 1) return ReplError.WrongArgCount;
+        var table = try Table.open(self.db, self.allocator, args[0]);
+        defer table.deinit();
+
+        const setf = try extractSetFlag(self.allocator, args[1..]);
+        defer self.allocator.free(setf.sets);
+        defer self.allocator.free(setf.rest);
+
+        const exprText = try std.mem.join(self.allocator, " ", setf.rest);
+        defer self.allocator.free(exprText);
+
+        var parsed: ?exprmod.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (exprText.len > 0) {
+            parsed = try exprmod.parse(self.allocator, exprText);
+        }
+        const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
+
+        const updated = try table.updateWhere(pred, setf.sets);
+        try writer.print("{d}\n", .{updated});
+    }
+
+    /// `table delete <table> [expr...]`: interactive counterpart of the
+    /// one-shot CLI's `table delete` (main.zig's `runTable`) over
+    /// `query.Table.deleteWhere`, same expr grammar as `cmdTableSelect`/
+    /// `cmdTableExplain` (empty expr deletes every row). Prints the number
+    /// of rows deleted.
+    fn cmdTableDelete(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len < 1) return ReplError.WrongArgCount;
+        var table = try Table.open(self.db, self.allocator, args[0]);
+        defer table.deinit();
+
+        const exprText = try std.mem.join(self.allocator, " ", args[1..]);
+        defer self.allocator.free(exprText);
+
+        var parsed: ?exprmod.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (exprText.len > 0) {
+            parsed = try exprmod.parse(self.allocator, exprText);
+        }
+        const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
+
+        const deleted = try table.deleteWhere(pred);
+        try writer.print("{d}\n", .{deleted});
+    }
+
+    /// `table join [--left|--right|--full] <leftTable> <leftField>
+    /// <rightTable> <rightField> [--limit N] [--offset N]`: interactive
+    /// counterpart of the one-shot CLI's `table join` over join.zig's four
+    /// join functions. With no flag, prints inner-join pairs (`L <row>`
+    /// then `R <row>`); `--left`/`--right`/`--full` print `L (nil)`/
+    /// `R (nil)` for the unmatched side exactly like the CLI.
+    /// `--limit`/`--offset` window the already-joined result through
+    /// `join.applyPage`, same convention as `table select`'s paging (0 or
+    /// omitted = unlimited). Predicates on either side are not exposed here
+    /// (same deliberately minimal CLI surface as `table join` itself - the
+    /// richer path is the `join.zig` library API, as its own tests cover).
+    fn cmdTableJoin(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        const JoinMode = enum { inner, left, right, full };
+        var mode: JoinMode = .inner;
+        var positional = std.ArrayList([]const u8).init(self.allocator);
+        defer positional.deinit();
+        for (args) |a| {
+            if (std.mem.eql(u8, a, "--left")) {
+                mode = .left;
+            } else if (std.mem.eql(u8, a, "--right")) {
+                mode = .right;
+            } else if (std.mem.eql(u8, a, "--full")) {
+                mode = .full;
+            } else {
+                try positional.append(a);
+            }
+        }
+        const pf = try extractPageFlags(self.allocator, positional.items);
+        defer self.allocator.free(pf.rest);
+        if (pf.rest.len != 4) return ReplError.WrongArgCount;
+        const jargs = pf.rest;
+        const page = querymod.Page{ .offset = pf.page.offset, .limit = pf.page.limit };
+
+        var left = try Table.open(self.db, self.allocator, jargs[0]);
+        defer left.deinit();
+        var right = try Table.open(self.db, self.allocator, jargs[2]);
+        defer right.deinit();
+
