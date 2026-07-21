@@ -3613,3 +3613,386 @@ test "table_window args round trip a RANGE frame, and default to ROWS when the b
     try std.testing.expectEqual(windowmod.FrameMode.rows, rowsArgs.frame);
 }
 
+test "decodeTableWindow rejects an unknown frame byte instead of silently defaulting to ROWS" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, "orders");
+    try w.byte(1); // specs count
+    try w.byte(@intFromEnum(windowmod.WindowKind.sum));
+    try putLenPrefixed(w, "total");
+    try w.byte(0); // partitionBy count
+    try w.byte(0); // orderBy count
+    try w.putU32(0);
+    try w.putU32(0);
+    try w.byte(200); // not a valid FrameMode tag
+
+    try std.testing.expectError(error.Malformed, decodeTableWindow(allocator, buf.items));
+}
+
+test "table_window args round trip a multi-column partition and multi-column descending order-by" {
+    const allocator = std.testing.allocator;
+    const partitionBy = [_][]const u8{ "city", "region" };
+    const orderBy = [_]querymod.OrderBy{
+        .{ .field = "day", .descending = true },
+        .{ .field = "amount", .descending = false },
+    };
+    const specs = [_]windowmod.WindowSpec{.{ .field = "amount", .kind = .max }};
+    const payload = try encodeTableWindow(allocator, "orders", &specs, &partitionBy, &orderBy, 0, 0, "", .rows);
+    defer allocator.free(payload);
+    const args = try decodeTableWindow(allocator, payload);
+    defer allocator.free(args.specs);
+    defer allocator.free(args.partitionBy);
+    defer allocator.free(args.orderBy);
+
+    try std.testing.expectEqual(@as(usize, 2), args.partitionBy.len);
+    try std.testing.expectEqualStrings("city", args.partitionBy[0]);
+    try std.testing.expectEqualStrings("region", args.partitionBy[1]);
+    try std.testing.expectEqual(@as(usize, 2), args.orderBy.len);
+    try std.testing.expect(args.orderBy[0].descending);
+    try std.testing.expect(!args.orderBy[1].descending);
+}
+
+test "decodeTableWindow rejects an unknown window kind byte instead of corrupting a spec" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, "orders");
+    try w.byte(1); // specs count
+    try w.byte(200); // not a valid WindowKind tag
+    try putLenPrefixed(w, "total");
+    try w.byte(0); // partitionBy count
+    try w.byte(0); // orderBy count
+    try w.putU32(0);
+    try w.putU32(0);
+
+    try std.testing.expectError(error.Malformed, decodeTableWindow(allocator, buf.items));
+}
+
+test "window rows round trip through encode and decode" {
+    const allocator = std.testing.allocator;
+    var rows = [_]rowmod.Row{ rowmod.Row.init(allocator), rowmod.Row.init(allocator) };
+    defer for (&rows) |*r| r.deinit();
+    try rows[0].set("city", .{ .text = "warsaw" });
+    try rows[1].set("city", .{ .text = "krakow" });
+
+    var values0 = [_]rowmod.Value{.{ .int = 1 }};
+    var values1 = [_]rowmod.Value{.{ .int = 2 }};
+    const windowRows = [_]WindowRow{
+        .{ .row = rows[0], .values = &values0 },
+        .{ .row = rows[1], .values = &values1 },
+    };
+    const payload = try encodeWindowRows(allocator, &windowRows);
+    defer allocator.free(payload);
+
+    const decoded = try decodeWindowRows(allocator, payload);
+    defer freeWindowRows(allocator, decoded);
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.len);
+    try std.testing.expectEqualStrings("warsaw", decoded[0].row.get("city").?.text);
+    try std.testing.expectEqual(@as(usize, 1), decoded[0].values.len);
+    try std.testing.expectEqual(@as(i64, 1), decoded[0].values[0].int);
+    try std.testing.expectEqualStrings("krakow", decoded[1].row.get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 2), decoded[1].values[0].int);
+}
+
+test "window rows round trip MULTIPLE values per row, same order as the request's specs" {
+    const allocator = std.testing.allocator;
+    var rows = [_]rowmod.Row{rowmod.Row.init(allocator)};
+    defer for (&rows) |*r| r.deinit();
+    try rows[0].set("city", .{ .text = "warsaw" });
+
+    var values0 = [_]rowmod.Value{ .{ .int = 30 }, .{ .float = 15.0 }, .{ .int = 1 } };
+    const windowRows = [_]WindowRow{.{ .row = rows[0], .values = &values0 }};
+    const payload = try encodeWindowRows(allocator, &windowRows);
+    defer allocator.free(payload);
+
+    const decoded = try decodeWindowRows(allocator, payload);
+    defer freeWindowRows(allocator, decoded);
+
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqual(@as(usize, 3), decoded[0].values.len);
+    try std.testing.expectEqual(@as(i64, 30), decoded[0].values[0].int);
+    try std.testing.expectEqual(@as(f64, 15.0), decoded[0].values[1].float);
+    try std.testing.expectEqual(@as(i64, 1), decoded[0].values[2].int);
+}
+
+test "empty window row list round trips" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeWindowRows(allocator, &[_]WindowRow{});
+    defer allocator.free(payload);
+    const decoded = try decodeWindowRows(allocator, payload);
+    defer freeWindowRows(allocator, decoded);
+    try std.testing.expectEqual(@as(usize, 0), decoded.len);
+}
+
+test "subscribe args round trip a multi-channel list" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeSubscribe(allocator, &.{ "orders", "alerts" });
+    defer allocator.free(payload);
+
+    const args = try decodeSubscribe(allocator, payload);
+    defer args.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), args.channels.len);
+    try std.testing.expectEqualStrings("orders", args.channels[0]);
+    try std.testing.expectEqualStrings("alerts", args.channels[1]);
+}
+
+test "subscribe args round trip an empty channel list" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeSubscribe(allocator, &.{});
+    defer allocator.free(payload);
+
+    const args = try decodeSubscribe(allocator, payload);
+    defer args.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), args.channels.len);
+}
+
+test "decodeSubscribe rejects a truncated channel count" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.Malformed, decodeSubscribe(allocator, &.{ 0, 0 }));
+}
+
+test "decodeSubscribe rejects a channel count larger than the payload can hold" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU32(5);
+    try std.testing.expectError(error.Malformed, decodeSubscribe(allocator, buf.items));
+}
+
+test "subscribe ack round trips a subscriber id and channel count" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeSubscribeAck(allocator, 42, 3);
+    defer allocator.free(payload);
+    const ack = try decodeSubscribeAck(payload);
+    try std.testing.expectEqual(@as(u64, 42), ack.subscriberId);
+    try std.testing.expectEqual(@as(u32, 3), ack.channelCount);
+}
+
+test "unsubscribe args round trip a subscriber id and multi-channel list" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeUnsubscribe(allocator, 7, &.{ "orders", "alerts" });
+    defer allocator.free(payload);
+
+    const args = try decodeUnsubscribe(allocator, payload);
+    defer args.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 7), args.subscriberId);
+    try std.testing.expectEqual(@as(usize, 2), args.channels.len);
+    try std.testing.expectEqualStrings("orders", args.channels[0]);
+    try std.testing.expectEqualStrings("alerts", args.channels[1]);
+}
+
+test "unsubscribe args round trip an empty channel list" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeUnsubscribe(allocator, 1, &.{});
+    defer allocator.free(payload);
+
+    const args = try decodeUnsubscribe(allocator, payload);
+    defer args.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), args.channels.len);
+}
+
+test "decodeUnsubscribe rejects a truncated channel count" {
+    const allocator = std.testing.allocator;
+    // 8 bytes of subscriber id, then only 2 of the 4 count bytes.
+    try std.testing.expectError(error.Malformed, decodeUnsubscribe(allocator, &.{ 0, 0, 0, 0, 0, 0, 0, 1, 0, 0 }));
+}
+
+test "decodeUnsubscribe rejects a channel count larger than the payload can hold" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try w.putU64(1);
+    try w.putU32(5);
+    try std.testing.expectError(error.Malformed, decodeUnsubscribe(allocator, buf.items));
+}
+
+test "unsubscribe result round trips a removed count, including zero" {
+    const allocator = std.testing.allocator;
+    const zero = try encodeUnsubscribeResult(allocator, 0);
+    defer allocator.free(zero);
+    try std.testing.expectEqual(@as(u32, 0), try decodeUnsubscribeResult(zero));
+
+    const some = try encodeUnsubscribeResult(allocator, 2);
+    defer allocator.free(some);
+    try std.testing.expectEqual(@as(u32, 2), try decodeUnsubscribeResult(some));
+}
+
+test "publish args round trip a channel and a binary-safe message" {
+    const allocator = std.testing.allocator;
+    const message = [_]u8{ 0, 1, 2, 0, 255 };
+    const payload = try encodePublish(allocator, "orders", &message);
+    defer allocator.free(payload);
+
+    const args = try decodePublish(payload);
+    try std.testing.expectEqualStrings("orders", args.channel);
+    try std.testing.expectEqualSlices(u8, &message, args.message);
+}
+
+test "publish result round trips a subscriber count, including zero" {
+    const allocator = std.testing.allocator;
+    const payload = try encodePublishResult(allocator, 0);
+    defer allocator.free(payload);
+    try std.testing.expectEqual(@as(u64, 0), try decodePublishResult(payload));
+
+    const payload2 = try encodePublishResult(allocator, 7);
+    defer allocator.free(payload2);
+    try std.testing.expectEqual(@as(u64, 7), try decodePublishResult(payload2));
+}
+
+test "pubsub message round trips channel and payload as independent owned copies" {
+    const allocator = std.testing.allocator;
+    const payload = try encodePubSubMessage(allocator, "alerts", "disk full");
+    defer allocator.free(payload);
+
+    const decoded = try decodePubSubMessage(allocator, payload);
+    defer decoded.deinit(allocator);
+
+    try std.testing.expectEqualStrings("alerts", decoded.channel);
+    try std.testing.expectEqualStrings("disk full", decoded.payload);
+}
+
+test "pubsub message round trips an empty payload" {
+    const allocator = std.testing.allocator;
+    const payload = try encodePubSubMessage(allocator, "ch", "");
+    defer allocator.free(payload);
+
+    const decoded = try decodePubSubMessage(allocator, payload);
+    defer decoded.deinit(allocator);
+
+    try std.testing.expectEqualStrings("ch", decoded.channel);
+    try std.testing.expectEqual(@as(usize, 0), decoded.payload.len);
+}
+
+test "table_window args round trip a lag spec with a nonzero offset and an int default" {
+    const allocator = std.testing.allocator;
+    const specs = [_]windowmod.WindowSpec{.{ .field = "amount", .kind = .lag, .offset = 3, .default = .{ .int = -1 } }};
+    const order = [_]querymod.OrderBy{.{ .field = "day" }};
+    const payload = try encodeTableWindow(allocator, "orders", &specs, &.{}, &order, 0, 0, "", .rows);
+    defer allocator.free(payload);
+    const args = try decodeTableWindow(allocator, payload);
+    defer allocator.free(args.specs);
+    defer allocator.free(args.partitionBy);
+    defer allocator.free(args.orderBy);
+
+    try std.testing.expectEqual(@as(usize, 1), args.specs.len);
+    try std.testing.expectEqual(windowmod.WindowKind.lag, args.specs[0].kind);
+    try std.testing.expectEqualStrings("amount", args.specs[0].field);
+    try std.testing.expectEqual(@as(u64, 3), args.specs[0].offset);
+    try std.testing.expectEqual(@as(i64, -1), args.specs[0].default.int);
+}
+
+test "table_window args round trip a lead spec with its default text and default offset of 1" {
+    const allocator = std.testing.allocator;
+    const specs = [_]windowmod.WindowSpec{.{ .field = "status", .kind = .lead, .default = .{ .text = "none-yet" } }};
+    const payload = try encodeTableWindow(allocator, "orders", &specs, &.{}, &.{}, 0, 0, "", .rows);
+    defer allocator.free(payload);
+    const args = try decodeTableWindow(allocator, payload);
+    defer allocator.free(args.specs);
+    defer allocator.free(args.partitionBy);
+    defer allocator.free(args.orderBy);
+
+    try std.testing.expectEqual(windowmod.WindowKind.lead, args.specs[0].kind);
+    try std.testing.expectEqual(@as(u64, 1), args.specs[0].offset);
+    try std.testing.expectEqualStrings("none-yet", args.specs[0].default.text);
+}
+
+test "table_window args round trip lag/lead alongside a plain sum spec in the same request" {
+    const allocator = std.testing.allocator;
+    const specs = [_]windowmod.WindowSpec{
+        .{ .field = "amount", .kind = .sum },
+        .{ .field = "amount", .kind = .lag, .offset = 2 },
+        .{ .field = "amount", .kind = .lead },
+    };
+    const payload = try encodeTableWindow(allocator, "orders", &specs, &.{}, &.{}, 0, 0, "", .rows);
+    defer allocator.free(payload);
+    const args = try decodeTableWindow(allocator, payload);
+    defer allocator.free(args.specs);
+    defer allocator.free(args.partitionBy);
+    defer allocator.free(args.orderBy);
+
+    try std.testing.expectEqual(@as(usize, 3), args.specs.len);
+    try std.testing.expectEqual(windowmod.WindowKind.sum, args.specs[0].kind);
+    try std.testing.expectEqual(windowmod.WindowKind.lag, args.specs[1].kind);
+    try std.testing.expectEqual(@as(u64, 2), args.specs[1].offset);
+    try std.testing.expectEqual(windowmod.WindowKind.lead, args.specs[2].kind);
+    try std.testing.expectEqual(@as(u64, 1), args.specs[2].offset);
+}
+
+test "table_window args round trip an nth_value spec with its position and a custom default" {
+    const allocator = std.testing.allocator;
+    const specs = [_]windowmod.WindowSpec{.{ .field = "amount", .kind = .nth_value, .offset = 2, .default = .{ .int = -1 } }};
+    const order = [_]querymod.OrderBy{.{ .field = "day" }};
+    const payload = try encodeTableWindow(allocator, "orders", &specs, &.{}, &order, 0, 0, "", .range);
+    defer allocator.free(payload);
+    const args = try decodeTableWindow(allocator, payload);
+    defer allocator.free(args.specs);
+    defer allocator.free(args.partitionBy);
+    defer allocator.free(args.orderBy);
+
+    try std.testing.expectEqual(@as(usize, 1), args.specs.len);
+    try std.testing.expectEqual(windowmod.WindowKind.nth_value, args.specs[0].kind);
+    try std.testing.expectEqualStrings("amount", args.specs[0].field);
+    try std.testing.expectEqual(@as(u64, 2), args.specs[0].offset);
+    try std.testing.expectEqual(@as(i64, -1), args.specs[0].default.int);
+}
+
+test "table_window args round trip nth_value alongside lag/lead/sum in the same request" {
+    const allocator = std.testing.allocator;
+    const specs = [_]windowmod.WindowSpec{
+        .{ .field = "amount", .kind = .sum },
+        .{ .field = "amount", .kind = .nth_value, .offset = 3 },
+        .{ .field = "amount", .kind = .lag },
+    };
+    const payload = try encodeTableWindow(allocator, "orders", &specs, &.{}, &.{}, 0, 0, "", .rows);
+    defer allocator.free(payload);
+    const args = try decodeTableWindow(allocator, payload);
+    defer allocator.free(args.specs);
+    defer allocator.free(args.partitionBy);
+    defer allocator.free(args.orderBy);
+
+    try std.testing.expectEqual(@as(usize, 3), args.specs.len);
+    try std.testing.expectEqual(windowmod.WindowKind.sum, args.specs[0].kind);
+    try std.testing.expectEqual(windowmod.WindowKind.nth_value, args.specs[1].kind);
+    try std.testing.expectEqual(@as(u64, 3), args.specs[1].offset);
+    try std.testing.expectEqual(windowmod.WindowKind.lag, args.specs[2].kind);
+}
+
+test "decodeTableWindow rejects a truncated nth_value default value instead of misreading trailing bytes" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, "orders");
+    try w.byte(1); // one spec
+    try w.byte(@intFromEnum(windowmod.WindowKind.nth_value));
+    try putLenPrefixed(w, "amount");
+    try w.putU64(2); // n
+    try w.byte(@intFromEnum(rowmod.ValueTag.int)); // default tag says int...
+    // ...but the 8-byte payload is missing entirely.
+
+    try std.testing.expectError(error.Malformed, decodeTableWindow(allocator, buf.items));
+}
+
+test "decodeTableWindow rejects a truncated lag/lead default value instead of misreading trailing bytes" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    const w = encode.ByteWriter.init(&buf);
+    try putLenPrefixed(w, "orders");
+    try w.byte(1); // one spec
+    try w.byte(@intFromEnum(windowmod.WindowKind.lag));
+    try putLenPrefixed(w, "amount");
+    try w.putU64(1); // offset
+    try w.byte(@intFromEnum(rowmod.ValueTag.text)); // default tag says text...
+    // ...but the length-prefixed payload is missing entirely.
+
+    try std.testing.expectError(error.Malformed, decodeTableWindow(allocator, buf.items));
+}
