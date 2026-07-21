@@ -2065,3 +2065,319 @@ test "selectPageOrdered with an empty order-by falls through to selectPage's ear
     for (ordered, plain) |o, p| try std.testing.expectEqual(o.get(pkField).?.int, p.get(pkField).?.int);
 }
 
+test "createCompositeIndex backfills then full-tuple eq select uses it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 30 } },
+    });
+    try table.put(.{ .int = 2 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 40 } },
+    });
+    try table.put(.{ .int = 3 }, &.{
+        .{ .name = "city", .value = .{ .text = "krakow" } },
+        .{ .name = "age", .value = .{ .int = 30 } },
+    });
+
+    try table.createCompositeIndex("city_age", &.{ "city", "age" });
+    try std.testing.expect(table.hasCompositeIndex("city_age"));
+
+    const preds = [_]Predicate{
+        .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+        .{ .eq = .{ .field = "age", .value = .{ .int = 30 } } },
+    };
+    const results = try table.select(.{ .and_ = &preds });
+    defer freeRows(allocator, results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(i64, 1), results[0].get(pkField).?.int);
+}
+
+test "composite index leftmost prefix narrows without constraining every column" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createCompositeIndex("city_age", &.{ "city", "age" });
+
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 30 } },
+    });
+    try table.put(.{ .int = 2 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 40 } },
+    });
+    try table.put(.{ .int = 3 }, &.{
+        .{ .name = "city", .value = .{ .text = "krakow" } },
+        .{ .name = "age", .value = .{ .int = 50 } },
+    });
+
+    // Only the leading column is constrained - the composite index must
+    // still narrow the scan to the two warsaw rows via its leftmost prefix,
+    // and the (unindexed-alone) age column is unconstrained here.
+    const results = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
+    defer freeRows(allocator, results);
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "composite index uses a range bound on the column after the matched prefix" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createCompositeIndex("city_age", &.{ "city", "age" });
+
+    var age: i64 = 20;
+    while (age < 30) : (age += 1) {
+        try table.put(.{ .int = age }, &.{
+            .{ .name = "city", .value = .{ .text = "warsaw" } },
+            .{ .name = "age", .value = .{ .int = age } },
+        });
+        try table.put(.{ .int = age + 100 }, &.{
+            .{ .name = "city", .value = .{ .text = "krakow" } },
+            .{ .name = "age", .value = .{ .int = age } },
+        });
+    }
+
+    // city == "warsaw" and 23 <= age < 27: must stay inside the warsaw
+    // bucket of the composite index even though krakow rows overlap the
+    // same age range byte-for-byte.
+    const preds = [_]Predicate{
+        .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+        .{ .gte = .{ .field = "age", .value = .{ .int = 23 } } },
+        .{ .lt = .{ .field = "age", .value = .{ .int = 27 } } },
+    };
+    const results = try table.select(.{ .and_ = &preds });
+    defer freeRows(allocator, results);
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    for (results) |r| {
+        try std.testing.expectEqualStrings("warsaw", r.get("city").?.text);
+        try std.testing.expect(r.get("age").?.int >= 23 and r.get("age").?.int < 27);
+    }
+
+    // A one-sided range (age > 27) narrows the same way.
+    const openPreds = [_]Predicate{
+        .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+        .{ .gt = .{ .field = "age", .value = .{ .int = 27 } } },
+    };
+    const openResults = try table.select(.{ .and_ = &openPreds });
+    defer freeRows(allocator, openResults);
+    try std.testing.expectEqual(@as(usize, 2), openResults.len);
+    for (openResults) |r| {
+        try std.testing.expectEqualStrings("warsaw", r.get("city").?.text);
+        try std.testing.expect(r.get("age").?.int > 27);
+    }
+}
+
+test "composite index stays in sync across update and delete" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createCompositeIndex("city_age", &.{ "city", "age" });
+
+    const preds = [_]Predicate{
+        .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+        .{ .eq = .{ .field = "age", .value = .{ .int = 30 } } },
+    };
+    const pred = Predicate{ .and_ = &preds };
+
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 30 } },
+    });
+    {
+        const found = try table.select(pred);
+        defer freeRows(allocator, found);
+        try std.testing.expectEqual(@as(usize, 1), found.len);
+    }
+
+    // Moving age away from 30 must drop the old composite entry.
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 31 } },
+    });
+    {
+        const stale = try table.select(pred);
+        defer freeRows(allocator, stale);
+        try std.testing.expectEqual(@as(usize, 0), stale.len);
+    }
+
+    // A row missing one of the composite columns entirely must not produce
+    // a (partial, ill-formed) entry: the put must still succeed, and the
+    // row must never surface as a false match on any age value including
+    // its own current (missing) one.
+    try table.put(.{ .int = 2 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+    {
+        const wholeTable = try table.select(null);
+        defer freeRows(allocator, wholeTable);
+        try std.testing.expectEqual(@as(usize, 2), wholeTable.len);
+
+        const ageless = [_]Predicate{
+            .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+            .{ .eq = .{ .field = "age", .value = .{ .int = 31 } } },
+        };
+        const noMatch = try table.select(.{ .and_ = &ageless });
+        defer freeRows(allocator, noMatch);
+        try std.testing.expectEqual(@as(usize, 1), noMatch.len);
+        try std.testing.expectEqual(@as(i64, 1), noMatch[0].get(pkField).?.int);
+    }
+
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 30 } },
+    });
+    try table.delete(.{ .int = 1 });
+    {
+        const afterDelete = try table.select(pred);
+        defer freeRows(allocator, afterDelete);
+        try std.testing.expectEqual(@as(usize, 0), afterDelete.len);
+    }
+}
+
+test "dropCompositeIndex removes entries and falls back to full scan" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createCompositeIndex("city_age", &.{ "city", "age" });
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 30 } },
+    });
+
+    try table.dropCompositeIndex("city_age");
+    try std.testing.expect(!table.hasCompositeIndex("city_age"));
+
+    const preds = [_]Predicate{
+        .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+        .{ .eq = .{ .field = "age", .value = .{ .int = 30 } } },
+    };
+    const results = try table.select(.{ .and_ = &preds });
+    defer freeRows(allocator, results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+}
+
+test "createCompositeIndex rejects bad field counts and identifiers" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+
+    try std.testing.expectError(error.InvalidCompositeIndex, table.createCompositeIndex("solo", &.{"city"}));
+    try std.testing.expectError(error.InvalidIdentifier, table.createCompositeIndex("bad\x00name", &.{ "city", "age" }));
+    try std.testing.expectError(error.InvalidIdentifier, table.createCompositeIndex("ok", &.{ "city", "bad\x00field" }));
+}
+
+test "composite index survives a table reopen (persisted across process restart)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    {
+        var table = try Table.open(&db, allocator, "users");
+        defer table.deinit();
+        try table.createCompositeIndex("city_age", &.{ "city", "age" });
+        try table.put(.{ .int = 1 }, &.{
+            .{ .name = "city", .value = .{ .text = "warsaw" } },
+            .{ .name = "age", .value = .{ .int = 30 } },
+        });
+    }
+
+    var reopened = try Table.open(&db, allocator, "users");
+    defer reopened.deinit();
+    try std.testing.expect(reopened.hasCompositeIndex("city_age"));
+
+    const preds = [_]Predicate{
+        .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+        .{ .eq = .{ .field = "age", .value = .{ .int = 30 } } },
+    };
+    const results = try reopened.select(.{ .and_ = &preds });
+    defer freeRows(allocator, results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+}
+
+test "explain reports full_scan for a null predicate and an unindexed field" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+
+    var noPred = try table.explain(allocator, null);
+    defer noPred.deinit(allocator);
+    try std.testing.expectEqual(PlanKind.full_scan, noPred.kind);
+    try std.testing.expect(noPred.indexName == null);
+
+    var unindexed = try table.explain(allocator, .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
+    defer unindexed.deinit(allocator);
+    try std.testing.expectEqual(PlanKind.full_scan, unindexed.kind);
+}
+
+test "explain reports index_eq and index_range for a single-field index" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "events");
+    defer table.deinit();
+    try table.createIndex("score");
+    try table.put(.{ .int = 1 }, &.{.{ .name = "score", .value = .{ .int = 5 } }});
+
+    var eqPlan = try table.explain(allocator, .{ .eq = .{ .field = "score", .value = .{ .int = 5 } } });
+    defer eqPlan.deinit(allocator);
+    try std.testing.expectEqual(PlanKind.index_eq, eqPlan.kind);
+    try std.testing.expectEqualStrings("score", eqPlan.indexName.?);
+    try std.testing.expectEqual(@as(usize, 1), eqPlan.matchedFields);
+    try std.testing.expectEqual(@as(usize, 1), eqPlan.totalFields);
+
+    var rangePlan = try table.explain(allocator, .{ .gte = .{ .field = "score", .value = .{ .int = 5 } } });
+    defer rangePlan.deinit(allocator);
+    try std.testing.expectEqual(PlanKind.index_range, rangePlan.kind);
+    try std.testing.expectEqualStrings("score", rangePlan.indexName.?);
+}
+
+test "explain reports composite_eq and composite_range with matched/total field counts" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
