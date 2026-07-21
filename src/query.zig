@@ -2381,3 +2381,323 @@ test "explain reports composite_eq and composite_range with matched/total field 
     var db = try openTemp(&tmp, allocator);
     defer db.close();
 
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createCompositeIndex("city_age", &.{ "city", "age" });
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 30 } },
+    });
+
+    // Only the leading column pinned -> composite_eq over a strict prefix
+    // (matchedFields 1 of 2). `findCompositeMatch` only looks inside a
+    // top-level `and_` (see its doc comment), so a bare single `eq` outside
+    // one does not reach the composite index at all - wrapping in `and_`
+    // with itself as the sole conjunct is what actually exercises the
+    // leftmost-prefix match here.
+    const prefixPreds = [_]Predicate{
+        .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+    };
+    var prefixOnly = try table.explain(allocator, .{ .and_ = &prefixPreds });
+    defer prefixOnly.deinit(allocator);
+    try std.testing.expectEqual(PlanKind.composite_eq, prefixOnly.kind);
+    try std.testing.expectEqualStrings("city_age", prefixOnly.indexName.?);
+    try std.testing.expectEqual(@as(usize, 1), prefixOnly.matchedFields);
+    try std.testing.expectEqual(@as(usize, 2), prefixOnly.totalFields);
+
+    // Both columns pinned by equality -> composite_eq, fully matched.
+    const eqPreds = [_]Predicate{
+        .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+        .{ .eq = .{ .field = "age", .value = .{ .int = 30 } } },
+    };
+    var fullEq = try table.explain(allocator, .{ .and_ = &eqPreds });
+    defer fullEq.deinit(allocator);
+    try std.testing.expectEqual(PlanKind.composite_eq, fullEq.kind);
+    try std.testing.expectEqual(@as(usize, 2), fullEq.matchedFields);
+
+    // Leading column pinned by equality, next column range-bound -> composite_range.
+    const rangePreds = [_]Predicate{
+        .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+        .{ .gte = .{ .field = "age", .value = .{ .int = 18 } } },
+    };
+    var rangeMatch = try table.explain(allocator, .{ .and_ = &rangePreds });
+    defer rangeMatch.deinit(allocator);
+    try std.testing.expectEqual(PlanKind.composite_range, rangeMatch.kind);
+    try std.testing.expectEqualStrings("city_age", rangeMatch.indexName.?);
+    try std.testing.expectEqual(@as(usize, 1), rangeMatch.matchedFields);
+}
+
+test "explain never mutates the table (const receiver, no rows touched)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createIndex("city");
+    try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+
+    const pred = Predicate{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } };
+    const constTable: *const Table = &table;
+    var plan = try constTable.explain(allocator, pred);
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(PlanKind.index_eq, plan.kind);
+
+    // The row explain() was asked about is still there afterwards.
+    const rows = try table.select(pred);
+    defer freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+}
+
+test "updateWhere applies a set clause to every matching row and reports the count" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.put(.{ .int = 1 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "active", .value = .{ .int = 0 } } });
+    try table.put(.{ .int = 2 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "active", .value = .{ .int = 0 } } });
+    try table.put(.{ .int = 3 }, &.{ .{ .name = "city", .value = .{ .text = "krakow" } }, .{ .name = "active", .value = .{ .int = 0 } } });
+
+    const pred = Predicate{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } };
+    const updated = try table.updateWhere(pred, &.{.{ .name = "active", .value = .{ .int = 1 } }});
+    try std.testing.expectEqual(@as(usize, 2), updated);
+
+    var row1 = (try table.get(.{ .int = 1 })).?;
+    defer row1.deinit();
+    try std.testing.expectEqual(Value{ .int = 1 }, row1.get("active").?);
+    try std.testing.expectEqualStrings("warsaw", row1.get("city").?.text);
+
+    var row3 = (try table.get(.{ .int = 3 })).?;
+    defer row3.deinit();
+    try std.testing.expectEqual(Value{ .int = 0 }, row3.get("active").?);
+}
+
+test "updateWhere with a null predicate touches every row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "counters");
+    defer table.deinit();
+    try table.put(.{ .int = 1 }, &.{.{ .name = "n", .value = .{ .int = 5 } }});
+    try table.put(.{ .int = 2 }, &.{.{ .name = "n", .value = .{ .int = 7 } }});
+
+    const updated = try table.updateWhere(null, &.{.{ .name = "flag", .value = .{ .text = "seen" } }});
+    try std.testing.expectEqual(@as(usize, 2), updated);
+
+    var row1 = (try table.get(.{ .int = 1 })).?;
+    defer row1.deinit();
+    try std.testing.expectEqualStrings("seen", row1.get("flag").?.text);
+    // Untouched fields survive the merge.
+    try std.testing.expectEqual(Value{ .int = 5 }, row1.get("n").?);
+}
+
+test "updateWhere adds a brand new field a matched row never had" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+
+    _ = try table.updateWhere(null, &.{.{ .name = "tier", .value = .{ .text = "gold" } }});
+
+    var row = (try table.get(.{ .int = 1 })).?;
+    defer row.deinit();
+    try std.testing.expectEqualStrings("gold", row.get("tier").?.text);
+    try std.testing.expectEqualStrings("warsaw", row.get("city").?.text);
+}
+
+test "updateWhere keeps a secondary index in sync when the indexed field changes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createIndex("city");
+    try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+
+    const updated = try table.updateWhere(
+        .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+        &.{.{ .name = "city", .value = .{ .text = "krakow" } }},
+    );
+    try std.testing.expectEqual(@as(usize, 1), updated);
+
+    // The stale index entry is gone, a fresh one under the new value works,
+    // and explain() confirms the index (not a full scan) still serves it.
+    const stale = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
+    defer freeRows(allocator, stale);
+    try std.testing.expectEqual(@as(usize, 0), stale.len);
+
+    const fresh = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "krakow" } } });
+    defer freeRows(allocator, fresh);
+    try std.testing.expectEqual(@as(usize, 1), fresh.len);
+
+    const constTable: *const Table = &table;
+    var plan = try constTable.explain(allocator, .{ .eq = .{ .field = "city", .value = .{ .text = "krakow" } } });
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(PlanKind.index_eq, plan.kind);
+}
+
+test "updateWhere keeps a composite index in sync across leading and trailing column moves" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createCompositeIndex("city_age", &.{ "city", "age" });
+
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 30 } },
+        .{ .name = "name", .value = .{ .text = "alice" } },
+    });
+    try table.put(.{ .int = 2 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 31 } },
+        .{ .name = "name", .value = .{ .text = "bob" } },
+    });
+    try table.put(.{ .int = 3 }, &.{
+        .{ .name = "city", .value = .{ .text = "krakow" } },
+        .{ .name = "age", .value = .{ .int = 30 } },
+        .{ .name = "name", .value = .{ .text = "carol" } },
+    });
+    try table.put(.{ .int = 4 }, &.{
+        .{ .name = "city", .value = .{ .text = "krakow" } },
+        .{ .name = "age", .value = .{ .int = 40 } },
+        .{ .name = "name", .value = .{ .text = "dave" } },
+    });
+
+    // updateWhere matched through the composite index (both columns pinned
+    // by equality) moves the TRAILING column (age). The old composite entry
+    // for row 1 must vanish and a fresh one under the new age must serve it.
+    {
+        const preds = [_]Predicate{
+            .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+            .{ .eq = .{ .field = "age", .value = .{ .int = 30 } } },
+        };
+        const updated = try table.updateWhere(
+            .{ .and_ = &preds },
+            &.{.{ .name = "age", .value = .{ .int = 45 } }},
+        );
+        try std.testing.expectEqual(@as(usize, 1), updated);
+    }
+    {
+        const stalePreds = [_]Predicate{
+            .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+            .{ .eq = .{ .field = "age", .value = .{ .int = 30 } } },
+        };
+        const stale = try table.select(.{ .and_ = &stalePreds });
+        defer freeRows(allocator, stale);
+        try std.testing.expectEqual(@as(usize, 0), stale.len);
+
+        const freshPreds = [_]Predicate{
+            .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+            .{ .eq = .{ .field = "age", .value = .{ .int = 45 } } },
+        };
+        const fresh = try table.select(.{ .and_ = &freshPreds });
+        defer freeRows(allocator, fresh);
+        try std.testing.expectEqual(@as(usize, 1), fresh.len);
+        try std.testing.expectEqual(@as(i64, 1), fresh[0].get(pkField).?.int);
+
+        const constTable: *const Table = &table;
+        var plan = try constTable.explain(allocator, .{ .and_ = &freshPreds });
+        defer plan.deinit(allocator);
+        try std.testing.expectEqual(PlanKind.composite_eq, plan.kind);
+        try std.testing.expectEqualStrings("city_age", plan.indexName.?);
+        try std.testing.expectEqual(@as(usize, 2), plan.matchedFields);
+    }
+
+    // Same check but moving the LEADING column (city) instead of the
+    // trailing one - a different code path in the composite key encoding
+    // (the prefix itself shifts, not just the suffix).
+    {
+        const preds = [_]Predicate{
+            .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+            .{ .eq = .{ .field = "age", .value = .{ .int = 31 } } },
+        };
+        const updated = try table.updateWhere(
+            .{ .and_ = &preds },
+            &.{.{ .name = "city", .value = .{ .text = "gdansk" } }},
+        );
+        try std.testing.expectEqual(@as(usize, 1), updated);
+    }
+    {
+        const stalePreds = [_]Predicate{
+            .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+            .{ .eq = .{ .field = "age", .value = .{ .int = 31 } } },
+        };
+        const stale = try table.select(.{ .and_ = &stalePreds });
+        defer freeRows(allocator, stale);
+        try std.testing.expectEqual(@as(usize, 0), stale.len);
+
+        const freshPreds = [_]Predicate{
+            .{ .eq = .{ .field = "city", .value = .{ .text = "gdansk" } } },
+            .{ .eq = .{ .field = "age", .value = .{ .int = 31 } } },
+        };
+        const fresh = try table.select(.{ .and_ = &freshPreds });
+        defer freeRows(allocator, fresh);
+        try std.testing.expectEqual(@as(usize, 1), fresh.len);
+        try std.testing.expectEqual(@as(i64, 2), fresh[0].get(pkField).?.int);
+    }
+
+    // updateWhere reached through composite_range (leading column pinned by
+    // equality, trailing column range-bound) must update every row the
+    // range covers, and leave the composite index able to keep serving
+    // both afterwards even though only the unindexed "name" field changed.
+    {
+        const rangePreds = [_]Predicate{
+            .{ .eq = .{ .field = "city", .value = .{ .text = "krakow" } } },
+            .{ .gte = .{ .field = "age", .value = .{ .int = 30 } } },
+        };
+        const constTable: *const Table = &table;
+        var rangePlan = try constTable.explain(allocator, .{ .and_ = &rangePreds });
+        defer rangePlan.deinit(allocator);
+        try std.testing.expectEqual(PlanKind.composite_range, rangePlan.kind);
+        try std.testing.expectEqualStrings("city_age", rangePlan.indexName.?);
+
+        const updated = try table.updateWhere(
+            .{ .and_ = &rangePreds },
+            &.{.{ .name = "name", .value = .{ .text = "updated" } }},
+        );
+        try std.testing.expectEqual(@as(usize, 2), updated);
+    }
+
+    // Final sanity sweep: every row is still reachable through the
+    // composite index under exactly its current (city, age), nothing was
+    // lost, duplicated, or left under a stale key.
+    const expectations = [_]struct { pk: i64, city: []const u8, age: i64, name: []const u8 }{
+        .{ .pk = 1, .city = "warsaw", .age = 45, .name = "alice" },
+        .{ .pk = 2, .city = "gdansk", .age = 31, .name = "bob" },
+        .{ .pk = 3, .city = "krakow", .age = 30, .name = "updated" },
+        .{ .pk = 4, .city = "krakow", .age = 40, .name = "updated" },
+    };
+    for (expectations) |exp| {
+        const preds = [_]Predicate{
+            .{ .eq = .{ .field = "city", .value = .{ .text = exp.city } } },
+            .{ .eq = .{ .field = "age", .value = .{ .int = exp.age } } },
+        };
+        const rows = try table.select(.{ .and_ = &preds });
+        defer freeRows(allocator, rows);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqual(exp.pk, rows[0].get(pkField).?.int);
+        try std.testing.expectEqualStrings(exp.name, rows[0].get("name").?.text);
+    }
+
