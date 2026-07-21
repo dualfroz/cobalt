@@ -3498,3 +3498,371 @@ test "a self-referencing foreign key restricts renaming a UNIQUE field still tar
     try std.testing.expectEqualStrings("B1-NEW", renamed.get("badge").?.text);
 }
 
+test "createCheckConstraint rejects a row that violates it and accepts one that satisfies it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createCheckConstraint("qty_positive", "qty gt i:0");
+    try std.testing.expect(orders.hasCheckConstraint("qty_positive"));
+
+    try orders.put(.{ .int = 1 }, &.{.{ .name = "qty", .value = .{ .int = 5 } }});
+    try std.testing.expectError(error.CheckViolation, orders.put(.{ .int = 2 }, &.{
+        .{ .name = "qty", .value = .{ .int = 0 } },
+    }));
+    try std.testing.expectError(error.CheckViolation, orders.put(.{ .int = 3 }, &.{
+        .{ .name = "qty", .value = .{ .int = -1 } },
+    }));
+}
+
+test "createCheckConstraint refuses to install over existing rows that already fail it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.put(.{ .int = 1 }, &.{.{ .name = "qty", .value = .{ .int = -5 } }});
+
+    try std.testing.expectError(error.CheckViolation, orders.createCheckConstraint("qty_positive", "qty gt i:0"));
+    try std.testing.expect(!orders.hasCheckConstraint("qty_positive"));
+}
+
+test "createCheckConstraint rejects a malformed expression before persisting anything" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try std.testing.expectError(error.InvalidCheckExpression, orders.createCheckConstraint("bad", "qty gt"));
+    try std.testing.expect(!orders.hasCheckConstraint("bad"));
+}
+
+test "dropCheckConstraint lifts the constraint, and a check constraint survives a table reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    {
+        var orders = try Table.open(&db, allocator, "orders");
+        defer orders.deinit();
+        try orders.createCheckConstraint("qty_positive", "qty gt i:0");
+    }
+
+    var reopened = try Table.open(&db, allocator, "orders");
+    defer reopened.deinit();
+    try std.testing.expect(reopened.hasCheckConstraint("qty_positive"));
+    try std.testing.expectError(error.CheckViolation, reopened.put(.{ .int = 1 }, &.{
+        .{ .name = "qty", .value = .{ .int = 0 } },
+    }));
+
+    try reopened.dropCheckConstraint("qty_positive");
+    try std.testing.expect(!reopened.hasCheckConstraint("qty_positive"));
+    try reopened.put(.{ .int = 1 }, &.{.{ .name = "qty", .value = .{ .int = 0 } }});
+}
+
+test "a row missing the checked field entirely is exempt (like is_null), but present-and-none is still checked" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createCheckConstraint("qty_known", "qty is_not_null");
+
+    try std.testing.expectError(error.CheckViolation, orders.put(.{ .int = 1 }, &.{}));
+}
+
+test "multiple CHECK constraints on the same table all must pass" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createCheckConstraint("qty_positive", "qty gt i:0");
+    try orders.createCheckConstraint("qty_capped", "qty lt i:1000");
+
+    try orders.put(.{ .int = 1 }, &.{.{ .name = "qty", .value = .{ .int = 500 } }});
+    try std.testing.expectError(error.CheckViolation, orders.put(.{ .int = 2 }, &.{
+        .{ .name = "qty", .value = .{ .int = 1000 } },
+    }));
+}
+
+test "ON DELETE CASCADE removes referencing rows instead of restricting the parent delete" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var customers = try Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+    try customers.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "Ada" } }});
+    try customers.put(.{ .int = 2 }, &.{.{ .name = "name", .value = .{ .text = "Boris" } }});
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createForeignKey("customer_id", "customers", pkField, .cascade);
+    try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
+    try orders.put(.{ .int = 101 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
+    try orders.put(.{ .int = 200 }, &.{.{ .name = "customer_id", .value = .{ .int = 2 } }});
+
+    try customers.delete(.{ .int = 1 });
+
+    try std.testing.expect((try customers.get(.{ .int = 1 })) == null);
+    try std.testing.expect((try orders.get(.{ .int = 100 })) == null);
+    try std.testing.expect((try orders.get(.{ .int = 101 })) == null);
+
+    // Untouched: customer 2 and its own order were never in the cascade's
+    // path.
+    var otherCustomer = (try customers.get(.{ .int = 2 })).?;
+    otherCustomer.deinit();
+    var otherOrder = (try orders.get(.{ .int = 200 })).?;
+    otherOrder.deinit();
+}
+
+test "ON DELETE CASCADE keeps secondary indexes on the cascaded rows in sync" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var customers = try Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+    try customers.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "Ada" } }});
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createIndex("status");
+    try orders.createForeignKey("customer_id", "customers", pkField, .cascade);
+    try orders.put(.{ .int = 100 }, &.{
+        .{ .name = "customer_id", .value = .{ .int = 1 } },
+        .{ .name = "status", .value = .{ .text = "open" } },
+    });
+
+    const before = try idx.scanEq(&db, allocator, "orders", "status", .{ .text = "open" });
+    defer allocator.free(before);
+    try std.testing.expectEqual(@as(usize, 1), before.len);
+
+    try customers.delete(.{ .int = 1 });
+
+    // The cascaded delete went through `executeDelete`, which maintains
+    // secondary indexes exactly like a direct `orders.delete` would - a
+    // stale index entry pointing at a now-gone row would otherwise poison
+    // every future `status = "open"` scan.
+    const after = try idx.scanEq(&db, allocator, "orders", "status", .{ .text = "open" });
+    defer allocator.free(after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "ON DELETE CASCADE recurses transitively across more than one hop" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var customers = try Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+    try customers.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "Ada" } }});
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createForeignKey("customer_id", "customers", pkField, .cascade);
+    try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
+
+    var lineItems = try Table.open(&db, allocator, "line_items");
+    defer lineItems.deinit();
+    try lineItems.createForeignKey("order_id", "orders", pkField, .cascade);
+    try lineItems.put(.{ .int = 1000 }, &.{.{ .name = "order_id", .value = .{ .int = 100 } }});
+    try lineItems.put(.{ .int = 1001 }, &.{.{ .name = "order_id", .value = .{ .int = 100 } }});
+
+    // Deleting the customer must cascade into orders, and from there into
+    // line_items - two hops, not just one.
+    try customers.delete(.{ .int = 1 });
+
+    try std.testing.expect((try customers.get(.{ .int = 1 })) == null);
+    try std.testing.expect((try orders.get(.{ .int = 100 })) == null);
+    try std.testing.expect((try lineItems.get(.{ .int = 1000 })) == null);
+    try std.testing.expect((try lineItems.get(.{ .int = 1001 })) == null);
+}
+
+test "ON DELETE CASCADE is all-or-nothing: a RESTRICT hit anywhere in the fan-out aborts with nothing deleted" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var customers = try Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+    try customers.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "Ada" } }});
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createForeignKey("customer_id", "customers", pkField, .cascade);
+    try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
+
+    // A shipment row RESTRICTs deleting the order it points at - deleting
+    // the customer would need to cascade into this order, but the order
+    // itself cannot legally go while its own restrict-mode reference is
+    // still live.
+    var shipments = try Table.open(&db, allocator, "shipments");
+    defer shipments.deinit();
+    try shipments.createForeignKey("order_id", "orders", pkField, .restrict);
+    try shipments.put(.{ .int = 9000 }, &.{.{ .name = "order_id", .value = .{ .int = 100 } }});
+
+    try std.testing.expectError(error.ForeignKeyInUse, customers.delete(.{ .int = 1 }));
+
+    // Two-phase plan-then-execute means the customer AND the order (which
+    // had already been planned for cascade removal before the restrict
+    // hit further down was discovered) are both still there - not just
+    // the customer.
+    var stillCustomer = (try customers.get(.{ .int = 1 })).?;
+    stillCustomer.deinit();
+    var stillOrder = (try orders.get(.{ .int = 100 })).?;
+    stillOrder.deinit();
+    var stillShipment = (try shipments.get(.{ .int = 9000 })).?;
+    stillShipment.deinit();
+}
+
+test "ON DELETE CASCADE terminates on a two-table delete cycle instead of recursing forever" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    // `a` and `b` each carry a nullable FK at the other, both ON DELETE
+    // CASCADE - a delete starting from either side must not infinite-loop
+    // bouncing back and forth between the two tables.
+    var a = try Table.open(&db, allocator, "a");
+    defer a.deinit();
+    var b = try Table.open(&db, allocator, "b");
+    defer b.deinit();
+
+    try a.put(.{ .int = 1 }, &.{});
+    try b.put(.{ .int = 1 }, &.{.{ .name = "a_id", .value = .{ .int = 1 } }});
+    try a.createForeignKey("b_id", "b", pkField, .cascade);
+    try a.put(.{ .int = 1 }, &.{.{ .name = "b_id", .value = .{ .int = 1 } }});
+    try b.createForeignKey("a_id", "a", pkField, .cascade);
+
+    try a.delete(.{ .int = 1 });
+
+    try std.testing.expect((try a.get(.{ .int = 1 })) == null);
+    try std.testing.expect((try b.get(.{ .int = 1 })) == null);
+}
+
+test "ON DELETE CASCADE on a self-referencing foreign key removes an entire subtree" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var employees = try Table.open(&db, allocator, "employees");
+    defer employees.deinit();
+    try employees.createForeignKey("manager_id", "employees", pkField, .cascade);
+
+    // 1 (CEO) -> 2 (VP) -> 3 and 4 (reports of the VP).
+    try employees.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "CEO" } }});
+    try employees.put(.{ .int = 2 }, &.{
+        .{ .name = "name", .value = .{ .text = "VP" } },
+        .{ .name = "manager_id", .value = .{ .int = 1 } },
+    });
+    try employees.put(.{ .int = 3 }, &.{
+        .{ .name = "name", .value = .{ .text = "IC-A" } },
+        .{ .name = "manager_id", .value = .{ .int = 2 } },
+    });
+    try employees.put(.{ .int = 4 }, &.{
+        .{ .name = "name", .value = .{ .text = "IC-B" } },
+        .{ .name = "manager_id", .value = .{ .int = 2 } },
+    });
+
+    // Deleting the VP must cascade to both reports, but must not touch the
+    // CEO (an ancestor, not a dependent).
+    try employees.delete(.{ .int = 2 });
+
+    var ceo = (try employees.get(.{ .int = 1 })).?;
+    ceo.deinit();
+    try std.testing.expect((try employees.get(.{ .int = 2 })) == null);
+    try std.testing.expect((try employees.get(.{ .int = 3 })) == null);
+    try std.testing.expect((try employees.get(.{ .int = 4 })) == null);
+}
+
+test "deleteWhere cascades every match, not just the first" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var customers = try Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+    try customers.put(.{ .int = 1 }, &.{.{ .name = "region", .value = .{ .text = "eu" } }});
+    try customers.put(.{ .int = 2 }, &.{.{ .name = "region", .value = .{ .text = "eu" } }});
+    try customers.put(.{ .int = 3 }, &.{.{ .name = "region", .value = .{ .text = "us" } }});
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createForeignKey("customer_id", "customers", pkField, .cascade);
+    try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
+    try orders.put(.{ .int = 200 }, &.{.{ .name = "customer_id", .value = .{ .int = 2 } }});
+    try orders.put(.{ .int = 300 }, &.{.{ .name = "customer_id", .value = .{ .int = 3 } }});
+
+    const deleted = try customers.deleteWhere(.{ .eq = .{ .field = "region", .value = .{ .text = "eu" } } });
+    try std.testing.expectEqual(@as(usize, 2), deleted);
+
+    try std.testing.expect((try customers.get(.{ .int = 1 })) == null);
+    try std.testing.expect((try customers.get(.{ .int = 2 })) == null);
+    try std.testing.expect((try orders.get(.{ .int = 100 })) == null);
+    try std.testing.expect((try orders.get(.{ .int = 200 })) == null);
+
+    var stillCustomer = (try customers.get(.{ .int = 3 })).?;
+    stillCustomer.deinit();
+    var stillOrder = (try orders.get(.{ .int = 300 })).?;
+    stillOrder.deinit();
+}
+
+test "dropForeignKey lifts a CASCADE constraint the same as a RESTRICT one" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var customers = try Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+    try customers.put(.{ .int = 1 }, &.{});
+
+    var orders = try Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try orders.createForeignKey("customer_id", "customers", pkField, .cascade);
+    try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
+
+    try orders.dropForeignKey("customer_id");
+    try customers.delete(.{ .int = 1 });
+
+    try std.testing.expect((try customers.get(.{ .int = 1 })) == null);
+    // No FK left at all, so the order is untouched by the parent's delete -
+    // not restricted, not cascaded, simply irrelevant now.
+    var stillOrder = (try orders.get(.{ .int = 100 })).?;
+    stillOrder.deinit();
+}
