@@ -1434,3 +1434,478 @@ test "like predicate filters by pattern and never uses an index on that field" {
     // notion of substring matching), never mistake this for an eq lookup.
     try table.createIndex("name");
 
+    try table.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "Ada Lovelace" } }});
+    try table.put(.{ .int = 2 }, &.{.{ .name = "name", .value = .{ .text = "Alan Turing" } }});
+    try table.put(.{ .int = 3 }, &.{.{ .name = "name", .value = .{ .text = "Grace Hopper" } }});
+
+    {
+        const results = try table.select(.{ .like = .{ .field = "name", .value = .{ .text = "A%" } } });
+        defer freeRows(allocator, results);
+        try std.testing.expectEqual(@as(usize, 2), results.len);
+    }
+    {
+        const results = try table.select(.{ .like = .{ .field = "name", .value = .{ .text = "%ing" } } });
+        defer freeRows(allocator, results);
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings("Alan Turing", results[0].get("name").?.text);
+    }
+    {
+        const results = try table.select(.{ .like = .{ .field = "name", .value = .{ .text = "%z%" } } });
+        defer freeRows(allocator, results);
+        try std.testing.expectEqual(@as(usize, 0), results.len);
+    }
+
+    var plan = try table.explain(allocator, .{ .like = .{ .field = "name", .value = .{ .text = "A%" } } });
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(PlanKind.full_scan, plan.kind);
+}
+
+test "like combines with an indexed eq leaf inside and_ without breaking the index plan" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createIndex("city");
+
+    try table.put(.{ .int = 1 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "name", .value = .{ .text = "Ada" } } });
+    try table.put(.{ .int = 2 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "name", .value = .{ .text = "Boris" } } });
+    try table.put(.{ .int = 3 }, &.{ .{ .name = "city", .value = .{ .text = "krakow" } }, .{ .name = "name", .value = .{ .text = "Ada" } } });
+
+    const preds = [_]Predicate{
+        .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+        .{ .like = .{ .field = "name", .value = .{ .text = "A%" } } },
+    };
+    const pred = Predicate{ .and_ = &preds };
+
+    // findIndexableLeaf must still pick the `eq` leaf on `city` for the
+    // index scan even though `like` sits right next to it in the same and_;
+    // selectByIndexPage then re-evaluates the whole predicate (including
+    // `like`) against every index candidate.
+    var plan = try table.explain(allocator, pred);
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(PlanKind.index_eq, plan.kind);
+    try std.testing.expectEqualStrings("city", plan.indexName.?);
+
+    const results = try table.select(pred);
+    defer freeRows(allocator, results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(i64, 1), results[0].get(pkField).?.int);
+}
+
+test "index stays in sync across update and delete" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createIndex("city");
+
+    try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+    {
+        const warsaw = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
+        defer freeRows(allocator, warsaw);
+        try std.testing.expectEqual(@as(usize, 1), warsaw.len);
+    }
+
+    // Move the row to a different city: the old index entry must disappear.
+    try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "krakow" } }});
+    {
+        const warsaw = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
+        defer freeRows(allocator, warsaw);
+        try std.testing.expectEqual(@as(usize, 0), warsaw.len);
+        const krakow = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "krakow" } } });
+        defer freeRows(allocator, krakow);
+        try std.testing.expectEqual(@as(usize, 1), krakow.len);
+    }
+
+    try table.delete(.{ .int = 1 });
+    {
+        const krakow = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "krakow" } } });
+        defer freeRows(allocator, krakow);
+        try std.testing.expectEqual(@as(usize, 0), krakow.len);
+    }
+}
+
+test "dropIndex removes entries and falls back to full scan" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createIndex("city");
+    try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+
+    try table.dropIndex("city");
+    try std.testing.expect(!table.hasIndex("city"));
+
+    // Still correct without the index, just via full scan.
+    const results = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
+    defer freeRows(allocator, results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+}
+
+test "range predicate uses index and respects bounds" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "events");
+    defer table.deinit();
+    try table.createIndex("score");
+
+    var i: i64 = 0;
+    while (i < 10) : (i += 1) {
+        try table.put(.{ .int = i }, &.{.{ .name = "score", .value = .{ .int = i } }});
+    }
+
+    const results = try table.select(.{ .gte = .{ .field = "score", .value = .{ .int = 7 } } });
+    defer freeRows(allocator, results);
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+}
+
+test "compound and predicate narrows via one indexed conjunct" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createIndex("city");
+
+    try table.put(.{ .int = 1 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 20 } },
+    });
+    try table.put(.{ .int = 2 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "age", .value = .{ .int = 40 } },
+    });
+
+    const preds = [_]Predicate{
+        .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
+        .{ .gte = .{ .field = "age", .value = .{ .int = 30 } } },
+    };
+    const results = try table.select(.{ .and_ = &preds });
+    defer freeRows(allocator, results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(i64, 2), results[0].get(pkField).?.int);
+}
+
+test "not and or predicates evaluate via full scan" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+
+    try table.put(.{ .int = 1 }, &.{.{ .name = "age", .value = .{ .int = 10 } }});
+    try table.put(.{ .int = 2 }, &.{.{ .name = "age", .value = .{ .int = 20 } }});
+    try table.put(.{ .int = 3 }, &.{.{ .name = "age", .value = .{ .int = 30 } }});
+
+    const orPreds = [_]Predicate{
+        .{ .eq = .{ .field = "age", .value = .{ .int = 10 } } },
+        .{ .eq = .{ .field = "age", .value = .{ .int = 30 } } },
+    };
+    const orResults = try table.select(.{ .or_ = &orPreds });
+    defer freeRows(allocator, orResults);
+    try std.testing.expectEqual(@as(usize, 2), orResults.len);
+
+    const inner = Predicate{ .eq = .{ .field = "age", .value = .{ .int = 20 } } };
+    const notResult = try table.select(.{ .not_ = &inner });
+    defer freeRows(allocator, notResult);
+    try std.testing.expectEqual(@as(usize, 2), notResult.len);
+}
+
+test "is_null/is_not_null evaluate against missing fields, explicit none, and present values" {
+    const allocator = std.testing.allocator;
+    var sparse = Row.init(allocator);
+    defer sparse.deinit();
+    try sparse.set("age", .{ .int = 10 });
+
+    var withNone = Row.init(allocator);
+    defer withNone.deinit();
+    try withNone.set("city", .{ .none = {} });
+
+    var withCity = Row.init(allocator);
+    defer withCity.deinit();
+    try withCity.set("city", .{ .text = "warsaw" });
+
+    const isNull = Predicate{ .is_null = "city" };
+    const isNotNull = Predicate{ .is_not_null = "city" };
+
+    try std.testing.expect(isNull.evaluate(&sparse));
+    try std.testing.expect(!isNotNull.evaluate(&sparse));
+    try std.testing.expect(isNull.evaluate(&withNone));
+    try std.testing.expect(!isNotNull.evaluate(&withNone));
+    try std.testing.expect(!isNull.evaluate(&withCity));
+    try std.testing.expect(isNotNull.evaluate(&withCity));
+}
+
+test "is_null selects only sparse rows missing the field, over a full scan" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "people");
+    defer table.deinit();
+
+    try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+    try table.put(.{ .int = 2 }, &.{.{ .name = "age", .value = .{ .int = 40 } }});
+    try table.put(.{ .int = 3 }, &.{.{ .name = "age", .value = .{ .int = 50 } }});
+
+    var plan = try table.explain(allocator, .{ .is_null = "city" });
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(PlanKind.full_scan, plan.kind);
+
+    const missing = try table.select(.{ .is_null = "city" });
+    defer freeRows(allocator, missing);
+    try std.testing.expectEqual(@as(usize, 2), missing.len);
+
+    const present = try table.select(.{ .is_not_null = "city" });
+    defer freeRows(allocator, present);
+    try std.testing.expectEqual(@as(usize, 1), present.len);
+
+    // is_null on an indexed field still falls back to full_scan (not
+    // indexable), but the result is unaffected by the index's presence.
+    try table.createIndex("age");
+    const stillMissing = try table.select(.{ .is_null = "city" });
+    defer freeRows(allocator, stillMissing);
+    try std.testing.expectEqual(@as(usize, 2), stillMissing.len);
+}
+
+test "invalid identifiers are rejected" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try std.testing.expectError(error.InvalidIdentifier, Table.open(&db, allocator, ""));
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try std.testing.expectError(error.InvalidIdentifier, table.createIndex("bad\x00field"));
+}
+
+test "selectPage skips offset and stops at limit on a full scan" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+
+    // Row keys are the pk's order-preserving encoding, so full-scan order
+    // is ascending pk regardless of insertion order.
+    var pk: i64 = 10;
+    while (pk >= 1) : (pk -= 1) {
+        try table.put(.{ .int = pk }, &.{});
+    }
+
+    const page = try table.selectPage(null, .{ .offset = 3, .limit = 4 });
+    defer freeRows(allocator, page);
+    try std.testing.expectEqual(@as(usize, 4), page.len);
+    var expected: i64 = 4;
+    for (page) |r| {
+        try std.testing.expectEqual(expected, r.get(pkField).?.int);
+        expected += 1;
+    }
+}
+
+test "selectPage with limit 0 matches unlimited select" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    var pk: i64 = 1;
+    while (pk <= 5) : (pk += 1) try table.put(.{ .int = pk }, &.{});
+
+    const all = try table.select(null);
+    defer freeRows(allocator, all);
+    const page = try table.selectPage(null, .{});
+    defer freeRows(allocator, page);
+    try std.testing.expectEqual(all.len, page.len);
+}
+
+test "selectPage offset past the end returns nothing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.put(.{ .int = 1 }, &.{});
+    try table.put(.{ .int = 2 }, &.{});
+
+    const page = try table.selectPage(null, .{ .offset = 50 });
+    defer freeRows(allocator, page);
+    try std.testing.expectEqual(@as(usize, 0), page.len);
+}
+
+test "selectPage paginates through an index-narrowed predicate in pk order" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createIndex("city");
+
+    var pk: i64 = 1;
+    while (pk <= 6) : (pk += 1) {
+        try table.put(.{ .int = pk }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+    }
+    // Noise row indexed under a different value - must never leak into the
+    // paginated "warsaw" result regardless of offset/limit.
+    try table.put(.{ .int = 99 }, &.{.{ .name = "city", .value = .{ .text = "krakow" } }});
+
+    const pred = Predicate{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } };
+
+    const first = try table.selectPage(pred, .{ .limit = 2 });
+    defer freeRows(allocator, first);
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+    try std.testing.expectEqual(@as(i64, 1), first[0].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 2), first[1].get(pkField).?.int);
+
+    const second = try table.selectPage(pred, .{ .offset = 2, .limit = 2 });
+    defer freeRows(allocator, second);
+    try std.testing.expectEqual(@as(usize, 2), second.len);
+    try std.testing.expectEqual(@as(i64, 3), second[0].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 4), second[1].get(pkField).?.int);
+
+    const rest = try table.selectPage(pred, .{ .offset = 4 });
+    defer freeRows(allocator, rest);
+    try std.testing.expectEqual(@as(usize, 2), rest.len);
+    try std.testing.expectEqual(@as(i64, 5), rest[0].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 6), rest[1].get(pkField).?.int);
+}
+
+test "selectPage against a large indexed bucket stays correct with a small limit" {
+    // Exercises the streaming `cursorForLeaf` path (see index.zig's
+    // EqCursor) against a bucket far larger than the requested page: a
+    // regression that only materialized the first `limit` matches would
+    // silently pass this test too, but a regression that went back to
+    // materializing the whole 500-row match set first would still pass on
+    // correctness alone - the point of the streaming rewrite is that this
+    // scan touches roughly `offset + limit` index entries, not 500, which is
+    // asserted structurally in index.zig's cursor tests via early deinit.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    try table.createIndex("city");
+
+    var pk: i64 = 0;
+    while (pk < 500) : (pk += 1) {
+        try table.put(.{ .int = pk }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+    }
+
+    const pred = Predicate{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } };
+
+    const page = try table.selectPage(pred, .{ .offset = 497, .limit = 10 });
+    defer freeRows(allocator, page);
+    try std.testing.expectEqual(@as(usize, 3), page.len);
+    try std.testing.expectEqual(@as(i64, 497), page[0].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 498), page[1].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 499), page[2].get(pkField).?.int);
+}
+
+test "selectPageOrdered sorts a full scan ascending and descending by an int field" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    // Insert pks out of score order so ascending pk (the natural full-scan
+    // order) is NOT already sorted by `score` - a regression that forgot to
+    // sort and just returned scan order would fail both assertions below.
+    const scores = [_]i64{ 30, 10, 50, 20, 40 };
+    for (scores, 1..) |score, pk| {
+        try table.put(.{ .int = @intCast(pk) }, &.{.{ .name = "score", .value = .{ .int = score } }});
+    }
+
+    const asc = try table.selectPageOrdered(null, .{}, &.{.{ .field = "score" }});
+    defer freeRows(allocator, asc);
+    var expected = [_]i64{ 10, 20, 30, 40, 50 };
+    try std.testing.expectEqual(expected.len, asc.len);
+    for (asc, 0..) |r, i| try std.testing.expectEqual(expected[i], r.get("score").?.int);
+
+    const desc = try table.selectPageOrdered(null, .{}, &.{.{ .field = "score", .descending = true }});
+    defer freeRows(allocator, desc);
+    std.mem.reverse(i64, &expected);
+    for (desc, 0..) |r, i| try std.testing.expectEqual(expected[i], r.get("score").?.int);
+}
+
+test "selectPageOrdered applies offset/limit after sorting, not before" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var table = try Table.open(&db, allocator, "users");
+    defer table.deinit();
+    var pk: i64 = 1;
+    while (pk <= 10) : (pk += 1) {
+        // Descending score as pk increases, so "top 3 by score desc" is the
+        // FIRST 3 pks, not the last 3 - a page-then-sort bug (paging the
+        // natural scan order before sorting) would return the wrong rows.
+        try table.put(.{ .int = pk }, &.{.{ .name = "score", .value = .{ .int = 100 - pk } }});
+    }
+
+    const top3 = try table.selectPageOrdered(null, .{ .limit = 3 }, &.{.{ .field = "score", .descending = true }});
+    defer freeRows(allocator, top3);
+    try std.testing.expectEqual(@as(usize, 3), top3.len);
+    try std.testing.expectEqual(@as(i64, 1), top3[0].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 2), top3[1].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 3), top3[2].get(pkField).?.int);
+
+    const nextPage = try table.selectPageOrdered(null, .{ .offset = 3, .limit = 3 }, &.{.{ .field = "score", .descending = true }});
+    defer freeRows(allocator, nextPage);
+    try std.testing.expectEqual(@as(i64, 4), nextPage[0].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 6), nextPage[2].get(pkField).?.int);
+}
+
+test "selectPageOrdered sorts text fields lexically and is stable on ties" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
