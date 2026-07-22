@@ -788,3 +788,792 @@ pub const Repl = struct {
         }
     }
 
+    fn cmdCollCounter(self: *Repl, op: []const u8, args: []const []const u8, writer: anytype) !void {
+        const Counter = collectionsmod.Counter;
+        if (std.mem.eql(u8, op, "get")) {
+            if (args.len < 1) return ReplError.WrongArgCount;
+            const v = try Counter.get(self.db, self.allocator, args[0]);
+            try writer.print("{d}\n", .{v});
+        } else if (std.mem.eql(u8, op, "set")) {
+            if (args.len < 2) return ReplError.WrongArgCount;
+            const v = std.fmt.parseInt(i64, args[1], 10) catch return ReplError.InvalidArgument;
+            try Counter.set(self.db, self.allocator, args[0], v);
+            try writer.writeAll("OK\n");
+        } else if (std.mem.eql(u8, op, "incrby")) {
+            if (args.len < 2) return ReplError.WrongArgCount;
+            const delta = std.fmt.parseInt(i64, args[1], 10) catch return ReplError.InvalidArgument;
+            const v = try Counter.incrBy(self.db, self.allocator, args[0], delta);
+            try writer.print("{d}\n", .{v});
+        } else {
+            return ReplError.UnknownCollectionOp;
+        }
+    }
+
+    fn cmdCollHash(self: *Repl, op: []const u8, args: []const []const u8, writer: anytype) !void {
+        const Hash = collectionsmod.Hash;
+        if (std.mem.eql(u8, op, "set")) {
+            if (args.len < 3) return ReplError.WrongArgCount;
+            const created = try Hash.set(self.db, self.allocator, args[0], args[1], args[2]);
+            try writer.print("{s}\n", .{if (created) "created" else "updated"});
+        } else if (std.mem.eql(u8, op, "get")) {
+            if (args.len < 2) return ReplError.WrongArgCount;
+            if (try Hash.get(self.db, self.allocator, args[0], args[1])) |v| {
+                defer self.allocator.free(v);
+                try writer.print("{s}\n", .{v});
+            } else {
+                try writer.writeAll("(nil)\n");
+            }
+        } else if (std.mem.eql(u8, op, "del")) {
+            if (args.len < 2) return ReplError.WrongArgCount;
+            const existed = try Hash.del(self.db, self.allocator, args[0], args[1]);
+            try writer.print("{d}\n", .{@intFromBool(existed)});
+        } else if (std.mem.eql(u8, op, "len")) {
+            if (args.len < 1) return ReplError.WrongArgCount;
+            const n = try Hash.len(self.db, self.allocator, args[0]);
+            try writer.print("{d}\n", .{n});
+        } else if (std.mem.eql(u8, op, "getall")) {
+            if (args.len < 1) return ReplError.WrongArgCount;
+            const fields = try Hash.getAll(self.db, self.allocator, args[0]);
+            defer {
+                for (fields) |f| f.free(self.allocator);
+                self.allocator.free(fields);
+            }
+            for (fields) |f| try writer.print("{s}\t{s}\n", .{ f.field, f.value });
+        } else {
+            return ReplError.UnknownCollectionOp;
+        }
+    }
+
+    fn cmdCollSet(self: *Repl, op: []const u8, args: []const []const u8, writer: anytype) !void {
+        const Set = collectionsmod.Set;
+        if (std.mem.eql(u8, op, "add")) {
+            if (args.len < 2) return ReplError.WrongArgCount;
+            const added = try Set.add(self.db, self.allocator, args[0], args[1]);
+            try writer.print("{d}\n", .{@intFromBool(added)});
+        } else if (std.mem.eql(u8, op, "rem")) {
+            if (args.len < 2) return ReplError.WrongArgCount;
+            const removed = try Set.remove(self.db, self.allocator, args[0], args[1]);
+            try writer.print("{d}\n", .{@intFromBool(removed)});
+        } else if (std.mem.eql(u8, op, "ismember")) {
+            if (args.len < 2) return ReplError.WrongArgCount;
+            const is = try Set.isMember(self.db, self.allocator, args[0], args[1]);
+            try writer.print("{d}\n", .{@intFromBool(is)});
+        } else if (std.mem.eql(u8, op, "card")) {
+            if (args.len < 1) return ReplError.WrongArgCount;
+            const n = try Set.card(self.db, self.allocator, args[0]);
+            try writer.print("{d}\n", .{n});
+        } else if (std.mem.eql(u8, op, "members")) {
+            if (args.len < 1) return ReplError.WrongArgCount;
+            const ms = try Set.members(self.db, self.allocator, args[0]);
+            defer {
+                for (ms) |m| self.allocator.free(m);
+                self.allocator.free(ms);
+            }
+            for (ms) |m| try writer.print("{s}\n", .{m});
+        } else if (std.mem.eql(u8, op, "inter") or std.mem.eql(u8, op, "union")) {
+            if (args.len < 1) return ReplError.WrongArgCount;
+            _ = try collttlmod.expireIfDueMany(self.db, self.allocator, .set, args[1..], std.time.nanoTimestamp());
+            const ms = if (std.mem.eql(u8, op, "inter"))
+                try Set.intersect(self.db, self.allocator, args)
+            else
+                try Set.unionOf(self.db, self.allocator, args);
+            defer {
+                for (ms) |m| self.allocator.free(m);
+                self.allocator.free(ms);
+            }
+            for (ms) |m| try writer.print("{s}\n", .{m});
+        } else if (std.mem.eql(u8, op, "diff")) {
+            if (args.len < 2) return ReplError.WrongArgCount;
+            _ = try collttlmod.expireIfDueMany(self.db, self.allocator, .set, args[1..], std.time.nanoTimestamp());
+            const ms = try Set.difference(self.db, self.allocator, args[0], args[1..]);
+            defer {
+                for (ms) |m| self.allocator.free(m);
+                self.allocator.free(ms);
+            }
+            for (ms) |m| try writer.print("{s}\n", .{m});
+        } else {
+            return ReplError.UnknownCollectionOp;
+        }
+    }
+
+    fn cmdCollList(self: *Repl, op: []const u8, args: []const []const u8, writer: anytype) !void {
+        const List = collectionsmod.List;
+        if (std.mem.eql(u8, op, "lpush")) {
+            if (args.len < 2) return ReplError.WrongArgCount;
+            try List.pushLeft(self.db, self.allocator, args[0], args[1]);
+            try writer.writeAll("OK\n");
+        } else if (std.mem.eql(u8, op, "rpush")) {
+            if (args.len < 2) return ReplError.WrongArgCount;
+            try List.pushRight(self.db, self.allocator, args[0], args[1]);
+            try writer.writeAll("OK\n");
+        } else if (std.mem.eql(u8, op, "lpop") or std.mem.eql(u8, op, "rpop")) {
+            if (args.len < 1) return ReplError.WrongArgCount;
+            const popped = if (std.mem.eql(u8, op, "lpop"))
+                try List.popLeft(self.db, self.allocator, args[0])
+            else
+                try List.popRight(self.db, self.allocator, args[0]);
+            if (popped) |v| {
+                defer self.allocator.free(v);
+                try writer.print("{s}\n", .{v});
+            } else {
+                try writer.writeAll("(nil)\n");
+            }
+        } else if (std.mem.eql(u8, op, "len")) {
+            if (args.len < 1) return ReplError.WrongArgCount;
+            const n = try List.len(self.db, self.allocator, args[0]);
+            try writer.print("{d}\n", .{n});
+        } else if (std.mem.eql(u8, op, "range")) {
+            if (args.len < 3) return ReplError.WrongArgCount;
+            const start = std.fmt.parseInt(i64, args[1], 10) catch return ReplError.InvalidArgument;
+            const stop = std.fmt.parseInt(i64, args[2], 10) catch return ReplError.InvalidArgument;
+            const vals = try List.range(self.db, self.allocator, args[0], start, stop);
+            defer {
+                for (vals) |v| self.allocator.free(v);
+                self.allocator.free(vals);
+            }
+            for (vals) |v| try writer.print("{s}\n", .{v});
+        } else {
+            return ReplError.UnknownCollectionOp;
+        }
+    }
+
+    fn cmdCollZSet(self: *Repl, op: []const u8, args: []const []const u8, writer: anytype) !void {
+        const ZSet = collectionsmod.ZSet;
+        if (std.mem.eql(u8, op, "add")) {
+            if (args.len < 3) return ReplError.WrongArgCount;
+            const scoreVal = std.fmt.parseFloat(f64, args[2]) catch return ReplError.InvalidArgument;
+            try ZSet.add(self.db, self.allocator, args[0], args[1], scoreVal);
+            try writer.writeAll("OK\n");
+        } else if (std.mem.eql(u8, op, "score")) {
+            if (args.len < 2) return ReplError.WrongArgCount;
+            if (try ZSet.score(self.db, self.allocator, args[0], args[1])) |s| {
+                try writer.print("{d}\n", .{s});
+            } else {
+                try writer.writeAll("(nil)\n");
+            }
+        } else if (std.mem.eql(u8, op, "incrby")) {
+            if (args.len < 3) return ReplError.WrongArgCount;
+            const delta = std.fmt.parseFloat(f64, args[2]) catch return ReplError.InvalidArgument;
+            const s = try ZSet.incrBy(self.db, self.allocator, args[0], args[1], delta);
+            try writer.print("{d}\n", .{s});
+        } else if (std.mem.eql(u8, op, "rem")) {
+            if (args.len < 2) return ReplError.WrongArgCount;
+            const removed = try ZSet.remove(self.db, self.allocator, args[0], args[1]);
+            try writer.print("{d}\n", .{@intFromBool(removed)});
+        } else if (std.mem.eql(u8, op, "card")) {
+            if (args.len < 1) return ReplError.WrongArgCount;
+            const n = try ZSet.card(self.db, self.allocator, args[0]);
+            try writer.print("{d}\n", .{n});
+        } else if (std.mem.eql(u8, op, "rangebyrank") or std.mem.eql(u8, op, "rangebyscore")) {
+            if (args.len < 3) return ReplError.WrongArgCount;
+            const zms = if (std.mem.eql(u8, op, "rangebyrank")) blk: {
+                const start = std.fmt.parseInt(i64, args[1], 10) catch return ReplError.InvalidArgument;
+                const stop = std.fmt.parseInt(i64, args[2], 10) catch return ReplError.InvalidArgument;
+                break :blk try ZSet.rangeByRank(self.db, self.allocator, args[0], start, stop);
+            } else blk: {
+                const min = std.fmt.parseFloat(f64, args[1]) catch return ReplError.InvalidArgument;
+                const max = std.fmt.parseFloat(f64, args[2]) catch return ReplError.InvalidArgument;
+                break :blk try ZSet.rangeByScore(self.db, self.allocator, args[0], min, max);
+            };
+            defer {
+                for (zms) |zm| zm.free(self.allocator);
+                self.allocator.free(zms);
+            }
+            for (zms) |zm| try writer.print("{s}\t{d}\n", .{ zm.member, zm.score });
+        } else if (std.mem.eql(u8, op, "rank")) {
+            if (args.len < 2) return ReplError.WrongArgCount;
+            if (try ZSet.rank(self.db, self.allocator, args[0], args[1])) |r| {
+                try writer.print("{d}\n", .{r});
+            } else {
+                try writer.writeAll("(nil)\n");
+            }
+        } else {
+            return ReplError.UnknownCollectionOp;
+        }
+    }
+
+    fn cmdHelp(self: *Repl, writer: anytype) !void {
+        _ = self;
+        try writer.writeAll(
+            \\commands:
+            \\  put <key> <value>            table put <table> <pk> [field=value ...]
+            \\  get <key>                    table get <table> <pk>
+            \\  del <key>                    table del <table> <pk>
+            \\  scan [prefix]                begin / commit / rollback
+            \\  stats / flush / compact      exit / quit
+            \\  table select <table> [expr...] [--limit N] [--offset N]
+            \\                        [--order-by f[:desc][,f[:desc]...]]
+            \\  table join [--left|--right|--full] <lt> <lf> <rt> <rf> [--limit N] [--offset N]
+            \\  table aggregate <table> <groupField|*> <spec>[,<spec>...] [expr...] [--limit N] [--offset N]
+            \\  table window <table> <kind[:field]>[,<kind[:field]>...] [expr...] [partition f[,f...]]
+            \\                        [order f[:desc][,f...]] [--limit N] [--offset N] [--range]
+            \\  coll <kind> <op> [args...]   kind: counter/hash/set/list/zset
+            \\  expire/persist/ttl <key>     coll <kind> expire/persist/ttl <name>
+            \\  expire-sweep                 coll expire-sweep
+            \\
+        );
+    }
+};
+
+const PageFlags = struct { limit: u32 = 0, offset: u32 = 0 };
+
+/// Pulls `--limit N` / `--offset N` out of a `table select` argument list
+/// wherever they appear, returning the remaining tokens (destined to be
+/// joined into the expr text) alongside the parsed page window. Same shape
+/// as main.zig's identically-named helper for `table select`/`remote-select`
+/// on the one-shot CLI - kept as its own small copy here rather than shared,
+/// since main.zig is the binary entry point and not a module repl.zig can
+/// import. Caller owns and frees `rest`.
+fn extractPageFlags(allocator: Allocator, args: []const []const u8) !struct { page: PageFlags, rest: [][]const u8 } {
+    var page = PageFlags{};
+    var rest = std.ArrayList([]const u8).init(allocator);
+    errdefer rest.deinit();
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const isLimit = std.mem.eql(u8, args[i], "--limit");
+        const isOffset = std.mem.eql(u8, args[i], "--offset");
+        if (isLimit or isOffset) {
+            i += 1;
+            if (i >= args.len) return error.InvalidPageFlag;
+            const n = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidPageFlag;
+            if (isLimit) page.limit = n else page.offset = n;
+        } else {
+            try rest.append(args[i]);
+        }
+    }
+    return .{ .page = page, .rest = try rest.toOwnedSlice() };
+}
+
+/// Pulls a lone `--range` flag (no value) out of `table window`'s trailing
+/// args, requesting `window.FrameMode.range` instead of the default
+/// `.rows` running frame - see `window.zig`'s `compute` doc comment. Same
+/// shape as main.zig's identically-named helper, kept as its own small copy
+/// here for the same reason `extractPageFlags` above is. Caller owns and
+/// frees `rest`.
+fn extractRangeFlag(allocator: Allocator, args: []const []const u8) !struct { range: bool, rest: [][]const u8 } {
+    var range = false;
+    var rest = std.ArrayList([]const u8).init(allocator);
+    errdefer rest.deinit();
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--range")) {
+            range = true;
+        } else {
+            try rest.append(a);
+        }
+    }
+    return .{ .range = range, .rest = try rest.toOwnedSlice() };
+}
+
+const SelectFlags = struct { page: PageFlags = .{}, orderBy: []const querymod.OrderBy = &.{} };
+
+/// `table select`-only counterpart of `extractPageFlags` above, mirroring
+/// main.zig's identically-shaped `extractSelectFlags`/`SelectFlags`: same
+/// `--limit`/`--offset` handling plus `--order-by
+/// field[:desc][,field[:desc]...]` (comma-separated, applied left to
+/// right), kept SEPARATE from `extractPageFlags` rather than folded into
+/// it because `extractPageFlags` is also used by `table join`/`table
+/// aggregate` here, neither of which sorts its result - recognizing
+/// `--order-by` there too would silently consume the flag without
+/// honoring it. Caller owns and frees `rest` AND `flags.orderBy`.
+fn extractSelectFlags(allocator: Allocator, args: []const []const u8) !struct { flags: SelectFlags, rest: [][]const u8 } {
+    var flags = SelectFlags{};
+    var rest = std.ArrayList([]const u8).init(allocator);
+    errdefer rest.deinit();
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const isLimit = std.mem.eql(u8, args[i], "--limit");
+        const isOffset = std.mem.eql(u8, args[i], "--offset");
+        const isOrderBy = std.mem.eql(u8, args[i], "--order-by");
+        if (isLimit or isOffset) {
+            i += 1;
+            if (i >= args.len) return error.InvalidPageFlag;
+            const n = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidPageFlag;
+            if (isLimit) flags.page.limit = n else flags.page.offset = n;
+        } else if (isOrderBy) {
+            i += 1;
+            if (i >= args.len) return error.InvalidPageFlag;
+            allocator.free(flags.orderBy);
+            flags.orderBy = try parseOrderByList(allocator, args[i]);
+        } else {
+            try rest.append(args[i]);
+        }
+    }
+    return .{ .flags = flags, .rest = try rest.toOwnedSlice() };
+}
+
+/// Parses `--order-by`'s `field[:desc]` value - mirrors main.zig's
+/// identically-shaped `parseOrderByFlag` (kept as its own copy for the same
+/// reason `extractPageFlags`'s doc comment gives: repl.zig cannot import
+/// main.zig, the binary entry point). `:desc`/`:asc` are the only accepted
+/// suffixes; anything else is a malformed flag, not a silent default.
+fn parseOrderByFlag(text: []const u8) !querymod.OrderBy {
+    if (std.mem.indexOfScalar(u8, text, ':')) |colon| {
+        const field = text[0..colon];
+        const dir = text[colon + 1 ..];
+        if (field.len == 0) return error.InvalidPageFlag;
+        if (std.mem.eql(u8, dir, "desc")) return .{ .field = field, .descending = true };
+        if (std.mem.eql(u8, dir, "asc")) return .{ .field = field, .descending = false };
+        return error.InvalidPageFlag;
+    }
+    if (text.len == 0) return error.InvalidPageFlag;
+    return .{ .field = text };
+}
+
+/// Splits `--order-by`'s comma-separated value into one or more columns -
+/// mirrors main.zig's identically-shaped `parseOrderByList` (kept as its
+/// own copy for the same reason `parseOrderByFlag` above is). Caller owns
+/// and frees the returned slice.
+fn parseOrderByList(allocator: Allocator, text: []const u8) ![]querymod.OrderBy {
+    var list = std.ArrayList(querymod.OrderBy).init(allocator);
+    errdefer list.deinit();
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |segment| {
+        try list.append(try parseOrderByFlag(segment));
+    }
+    return list.toOwnedSlice();
+}
+
+/// Splits `name=value` into a Field, validating the name the same way
+/// index/table identifiers already are. Values follow the CLI's `i:`/`f:`/
+/// `b:`/`s:` typed-literal convention via `Value.parseCli`.
+fn parseField(text: []const u8) !Field {
+    const eq = std.mem.indexOfScalar(u8, text, '=') orelse return ReplError.InvalidField;
+    const name = text[0..eq];
+    if (!idx.validIdentifier(name)) return ReplError.InvalidField;
+    const value = try Value.parseCli(text[eq + 1 ..]);
+    return .{ .name = name, .value = value };
+}
+
+/// Splits `--set`'s comma-separated `name=value[,name=value...]` value into
+/// a list of Fields, each parsed by `parseField` - mirrors main.zig's
+/// identically-shaped `parseSetList` (kept as its own copy for the same
+/// reason `parseOrderByList` above is).  Caller owns and frees the returned
+/// slice.
+fn parseSetList(allocator: Allocator, text: []const u8) ![]Field {
+    var list = std.ArrayList(Field).init(allocator);
+    errdefer list.deinit();
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |segment| {
+        try list.append(try parseField(segment));
+    }
+    return list.toOwnedSlice();
+}
+
+/// Pulls a single required `--set name=value[,name=value...]` flag out of a
+/// `table update` argument list - mirrors main.zig's identically-shaped
+/// `extractSetFlag`. Missing `--set` is `error.MissingSetFlag`: a `SET`-less
+/// `UPDATE` names nothing to change. Caller owns and frees `rest` and the
+/// returned `sets` slice.
+fn extractSetFlag(allocator: Allocator, args: []const []const u8) !struct { sets: []Field, rest: [][]const u8 } {
+    var sets: []Field = &.{};
+    errdefer allocator.free(sets);
+    var rest = std.ArrayList([]const u8).init(allocator);
+    errdefer rest.deinit();
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--set")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidSetFlag;
+            allocator.free(sets);
+            sets = parseSetList(allocator, args[i]) catch return error.InvalidSetFlag;
+        } else {
+            try rest.append(args[i]);
+        }
+    }
+    if (sets.len == 0) return error.MissingSetFlag;
+    return .{ .sets = sets, .rest = try rest.toOwnedSlice() };
+}
+
+fn parseAggKind(name: []const u8) ?aggregatemod.AggKind {
+    if (std.mem.eql(u8, name, "count")) return .count;
+    if (std.mem.eql(u8, name, "sum")) return .sum;
+    if (std.mem.eql(u8, name, "avg")) return .avg;
+    if (std.mem.eql(u8, name, "min")) return .min;
+    if (std.mem.eql(u8, name, "max")) return .max;
+    if (std.mem.eql(u8, name, "distinct")) return .count_distinct;
+    return null;
+}
+
+/// Parses a comma-separated `table aggregate` spec list, same grammar and
+/// same small standalone copy as main.zig's identically-named helper (see
+/// `extractPageFlags` above for why this is not shared - main.zig is the
+/// binary entry point, not a module repl.zig can import).
+fn parseAggSpecs(allocator: Allocator, text: []const u8) ![]aggregatemod.AggSpec {
+    var specs = std.ArrayList(aggregatemod.AggSpec).init(allocator);
+    errdefer specs.deinit();
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |part| {
+        if (part.len == 0) return error.InvalidAggSpec;
+        if (std.mem.indexOfScalar(u8, part, ':')) |colon| {
+            const kind = parseAggKind(part[0..colon]) orelse return error.InvalidAggSpec;
+            const field = part[colon + 1 ..];
+            if (!idx.validIdentifier(field)) return error.InvalidAggSpec;
+            try specs.append(.{ .field = field, .kind = kind });
+        } else {
+            const kind = parseAggKind(part) orelse return error.InvalidAggSpec;
+            if (kind != .count) return error.InvalidAggSpec;
+            try specs.append(.{ .field = "", .kind = kind });
+        }
+    }
+    if (specs.items.len == 0) return error.InvalidAggSpec;
+    return specs.toOwnedSlice();
+}
+
+fn printAggLabel(writer: anytype, spec: aggregatemod.AggSpec) !void {
+    if (spec.field.len == 0) {
+        try writer.writeAll(@tagName(spec.kind));
+    } else {
+        try writer.print("{s}_{s}", .{ @tagName(spec.kind), spec.field });
+    }
+}
+
+fn parseWindowKind(name: []const u8) ?windowmod.WindowKind {
+    if (std.mem.eql(u8, name, "row_number")) return .row_number;
+    if (std.mem.eql(u8, name, "rank")) return .rank;
+    if (std.mem.eql(u8, name, "dense_rank")) return .dense_rank;
+    if (std.mem.eql(u8, name, "sum")) return .sum;
+    if (std.mem.eql(u8, name, "avg")) return .avg;
+    if (std.mem.eql(u8, name, "count")) return .count;
+    if (std.mem.eql(u8, name, "count_distinct")) return .count_distinct;
+    if (std.mem.eql(u8, name, "min")) return .min;
+    if (std.mem.eql(u8, name, "max")) return .max;
+    if (std.mem.eql(u8, name, "lag")) return .lag;
+    if (std.mem.eql(u8, name, "lead")) return .lead;
+    if (std.mem.eql(u8, name, "first_value")) return .first_value;
+    if (std.mem.eql(u8, name, "last_value")) return .last_value;
+    if (std.mem.eql(u8, name, "nth_value")) return .nth_value;
+    return null;
+}
+
+/// Parses a single `table window` spec token, same grammar (including
+/// lag/lead's optional `:offset[:default]` suffix and nth_value's required
+/// `:n[:default]` suffix) and same small standalone copy as main.zig's
+/// identically-named helper (see `parseAggSpecs` above for why this is not
+/// shared).
+fn parseWindowSpec(text: []const u8) !windowmod.WindowSpec {
+    var it = std.mem.splitScalar(u8, text, ':');
+    const kind = parseWindowKind(it.next().?) orelse return error.InvalidWindowSpec;
+
+    if (kind == .row_number or kind == .rank or kind == .dense_rank) {
+        if (it.next() != null) return error.InvalidWindowSpec;
+        return .{ .field = "", .kind = kind };
+    }
+    if (kind == .lag or kind == .lead) {
+        const field = it.next() orelse return error.InvalidWindowSpec;
+        if (!idx.validIdentifier(field)) return error.InvalidWindowSpec;
+        var spec = windowmod.WindowSpec{ .field = field, .kind = kind };
+        if (it.next()) |offsetText| {
+            spec.offset = std.fmt.parseInt(u64, offsetText, 10) catch return error.InvalidWindowSpec;
+            // `it.rest()`, NOT another `it.next()`: a typed default literal
+            // (`i:-1`, `s:foo:bar`) can itself contain colons, which would
+            // get wrongly re-split by a further `splitScalar` step.
+            const rest = it.rest();
+            if (rest.len > 0) spec.default = Value.parseCli(rest) catch return error.InvalidWindowSpec;
+        }
+        return spec;
+    }
+    if (kind == .nth_value) {
+        const field = it.next() orelse return error.InvalidWindowSpec;
+        if (!idx.validIdentifier(field)) return error.InvalidWindowSpec;
+        const nText = it.next() orelse return error.InvalidWindowSpec;
+        const n = std.fmt.parseInt(u64, nText, 10) catch return error.InvalidWindowSpec;
+        if (n == 0) return error.InvalidWindowSpec;
+        var spec = windowmod.WindowSpec{ .field = field, .kind = kind, .offset = n };
+        const rest = it.rest();
+        if (rest.len > 0) spec.default = Value.parseCli(rest) catch return error.InvalidWindowSpec;
+        return spec;
+    }
+
+    const field = it.next() orelse {
+        if (kind == .count) return .{ .field = "", .kind = kind };
+        return error.InvalidWindowSpec;
+    };
+    if (it.next() != null) return error.InvalidWindowSpec;
+    if (!idx.validIdentifier(field)) return error.InvalidWindowSpec;
+    return .{ .field = field, .kind = kind };
+}
+
+/// Parses `table window`'s comma-separated spec list, same grammar and same
+/// small standalone copy as main.zig's identically-named helper (see
+/// `parseAggSpecs` above for why this is not shared) - lets one interactive
+/// `table window` call annotate rows with multiple columns sharing one
+/// `PARTITION BY`/`ORDER BY`/frame (`window.computeMany`).
+fn parseWindowSpecs(allocator: Allocator, text: []const u8) ![]windowmod.WindowSpec {
+    var specs = std.ArrayList(windowmod.WindowSpec).init(allocator);
+    errdefer specs.deinit();
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |part| {
+        if (part.len == 0) return error.InvalidWindowSpec;
+        try specs.append(try parseWindowSpec(part));
+    }
+    if (specs.items.len == 0) return error.InvalidWindowSpec;
+    return specs.toOwnedSlice();
+}
+
+fn printWindowLabel(writer: anytype, spec: windowmod.WindowSpec) !void {
+    if (spec.field.len == 0) {
+        try writer.writeAll(@tagName(spec.kind));
+    } else {
+        try writer.print("{s}_{s}", .{ @tagName(spec.kind), spec.field });
+    }
+}
+
+fn findLiteralToken(args: []const []const u8, token: []const u8) ?usize {
+    for (args, 0..) |a, i| {
+        if (std.mem.eql(u8, a, token)) return i;
+    }
+    return null;
+}
+
+/// Splits the trailing free-text args of `table window` on literal
+/// `partition` and `order` tokens, same grammar and same small standalone
+/// copy as main.zig's identically-named helper (see `parseAggSpecs` above
+/// for why this is not shared).
+fn splitWindowArgs(args: []const []const u8) struct { whereArgs: []const []const u8, partitionArgs: ?[]const []const u8, orderArgs: ?[]const []const u8 } {
+    if (findLiteralToken(args, "partition")) |pi| {
+        const whereArgs = args[0..pi];
+        const afterPartition = args[pi + 1 ..];
+        if (findLiteralToken(afterPartition, "order")) |oi| {
+            return .{ .whereArgs = whereArgs, .partitionArgs = afterPartition[0..oi], .orderArgs = afterPartition[oi + 1 ..] };
+        }
+        return .{ .whereArgs = whereArgs, .partitionArgs = afterPartition, .orderArgs = null };
+    }
+    if (findLiteralToken(args, "order")) |oi| {
+        return .{ .whereArgs = args[0..oi], .partitionArgs = null, .orderArgs = args[oi + 1 ..] };
+    }
+    return .{ .whereArgs = args, .partitionArgs = null, .orderArgs = null };
+}
+
+/// Parses `table window`'s `partition <field>[,field...]` value, same
+/// grammar and same small standalone copy as main.zig's identically-named
+/// helper. Caller owns and frees the returned slice (not each field - they
+/// borrow from `text`).
+fn parsePartitionList(allocator: Allocator, text: []const u8) ![][]const u8 {
+    var list = std.ArrayList([]const u8).init(allocator);
+    errdefer list.deinit();
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |field| {
+        if (!idx.validIdentifier(field)) return error.InvalidPartitionField;
+        try list.append(field);
+    }
+    return list.toOwnedSlice();
+}
+
+fn printValue(writer: anytype, value: Value) !void {
+    switch (value) {
+        .none => try writer.writeAll("(none)"),
+        .boolean => |b| try writer.print("{}", .{b}),
+        .int => |i| try writer.print("{d}", .{i}),
+        .float => |f| try writer.print("{d}", .{f}),
+        .text => |s| try writer.writeAll(s),
+        .bytes => |b| for (b) |byte| try writer.print("{x:0>2}", .{byte}),
+    }
+}
+
+fn printRow(writer: anytype, row: Row) !void {
+    for (row.fields.items, 0..) |f, i| {
+        if (i > 0) try writer.writeAll("\t");
+        try writer.print("{s}=", .{f.name});
+        try printValue(writer, f.value);
+    }
+    try writer.writeAll("\n");
+}
+
+/// Same wording as main.zig's own `printPlan` (the two binaries do not
+/// share this helper - main.zig has no repl.zig dependency and vice versa).
+fn printPlan(writer: anytype, plan: querymod.Plan) !void {
+    switch (plan.kind) {
+        .full_scan => try writer.writeAll("full scan (no usable index)\n"),
+        .index_eq => try writer.print("index '{s}' (equality)\n", .{plan.indexName.?}),
+        .index_range => try writer.print("index '{s}' (range)\n", .{plan.indexName.?}),
+        .composite_eq => try writer.print("composite index '{s}' (equality, {d}/{d} columns matched)\n", .{ plan.indexName.?, plan.matchedFields, plan.totalFields }),
+        .composite_range => try writer.print("composite index '{s}' (range, {d}/{d} columns matched)\n", .{ plan.indexName.?, plan.matchedFields, plan.totalFields }),
+    }
+}
+
+fn openTemp(tmp: *std.testing.TmpDir, allocator: Allocator) !Db {
+    var pathBuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp.dir.realpath(".", &pathBuf);
+    var dbPathBuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dbPath = try std.fmt.bufPrint(&dbPathBuf, "{s}/store", .{base});
+    return Db.open(allocator, dbPath, .{});
+}
+
+fn runScript(allocator: Allocator, repl: *Repl, script: []const u8) ![]u8 {
+    var stream = std.io.fixedBufferStream(script);
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try repl.runFromReader(stream.reader(), out.writer(), false);
+    return out.toOwnedSlice();
+}
+
+test "plain put/get/del run immediately without a transaction" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "put a 1\nget a\ndel a\nget a\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\n1\nOK\n(nil)\n", out);
+}
+
+test "comments and blank lines are ignored, exit stops the loop early" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\# a comment
+        \\
+        \\put a 1
+        \\exit
+        \\get a
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\n", out);
+}
+
+test "table select filters by expr and honors --limit/--offset" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put items i:1 name=a price=i:10
+        \\table put items i:2 name=b price=i:20
+        \\table put items i:3 name=c price=i:30
+        \\table select items price gt i:10
+        \\table select items price gt i:10 --limit 1
+        \\table select items price gt i:10 --offset 1
+        \\table select items
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "__pk=2\tname=b\tprice=20\n" ++
+            "__pk=3\tname=c\tprice=30\n" ++
+            "__pk=2\tname=b\tprice=20\n" ++
+            "__pk=3\tname=c\tprice=30\n" ++
+            "__pk=1\tname=a\tprice=10\n" ++
+            "__pk=2\tname=b\tprice=20\n" ++
+            "__pk=3\tname=c\tprice=30\n",
+        out,
+    );
+}
+
+test "table select --order-by sorts by field, honoring :desc and combining with --limit/--offset" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    // Insert with pk NOT in price order, so a bug that sorted only within
+    // the natural pk scan order (or ignored --order-by entirely) would
+    // produce a visibly different sequence than asserted below.
+    const out = try runScript(allocator, &repl,
+        \\table put items i:1 name=b price=i:20
+        \\table put items i:2 name=a price=i:30
+        \\table put items i:3 name=c price=i:10
+        \\table select items --order-by price
+        \\table select items --order-by price:desc
+        \\table select items --order-by price:desc --limit 1 --offset 1
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "__pk=3\tname=c\tprice=10\n" ++
+            "__pk=1\tname=b\tprice=20\n" ++
+            "__pk=2\tname=a\tprice=30\n" ++
+            "__pk=2\tname=a\tprice=30\n" ++
+            "__pk=1\tname=b\tprice=20\n" ++
+            "__pk=3\tname=c\tprice=10\n" ++
+            "__pk=1\tname=b\tprice=20\n",
+        out,
+    );
+}
+
+test "table select --order-by rejects a malformed direction suffix instead of defaulting to ascending" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "table put items i:1 price=i:5\ntable select items --order-by price:dsc\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\nerror: InvalidPageFlag\n", out);
+}
+
+test "table select --order-by with two comma-separated columns sorts by the first, breaking ties with the second" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    // Two rows share city "warsaw" with prices NOT in insertion order, so
+    // a single-column city sort alone would leave them in whatever order
+    // they were inserted - only a real `price` tiebreak fixes that.
+    const out = try runScript(allocator, &repl,
+        \\table put items i:1 city=warsaw price=i:30
+        \\table put items i:2 city=krakow price=i:5
+        \\table put items i:3 city=warsaw price=i:10
+        \\table select items --order-by city,price
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "__pk=2\tcity=krakow\tprice=5\n" ++
+            "__pk=3\tcity=warsaw\tprice=10\n" ++
+            "__pk=1\tcity=warsaw\tprice=30\n",
+        out,
+    );
+}
+
+test "table select --order-by rejects an empty segment from a doubled comma instead of silently collapsing it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "table put items i:1 price=i:5\ntable select items --order-by city,,price\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\nerror: InvalidPageFlag\n", out);
+}
+
