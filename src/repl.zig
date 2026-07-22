@@ -1577,3 +1577,626 @@ test "table select --order-by rejects an empty segment from a doubled comma inst
     try std.testing.expectEqualStrings("OK\nerror: InvalidPageFlag\n", out);
 }
 
+test "table select reports a parse error on malformed expr without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "table select items price bogus i:1\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("error: UnknownOperator\n", out);
+}
+
+test "table explain reports full_scan, an index, and a composite index, matching what table select would actually use" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    {
+        var table = try Table.open(&db, allocator, "users");
+        defer table.deinit();
+        try table.createIndex("age");
+        try table.createCompositeIndex("city_age", &.{ "city", "age" });
+    }
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put users i:1 city=s:warsaw age=i:30
+        \\table explain users
+        \\table explain users city eq s:warsaw
+        \\table explain users age eq i:30
+        \\table explain users city eq s:warsaw and age eq i:30
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\n" ++
+            "full scan (no usable index)\n" ++
+            "full scan (no usable index)\n" ++
+            "index 'age' (equality)\n" ++
+            "composite index 'city_age' (equality, 2/2 columns matched)\n",
+        out,
+    );
+}
+
+test "table update applies --set to matching rows, prints the count, and leaves other rows untouched" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put users i:1 city=s:warsaw active=i:0
+        \\table put users i:2 city=s:warsaw active=i:0
+        \\table put users i:3 city=s:krakow active=i:0
+        \\table update users --set active=i:1 city eq s:warsaw
+        \\table select users --order-by __pk
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "2\n" ++
+            "__pk=1\tcity=warsaw\tactive=1\n" ++
+            "__pk=2\tcity=warsaw\tactive=1\n" ++
+            "__pk=3\tcity=krakow\tactive=0\n",
+        out,
+    );
+}
+
+test "table update without --set is rejected as MissingSetFlag instead of silently updating nothing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "table put users i:1 city=s:warsaw\ntable update users city eq s:warsaw\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\nerror: MissingSetFlag\n", out);
+}
+
+test "table join inner/left/right/full match main.zig's L/R printing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put customers i:1 name=alice
+        \\table put customers i:2 name=bob
+        \\table put orders i:100 customer_id=i:1 total=i:50
+        \\table put orders i:101 customer_id=i:999 total=i:5
+        \\table join customers __pk orders customer_id
+        \\table join --left customers __pk orders customer_id
+        \\table join --right customers __pk orders customer_id
+        \\table join --full customers __pk orders customer_id
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        // plain inner join: only alice/order100 matches, bob and the orphan
+        // order are absent.
+        "OK\nOK\nOK\nOK\n" ++
+            "L __pk=1\tname=alice\n" ++
+            "R __pk=100\tcustomer_id=1\ttotal=50\n" ++
+            // --left: bob survives with R (nil), the orphan order is still absent.
+            "L __pk=1\tname=alice\n" ++
+            "R __pk=100\tcustomer_id=1\ttotal=50\n" ++
+            "L __pk=2\tname=bob\n" ++
+            "R (nil)\n" ++
+            // --right: the orphan order survives with L (nil), bob is absent.
+            "L __pk=1\tname=alice\n" ++
+            "R __pk=100\tcustomer_id=1\ttotal=50\n" ++
+            "L (nil)\n" ++
+            "R __pk=101\tcustomer_id=999\ttotal=5\n" ++
+            // --full: both bob and the orphan order survive.
+            "L __pk=1\tname=alice\n" ++
+            "R __pk=100\tcustomer_id=1\ttotal=50\n" ++
+            "L __pk=2\tname=bob\n" ++
+            "R (nil)\n" ++
+            "L (nil)\n" ++
+            "R __pk=101\tcustomer_id=999\ttotal=5\n",
+        out,
+    );
+}
+
+test "table join respects --limit and --offset like table select does" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put customers i:1 name=alice
+        \\table put customers i:2 name=bob
+        \\table put customers i:3 name=carol
+        \\table join --left customers __pk orders customer_id --offset 1 --limit 1
+        \\table join --left customers __pk orders customer_id --offset 50
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            // --offset 1 --limit 1: skip alice, keep exactly bob.
+            "L __pk=2\tname=bob\n" ++
+            "R (nil)\n" ++
+            // --offset 50 is past the end of a 3-row left outer join: nothing.
+            "",
+        out,
+    );
+}
+
+test "table join needs exactly four positional args after mode flags" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "table join --left customers __pk orders\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("error: WrongArgCount\n", out);
+}
+
+test "table aggregate groups by field with count/sum/avg/min/max, matching main.zig's CLI output" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 city=warsaw total=i:100
+        \\table put orders i:2 city=warsaw total=i:250
+        \\table put orders i:3 city=krakow total=i:40
+        \\table aggregate orders city count,sum:total,avg:total,min:total,max:total
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "group=warsaw\tcount=2\tsum_total=350\tavg_total=175\tmin_total=100\tmax_total=250\n" ++
+            "group=krakow\tcount=1\tsum_total=40\tavg_total=40\tmin_total=40\tmax_total=40\n",
+        out,
+    );
+}
+
+test "table aggregate distinct:field counts unique values, collapsing repeats within a group" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 city=warsaw region=mazovia
+        \\table put orders i:2 city=warsaw region=mazovia
+        \\table put orders i:3 city=warsaw region=innerwarsaw
+        \\table put orders i:4 city=krakow region=malopolska
+        \\table aggregate orders city count,distinct:region
+        \\table aggregate orders * distinct:region
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\nOK\n" ++
+            "group=warsaw\tcount=3\tcount_distinct_region=2\n" ++
+            "group=krakow\tcount=1\tcount_distinct_region=1\n" ++
+            "count_distinct_region=3\n",
+        out,
+    );
+}
+
+test "table aggregate with * groups nothing and honors an expr filter before aggregating" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 city=warsaw total=i:100
+        \\table put orders i:2 city=warsaw total=i:250
+        \\table put orders i:3 city=krakow total=i:40
+        \\table aggregate orders * count,sum:total
+        \\table aggregate orders * count,sum:total total gt i:50
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "count=3\tsum_total=390\n" ++
+            "count=2\tsum_total=350\n",
+        out,
+    );
+}
+
+test "table aggregate rejects an invalid spec without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "table aggregate orders city bogus:total\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("error: InvalidArgument\n", out);
+}
+
+test "table window row_number annotates every row without collapsing, restarting per partition in order" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 city=warsaw total=i:100
+        \\table put orders i:2 city=warsaw total=i:250
+        \\table put orders i:3 city=krakow total=i:40
+        \\table window orders row_number partition city order total
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "__pk=1\tcity=warsaw\ttotal=100\trow_number=1\n" ++
+            "__pk=2\tcity=warsaw\ttotal=250\trow_number=2\n" ++
+            "__pk=3\tcity=krakow\ttotal=40\trow_number=1\n",
+        out,
+    );
+}
+
+test "table window with a comma-separated spec list annotates every row with all columns, sharing one partition/order" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 city=warsaw total=i:100
+        \\table put orders i:2 city=warsaw total=i:250
+        \\table put orders i:3 city=krakow total=i:40
+        \\table window orders row_number,sum:total partition city order total
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "__pk=1\tcity=warsaw\ttotal=100\trow_number=1\tsum_total=100\n" ++
+            "__pk=2\tcity=warsaw\ttotal=250\trow_number=2\tsum_total=350\n" ++
+            "__pk=3\tcity=krakow\ttotal=40\trow_number=1\tsum_total=40\n",
+        out,
+    );
+}
+
+test "table window sum:field with order runs a running total along the sorted sequence" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 city=warsaw total=i:100
+        \\table put orders i:2 city=warsaw total=i:250
+        \\table put orders i:3 city=krakow total=i:40
+        \\table window orders sum:total order total
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "__pk=3\tcity=krakow\ttotal=40\tsum_total=40\n" ++
+            "__pk=1\tcity=warsaw\ttotal=100\tsum_total=140\n" ++
+            "__pk=2\tcity=warsaw\ttotal=250\tsum_total=390\n",
+        out,
+    );
+}
+
+test "table window --range shares a tied group's combined total, without it each tied row gets its own running total" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    // Two rows tied at day=1 (10, 20), then one row at day=2 (5).
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 day=i:1 amount=i:10
+        \\table put orders i:2 day=i:1 amount=i:20
+        \\table put orders i:3 day=i:2 amount=i:5
+        \\table window orders sum:amount order day --range
+        \\table window orders sum:amount order day
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            // --range: both day=1 rows share the tie group's combined total.
+            "__pk=1\tday=1\tamount=10\tsum_amount=30\n" ++
+            "__pk=2\tday=1\tamount=20\tsum_amount=30\n" ++
+            "__pk=3\tday=2\tamount=5\tsum_amount=35\n" ++
+            // default (ROWS): each physical row keeps its own running total.
+            "__pk=1\tday=1\tamount=10\tsum_amount=10\n" ++
+            "__pk=2\tday=1\tamount=20\tsum_amount=30\n" ++
+            "__pk=3\tday=2\tamount=5\tsum_amount=35\n",
+        out,
+    );
+}
+
+test "table window --range is rejected together with a ranking kind, not silently ignored" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 total=i:100
+        \\table window orders row_number order total --range
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\nerror: RangeNotApplicable\n", out);
+}
+
+test "table window sum:field with a partition but no order stamps the same whole-partition total on every row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 city=warsaw total=i:100
+        \\table put orders i:2 city=warsaw total=i:250
+        \\table put orders i:3 city=krakow total=i:40
+        \\table window orders sum:total partition city
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "__pk=1\tcity=warsaw\ttotal=100\tsum_total=350\n" ++
+            "__pk=2\tcity=warsaw\ttotal=250\tsum_total=350\n" ++
+            "__pk=3\tcity=krakow\ttotal=40\tsum_total=40\n",
+        out,
+    );
+}
+
+test "table window honors --limit/--offset in partition-then-order display order, not raw scan order" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 city=warsaw total=i:100
+        \\table put orders i:2 city=warsaw total=i:250
+        \\table put orders i:3 city=krakow total=i:40
+        \\table window orders row_number order total --offset 1 --limit 1
+        \\
+    );
+    defer allocator.free(out);
+    // Sorted by total ascending: krakow/40 (rownum 1), warsaw/100 (rownum
+    // 2), warsaw/250 (rownum 3) - offset 1 limit 1 must land on the SECOND
+    // entry of that sorted walk, not the second row `table put` inserted.
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "__pk=1\tcity=warsaw\ttotal=100\trow_number=2\n",
+        out,
+    );
+}
+
+test "table window rejects an invalid spec without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "table window orders bogus\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("error: InvalidArgument\n", out);
+}
+
+test "table window lag/lead read the adjacent row's value within order, NULL at the partition edge" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 day=i:1 amount=i:10
+        \\table put orders i:2 day=i:2 amount=i:20
+        \\table put orders i:3 day=i:3 amount=i:30
+        \\table window orders lag:amount,lead:amount order day
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "__pk=1\tday=1\tamount=10\tlag_amount=(none)\tlead_amount=20\n" ++
+            "__pk=2\tday=2\tamount=20\tlag_amount=10\tlead_amount=30\n" ++
+            "__pk=3\tday=3\tamount=30\tlag_amount=20\tlead_amount=(none)\n",
+        out,
+    );
+}
+
+test "table window lag with an explicit offset and a caller-supplied default instead of NULL" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 day=i:1 amount=i:10
+        \\table put orders i:2 day=i:2 amount=i:20
+        \\table window orders lag:amount:1:i:-1 order day
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\n" ++
+            "__pk=1\tday=1\tamount=10\tlag_amount=-1\n" ++
+            "__pk=2\tday=2\tamount=20\tlag_amount=10\n",
+        out,
+    );
+}
+
+test "table window lag/lead --range is rejected outright, like row_number" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 amount=i:10
+        \\table window orders lag:amount order amount --range
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\nerror: RangeNotApplicable\n", out);
+}
+
+test "table window first_value/last_value --range: last_value shares the current tie group's last member" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 day=i:1 amount=i:10
+        \\table put orders i:2 day=i:1 amount=i:20
+        \\table put orders i:3 day=i:2 amount=i:5
+        \\table window orders first_value:amount,last_value:amount order day --range
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "__pk=1\tday=1\tamount=10\tfirst_value_amount=10\tlast_value_amount=20\n" ++
+            "__pk=2\tday=1\tamount=20\tfirst_value_amount=10\tlast_value_amount=20\n" ++
+            "__pk=3\tday=2\tamount=5\tfirst_value_amount=10\tlast_value_amount=5\n",
+        out,
+    );
+}
+
+test "table window last_value without --range degenerates to the row's own field (ROWS default)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 day=i:1 amount=i:10
+        \\table put orders i:2 day=i:2 amount=i:20
+        \\table window orders last_value:amount order day
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\n" ++
+            "__pk=1\tday=1\tamount=10\tlast_value_amount=10\n" ++
+            "__pk=2\tday=2\tamount=20\tlast_value_amount=20\n",
+        out,
+    );
+}
+
+test "table window nth_value --range: position resolved against the CUMULATIVE frame, not just the current tie group" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
