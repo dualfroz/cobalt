@@ -465,3 +465,161 @@ pub const Repl = struct {
         var right = try Table.open(self.db, self.allocator, jargs[2]);
         defer right.deinit();
 
+        switch (mode) {
+            .inner => {
+                const joined = try joinmod.innerJoin(self.allocator, &left, jargs[1], null, &right, jargs[3], null);
+                const paged = try joinmod.applyPage(joinmod.JoinedRow, self.allocator, joined, page);
+                defer joinmod.freeJoined(self.allocator, paged);
+                for (paged) |pair| {
+                    try writer.writeAll("L ");
+                    try printRow(writer, pair.left);
+                    try writer.writeAll("R ");
+                    try printRow(writer, pair.right);
+                }
+            },
+            .left => {
+                const joined = try joinmod.leftOuterJoin(self.allocator, &left, jargs[1], null, &right, jargs[3], null);
+                const paged = try joinmod.applyPage(joinmod.OuterJoinedRow, self.allocator, joined, page);
+                defer joinmod.freeOuterJoined(self.allocator, paged);
+                for (paged) |pair| {
+                    try writer.writeAll("L ");
+                    try printRow(writer, pair.left);
+                    if (pair.right) |r| {
+                        try writer.writeAll("R ");
+                        try printRow(writer, r);
+                    } else {
+                        try writer.writeAll("R (nil)\n");
+                    }
+                }
+            },
+            .right => {
+                const joined = try joinmod.rightOuterJoin(self.allocator, &left, jargs[1], null, &right, jargs[3], null);
+                const paged = try joinmod.applyPage(joinmod.RightOuterJoinedRow, self.allocator, joined, page);
+                defer joinmod.freeRightOuterJoined(self.allocator, paged);
+                for (paged) |pair| {
+                    if (pair.left) |l| {
+                        try writer.writeAll("L ");
+                        try printRow(writer, l);
+                    } else {
+                        try writer.writeAll("L (nil)\n");
+                    }
+                    try writer.writeAll("R ");
+                    try printRow(writer, pair.right);
+                }
+            },
+            .full => {
+                const joined = try joinmod.fullOuterJoin(self.allocator, &left, jargs[1], null, &right, jargs[3], null);
+                const paged = try joinmod.applyPage(joinmod.FullOuterJoinedRow, self.allocator, joined, page);
+                defer joinmod.freeFullOuterJoined(self.allocator, paged);
+                for (paged) |pair| {
+                    if (pair.left) |l| {
+                        try writer.writeAll("L ");
+                        try printRow(writer, l);
+                    } else {
+                        try writer.writeAll("L (nil)\n");
+                    }
+                    if (pair.right) |r| {
+                        try writer.writeAll("R ");
+                        try printRow(writer, r);
+                    } else {
+                        try writer.writeAll("R (nil)\n");
+                    }
+                }
+            },
+        }
+    }
+
+    /// `table aggregate <table> <groupField|*> <spec>[,<spec>...] [expr...]
+    /// [--limit N] [--offset N]`: interactive counterpart of the one-shot
+    /// CLI's `table aggregate` (main.zig's `runTable`) over `aggregate.zig`'s
+    /// `GroupBy`/`runGlobal`. `*` as the group field means no grouping
+    /// (`runGlobal`, always exactly one output line, `--limit`/`--offset`
+    /// ignored - nothing to page over a single row), same sentinel the CLI
+    /// uses; anything else groups by that field (`run`, one line per
+    /// distinct group value, first-seen order), windowed by
+    /// `aggregate.applyPageGroups` same as local `table aggregate`.
+    fn cmdTableAggregate(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len < 2) return ReplError.WrongArgCount;
+        var table = try Table.open(self.db, self.allocator, args[0]);
+        defer table.deinit();
+        const groupField = args[1];
+
+        const specs = parseAggSpecs(self.allocator, args[2]) catch return ReplError.InvalidArgument;
+        defer self.allocator.free(specs);
+
+        const flags = try extractPageFlags(self.allocator, args[3..]);
+        defer self.allocator.free(flags.rest);
+
+        const exprText = try std.mem.join(self.allocator, " ", flags.rest);
+        defer self.allocator.free(exprText);
+        var parsed: ?exprmod.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (exprText.len > 0) parsed = try exprmod.parse(self.allocator, exprText);
+        const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
+
+        const rows = try table.select(pred);
+        defer querymod.freeRows(self.allocator, rows);
+
+        if (std.mem.eql(u8, groupField, "*")) {
+            const values = try aggregatemod.runGlobal(self.allocator, rows, specs);
+            defer aggregatemod.freeGlobalResult(self.allocator, values);
+            for (specs, values, 0..) |spec, v, i| {
+                if (i > 0) try writer.writeAll("\t");
+                try printAggLabel(writer, spec);
+                try writer.writeAll("=");
+                try printValue(writer, v);
+            }
+            try writer.writeAll("\n");
+        } else {
+            const unpaged = try aggregatemod.run(self.allocator, rows, groupField, specs);
+            const groups = try aggregatemod.applyPageGroups(self.allocator, unpaged, .{ .offset = flags.page.offset, .limit = flags.page.limit });
+            defer {
+                for (groups) |*g| g.deinit(self.allocator);
+                self.allocator.free(groups);
+            }
+            for (groups) |g| {
+                try writer.writeAll("group=");
+                try printValue(writer, g.group);
+                for (specs, g.values) |spec, v| {
+                    try writer.writeAll("\t");
+                    try printAggLabel(writer, spec);
+                    try writer.writeAll("=");
+                    try printValue(writer, v);
+                }
+                try writer.writeAll("\n");
+            }
+        }
+    }
+
+    /// `table window <table> <kind[:field]>[,<kind[:field]>...] [expr...]
+    /// [partition <field>[,field...]] [order <field[:desc]>[,field...]]
+    /// [--limit N] [--offset N] [--range]`: interactive counterpart of the
+    /// one-shot CLI's `table window` (main.zig's `runTable`) over
+    /// `window.zig`'s `computeMany` - a comma-separated spec list computes
+    /// multiple annotation columns sharing one partition/order/frame,
+    /// mirroring `table aggregate`'s multi-spec list. Unlike
+    /// `cmdTableAggregate`, a window annotation never collapses rows - every
+    /// matching row is printed, annotated with the computed value(s) - so
+    /// `--limit`/`--offset` window WHICH rows get
+    /// printed, walked in `window.orderedIndices`' partition-then-order
+    /// display sequence (matching local `table window`'s fix for the same
+    /// raw-scan-order paging bug, not raw scan order). `--range` switches
+    /// sum/avg/count/min/max from the default ROWS running frame to SQL's
+    /// actual RANGE default (rows tied on `order` share the tie group's
+    /// combined value), same as local `table window`/`remote-window`;
+    /// rejected together with row_number/rank/dense_rank.
+    fn cmdTableWindow(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len < 2) return ReplError.WrongArgCount;
+        var table = try Table.open(self.db, self.allocator, args[0]);
+        defer table.deinit();
+
+        const specs = parseWindowSpecs(self.allocator, args[1]) catch return ReplError.InvalidArgument;
+        defer self.allocator.free(specs);
+
+        const flags = try extractPageFlags(self.allocator, args[2..]);
+        defer self.allocator.free(flags.rest);
+
+        const rangeFlag = try extractRangeFlag(self.allocator, flags.rest);
+        defer self.allocator.free(rangeFlag.rest);
+        const frame: windowmod.FrameMode = if (rangeFlag.range) .range else .rows;
+
