@@ -2200,3 +2200,471 @@ test "table window nth_value --range: position resolved against the CUMULATIVE f
     var repl = Repl.init(allocator, &db);
     defer repl.deinit();
 
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 day=i:1 amount=i:10
+        \\table put orders i:2 day=i:1 amount=i:20
+        \\table put orders i:3 day=i:2 amount=i:5
+        \\table window orders nth_value:amount:2 order day --range
+        \\
+    );
+    defer allocator.free(out);
+    // day=1's tie group has 2 members - position 2 is its second member (20).
+    // day=2's frame is UNBOUNDED PRECEDING through its own tie group, so it
+    // already includes day=1's rows too - position 2 was already resolved
+    // to 20 there and stays 20, even though day=2's OWN group has just 1 row.
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "__pk=1\tday=1\tamount=10\tnth_value_amount=20\n" ++
+            "__pk=2\tday=1\tamount=20\tnth_value_amount=20\n" ++
+            "__pk=3\tday=2\tamount=5\tnth_value_amount=20\n",
+        out,
+    );
+}
+
+test "table window nth_value ROWS default: NULL until the frame grows to reach the requested position" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 day=i:1 amount=i:10
+        \\table put orders i:2 day=i:2 amount=i:20
+        \\table window orders nth_value:amount:2 order day
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\n" ++
+            "__pk=1\tday=1\tamount=10\tnth_value_amount=(none)\n" ++
+            "__pk=2\tday=2\tamount=20\tnth_value_amount=20\n",
+        out,
+    );
+}
+
+test "table window nth_value with a caller-supplied default instead of NULL" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 day=i:1 amount=i:10
+        \\table window orders nth_value:amount:5:i:-1 order day
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\n__pk=1\tday=1\tamount=10\tnth_value_amount=-1\n",
+        out,
+    );
+}
+
+test "table window nth_value with no field or no position reports InvalidArgument" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 day=i:1 amount=i:10
+        \\table window orders nth_value order day
+        \\table window orders nth_value:amount order day
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nerror: InvalidArgument\nerror: InvalidArgument\n",
+        out,
+    );
+}
+
+test "table window count_distinct runs a per-row distinct total, repeats do not grow it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 day=i:1 tag=s:a
+        \\table put orders i:2 day=i:2 tag=s:b
+        \\table put orders i:3 day=i:3 tag=s:a
+        \\table window orders count_distinct:tag order day
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n" ++
+            "__pk=1\tday=1\ttag=a\tcount_distinct_tag=1\n" ++
+            "__pk=2\tday=2\ttag=b\tcount_distinct_tag=2\n" ++
+            "__pk=3\tday=3\ttag=a\tcount_distinct_tag=2\n",
+        out,
+    );
+}
+
+test "table window count_distinct with no field reports InvalidArgument, unlike bare count" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl,
+        \\table put orders i:1 tag=s:a
+        \\table window orders count_distinct
+        \\
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\nerror: InvalidArgument\n", out);
+}
+
+test "unknown command and wrong arg counts report errors without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "bogus\nput onlyone\nget\nput a 1\nget a\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "error: UnknownCommand\nerror: WrongArgCount\nerror: WrongArgCount\nOK\n1\n",
+        out,
+    );
+}
+
+test "staged writes inside a transaction are invisible until commit, then durable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "begin\nput bal 100\nget bal\ncommit\nget bal\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\nOK\n100\nOK\n100\n", out);
+}
+
+test "get mid-transaction steers the next put, applied atomically on commit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    try db.put("bal", "100");
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "begin\nget bal\nput bal 150\ncommit\nget bal\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\n100\nOK\nOK\n150\n", out);
+
+    const stored = (try db.get(allocator, "bal")).?;
+    defer allocator.free(stored);
+    try std.testing.expectEqualStrings("150", stored);
+}
+
+test "rollback discards staged writes entirely" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "begin\nput x 1\nrollback\nget x\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\nOK\nOK\n(nil)\n", out);
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "x"));
+}
+
+test "commit/rollback without an active transaction report NoActiveTransaction" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "commit\nrollback\nput a 1\nget a\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "error: NoActiveTransaction\nerror: NoActiveTransaction\nOK\n1\n",
+        out,
+    );
+}
+
+test "double begin is rejected and leaves the first transaction usable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "begin\nput a 1\nbegin\ncommit\nget a\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\nOK\nerror: TransactionAlreadyActive\nOK\n1\n", out);
+}
+
+test "table put/get/del inside a transaction stage through TableTxn atomically across two tables" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(
+        allocator,
+        &repl,
+        "begin\n" ++
+            "table put accounts 1 name=alice balance=i:100\n" ++
+            "table put ledger 1 note=opening\n" ++
+            "table get accounts 1\n" ++
+            "commit\n" ++
+            "table get accounts 1\n" ++
+            "table get ledger 1\n",
+    );
+    defer allocator.free(out);
+
+    var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, out, "\n"), '\n');
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    const preCommitGet = lines.next().?;
+    try std.testing.expect(std.mem.indexOf(u8, preCommitGet, "name=alice") != null);
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    const postAccounts = lines.next().?;
+    try std.testing.expect(std.mem.indexOf(u8, postAccounts, "balance=100") != null);
+    const postLedger = lines.next().?;
+    try std.testing.expect(std.mem.indexOf(u8, postLedger, "note=opening") != null);
+    try std.testing.expectEqual(@as(?[]const u8, null), lines.next());
+
+    var directTable = try Table.open(&db, allocator, "accounts");
+    defer directTable.deinit();
+    var row = (try directTable.get(.{ .text = "1" })).?;
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 100), row.get("balance").?.int);
+}
+
+test "table writes made before commit are not visible to an independent Table handle" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    var stream = std.io.fixedBufferStream("begin\ntable put accounts 1 name=alice\n");
+    var out = std.ArrayList(u8).init(allocator);
+    defer out.deinit();
+    try repl.runFromReader(stream.reader(), out.writer(), false);
+    try std.testing.expectEqualStrings("OK\nOK\n", out.items);
+
+    var outsider = try Table.open(&db, allocator, "accounts");
+    defer outsider.deinit();
+    try std.testing.expectEqual(@as(?Row, null), try outsider.get(.{ .text = "1" }));
+
+    try repl.txn.?.commit();
+    repl.discardTxnState();
+
+    var again = try Table.open(&db, allocator, "accounts");
+    defer again.deinit();
+    var row = (try again.get(.{ .text = "1" })).?;
+    defer row.deinit();
+    try std.testing.expectEqualStrings("alice", row.get("name").?.text);
+}
+
+test "table put/get/del outside a transaction autocommit immediately like plain Table" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(
+        allocator,
+        &repl,
+        "table put widgets 7 sku=s:ABC qty=i:3\ntable get widgets 7\ntable del widgets 7\ntable get widgets 7\n",
+    );
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "OK\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "sku=ABC") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "qty=3") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "(nil)\n"));
+}
+
+test "malformed field is rejected before staging, transaction stays usable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(
+        allocator,
+        &repl,
+        "begin\ntable put accounts 1 badfieldnoequals\ntable put accounts 1 name=bob\ncommit\ntable get accounts 1\n",
+    );
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "OK\nerror: InvalidField\nOK\nOK\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "name=bob") != null);
+}
+
+test "a real external conflict surfaces error.Conflict on commit and applies nothing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    try db.put("balance", "100");
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    var stream = std.io.fixedBufferStream("begin\nget balance\n");
+    var out = std.ArrayList(u8).init(allocator);
+    defer out.deinit();
+    try repl.runFromReader(stream.reader(), out.writer(), false);
+
+    try db.put("balance", "external");
+
+    var stream2 = std.io.fixedBufferStream("put balance 150\ncommit\n");
+    try repl.runFromReader(stream2.reader(), out.writer(), false);
+    try std.testing.expect(std.mem.endsWith(u8, out.items, "OK\nerror: Conflict\n"));
+
+    const current = (try db.get(allocator, "balance")).?;
+    defer allocator.free(current);
+    try std.testing.expectEqualStrings("external", current);
+    try std.testing.expect(repl.inTransaction());
+
+    var stream3 = std.io.fixedBufferStream("rollback\n");
+    try repl.runFromReader(stream3.reader(), out.writer(), false);
+    try std.testing.expect(!repl.inTransaction());
+}
+
+test "scan always reflects committed Db state, not an in-flight transaction's staged writes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "put k1 v1\nbegin\nput k2 v2\nscan k\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\nOK\nOK\nk1\tv1\n", out);
+}
+
+test "abandoning an open transaction on deinit frees staged writes and pending TableTxn state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    const out = try runScript(allocator, &repl, "begin\nput a 1\ntable put accounts 1 name=alice\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\nOK\nOK\n", out);
+    repl.deinit();
+
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "a"));
+    var table = try Table.open(&db, allocator, "accounts");
+    defer table.deinit();
+    try std.testing.expectEqual(@as(?Row, null), try table.get(.{ .text = "1" }));
+}
+
+test "flush and compact run against the live Db and stats reflects it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "put a 1\nflush\ncompact\nstats\n");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "OK\nOK\nOK\n"));
+    try std.testing.expect(out.len > "OK\nOK\nOK\n".len);
+}
+
+test "help lists commands without touching db state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "help\n");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "begin / commit / rollback") != null);
+}
+
+test "prompt is written before each read only when requested" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    var stream = std.io.fixedBufferStream("begin\nput a 1\n");
+    var out = std.ArrayList(u8).init(allocator);
+    defer out.deinit();
+    try repl.runFromReader(stream.reader(), out.writer(), true);
+    try std.testing.expectEqualStrings("cobalt> OK\ncobalt(txn)> OK\ncobalt(txn)> ", out.items);
+}
+
