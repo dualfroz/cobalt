@@ -623,3 +623,168 @@ pub const Repl = struct {
         defer self.allocator.free(rangeFlag.rest);
         const frame: windowmod.FrameMode = if (rangeFlag.range) .range else .rows;
 
+        const split = splitWindowArgs(rangeFlag.rest);
+
+        const exprText = try std.mem.join(self.allocator, " ", split.whereArgs);
+        defer self.allocator.free(exprText);
+        var parsed: ?exprmod.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (exprText.len > 0) parsed = try exprmod.parse(self.allocator, exprText);
+        const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
+
+        var partitionBy: [][]const u8 = &.{};
+        defer self.allocator.free(partitionBy);
+        if (split.partitionArgs) |partitionArgs| {
+            if (partitionArgs.len != 1) return ReplError.InvalidArgument;
+            partitionBy = parsePartitionList(self.allocator, partitionArgs[0]) catch return ReplError.InvalidArgument;
+        }
+
+        var orderBy: []querymod.OrderBy = &.{};
+        defer self.allocator.free(orderBy);
+        if (split.orderArgs) |orderArgs| {
+            if (orderArgs.len != 1) return ReplError.InvalidArgument;
+            orderBy = parseOrderByList(self.allocator, orderArgs[0]) catch return ReplError.InvalidArgument;
+        }
+
+        const rows = try table.select(pred);
+        defer querymod.freeRows(self.allocator, rows);
+
+        const results = try windowmod.computeMany(self.allocator, rows, partitionBy, orderBy, specs, frame);
+        defer windowmod.freeManyResults(self.allocator, results);
+
+        const displayOrder = try windowmod.orderedIndices(self.allocator, rows, partitionBy, orderBy);
+        defer self.allocator.free(displayOrder);
+
+        const total = displayOrder.len;
+        const start = @min(flags.page.offset, total);
+        const end = if (flags.page.limit == 0) total else @min(start + flags.page.limit, total);
+        var i: usize = start;
+        while (i < end) : (i += 1) {
+            const rowIdx = displayOrder[i];
+            for (rows[rowIdx].fields.items, 0..) |f, j| {
+                if (j > 0) try writer.writeAll("\t");
+                try writer.print("{s}=", .{f.name});
+                try printValue(writer, f.value);
+            }
+            if (rows[rowIdx].fields.items.len > 0) try writer.writeAll("\t");
+            for (specs, 0..) |spec, specIdx| {
+                if (specIdx > 0) try writer.writeAll("\t");
+                try printWindowLabel(writer, spec);
+                try writer.writeAll("=");
+                try printValue(writer, results[rowIdx][specIdx]);
+            }
+            try writer.writeAll("\n");
+        }
+    }
+
+    fn getOrOpenTableTxn(self: *Repl, name: []const u8) !*TableTxn {
+        if (self.tableTxns.getPtr(name)) |existing| return existing;
+        var opened = try TableTxn.open(&self.txn.?, self.allocator, name);
+        errdefer opened.deinit();
+        const nameCopy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(nameCopy);
+        try self.tableTxns.put(nameCopy, opened);
+        return self.tableTxns.getPtr(name).?;
+    }
+
+    fn tablePut(self: *Repl, name: []const u8, pk: Value, fields: []const Field) !void {
+        if (self.txn != null) {
+            const tt = try self.getOrOpenTableTxn(name);
+            return tt.put(pk, fields);
+        }
+        var table = try Table.open(self.db, self.allocator, name);
+        defer table.deinit();
+        try table.put(pk, fields);
+    }
+
+    fn tableGet(self: *Repl, name: []const u8, pk: Value) !?Row {
+        if (self.txn != null) {
+            const tt = try self.getOrOpenTableTxn(name);
+            return tt.get(pk);
+        }
+        var table = try Table.open(self.db, self.allocator, name);
+        defer table.deinit();
+        return table.get(pk);
+    }
+
+    fn tableDel(self: *Repl, name: []const u8, pk: Value) !void {
+        if (self.txn != null) {
+            const tt = try self.getOrOpenTableTxn(name);
+            return tt.delete(pk);
+        }
+        var table = try Table.open(self.db, self.allocator, name);
+        defer table.deinit();
+        try table.delete(pk);
+    }
+
+    /// Runs `coll <kind> <op> [args...]` against the live `Db` - the
+    /// interactive counterpart of the one-shot CLI's `coll` command
+    /// (main.zig's `runColl`), same dispatch shape and lazy-expiry-on-
+    /// access behavior (every op below reads/writes a named collection as
+    /// `rest[0]`, so a collection whose TTL already elapsed is expired
+    /// before the op sees it, matching the CLI). Deliberately NOT routed
+    /// through the REPL's active `Transaction` the way `table`/plain
+    /// `put`/`get`/`del` are: `Counter.incrBy`/`List.pushLeft`/`ZSet.add`/
+    /// etc. already open and commit their OWN internal `Transaction` with
+    /// OCC retry per call (see collections.zig), so there is no staged,
+    /// uncommitted state here for `begin`/`commit` to bracket the way
+    /// `TableTxn` brackets table writes - every `coll` op is independently
+    /// durable the instant it returns, with or without an open REPL
+    /// transaction, exactly like `scan` above always sees committed state
+    /// only regardless of any in-flight transaction.
+    fn cmdColl(self: *Repl, args: []const []const u8, writer: anytype) !void {
+        if (args.len >= 1 and std.mem.eql(u8, args[0], "expire-sweep")) {
+            if (args.len != 1) return ReplError.WrongArgCount;
+            const reaped = try collttlmod.sweepExpired(self.db, self.allocator, std.time.nanoTimestamp());
+            try writer.print("reaped: {d}\n", .{reaped});
+            return;
+        }
+        if (args.len < 2) return ReplError.WrongArgCount;
+        const kind = CollKind.parse(args[0]) orelse return ReplError.UnknownCollectionKind;
+        const op = args[1];
+        const rest = args[2..];
+
+        if (std.mem.eql(u8, op, "expire") or std.mem.eql(u8, op, "ttl") or std.mem.eql(u8, op, "persist")) {
+            return self.cmdCollTtl(kind, op, rest, writer);
+        }
+
+        if (rest.len >= 1) {
+            _ = try collttlmod.expireIfDue(self.db, self.allocator, kind, rest[0], std.time.nanoTimestamp());
+        }
+
+        switch (kind) {
+            .counter => try self.cmdCollCounter(op, rest, writer),
+            .hash => try self.cmdCollHash(op, rest, writer),
+            .set => try self.cmdCollSet(op, rest, writer),
+            .list => try self.cmdCollList(op, rest, writer),
+            .zset => try self.cmdCollZSet(op, rest, writer),
+        }
+    }
+
+    /// `coll <kind> expire|ttl|persist <name>` and `coll expire-sweep`
+    /// mirror the CLI's `runCollTtl`/top-of-`runColl` special case over
+    /// collttl.zig - the collection-namespace counterpart of `cmdExpire`/
+    /// `cmdPersist`/`cmdTtl`/`cmdExpireSweep` above, same reasoning for
+    /// bypassing the active transaction (a whole collection's expiry is not
+    /// staged through `Transaction` either).
+    fn cmdCollTtl(self: *Repl, kind: CollKind, op: []const u8, args: []const []const u8, writer: anytype) !void {
+        if (std.mem.eql(u8, op, "expire")) {
+            if (args.len != 2) return ReplError.WrongArgCount;
+            const seconds = std.fmt.parseInt(u64, args[1], 10) catch return ReplError.InvalidArgument;
+            if (!try collectionsmod.collectionExists(self.db, self.allocator, kind, args[0])) return ReplError.NoSuchKey;
+            try collttlmod.setExpireSeconds(self.db, self.allocator, kind, args[0], std.time.nanoTimestamp(), seconds);
+            try writer.writeAll("OK\n");
+        } else if (std.mem.eql(u8, op, "persist")) {
+            if (args.len != 1) return ReplError.WrongArgCount;
+            try collttlmod.clearExpire(self.db, self.allocator, kind, args[0]);
+            try writer.writeAll("OK\n");
+        } else {
+            if (args.len != 1) return ReplError.WrongArgCount;
+            switch (try collttlmod.remaining(self.db, self.allocator, kind, args[0], std.time.nanoTimestamp())) {
+                .noKey => try writer.writeAll("-2\n"),
+                .noExpiry => try writer.writeAll("-1\n"),
+                .seconds => |s| try writer.print("{d}\n", .{s}),
+            }
+        }
+    }
+
