@@ -2668,3 +2668,167 @@ test "prompt is written before each read only when requested" {
     try std.testing.expectEqualStrings("cobalt> OK\ncobalt(txn)> OK\ncobalt(txn)> ", out.items);
 }
 
+test "coll counter get/set/incrby work interactively like the CLI's coll command" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(
+        allocator,
+        &repl,
+        "coll counter get hits\ncoll counter set hits 10\ncoll counter incrby hits 5\ncoll counter get hits\n",
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("0\nOK\n15\n15\n", out);
+}
+
+test "coll hash set/get/del/len/getall round-trip a field" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(
+        allocator,
+        &repl,
+        "coll hash set user name alice\ncoll hash get user name\ncoll hash len user\n" ++
+            "coll hash getall user\ncoll hash del user name\ncoll hash get user name\n",
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "created\nalice\n1\nname\talice\n1\n(nil)\n",
+        out,
+    );
+}
+
+test "coll set add/ismember/card/members/inter/union/diff cover real set operations" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(
+        allocator,
+        &repl,
+        "coll set add a x\ncoll set add a y\ncoll set add b y\n" ++
+            "coll set ismember a x\ncoll set card a\n" ++
+            "coll set inter a b\ncoll set diff a b\n",
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "1\n1\n1\n1\n2\ny\nx\n",
+        out,
+    );
+}
+
+test "coll list lpush/rpush/lpop/rpop/len/range behave like a deque" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(
+        allocator,
+        &repl,
+        "coll list rpush q one\ncoll list rpush q two\ncoll list lpush q zero\n" ++
+            "coll list len q\ncoll list range q 0 -1\ncoll list lpop q\ncoll list rpop q\n",
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\nOK\n3\nzero\none\ntwo\nzero\ntwo\n",
+        out,
+    );
+}
+
+test "coll zset add/score/incrby/rangebyscore/rank track member order" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(
+        allocator,
+        &repl,
+        "coll zset add ranks alice 10\ncoll zset add ranks bob 20\n" ++
+            "coll zset incrby ranks alice 15\ncoll zset score ranks alice\n" ++
+            "coll zset rank ranks alice\ncoll zset rangebyscore ranks 0 100\n",
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "OK\nOK\n25\n25\n1\nbob\t20\nalice\t25\n",
+        out,
+    );
+}
+
+test "coll reports UnknownCollectionKind/UnknownCollectionOp/InvalidArgument without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(
+        allocator,
+        &repl,
+        "coll bogus get x\ncoll counter frobnicate x\ncoll counter set x notanumber\ncoll counter get x\n",
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "error: UnknownCollectionKind\nerror: UnknownCollectionOp\nerror: InvalidArgument\n0\n",
+        out,
+    );
+}
+
+test "expire/ttl/persist manage a plain key's TTL like the CLI's same-named commands" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(
+        allocator,
+        &repl,
+        "put a 1\nttl a\nexpire a 100\nttl a\npersist a\nttl a\nttl missing\n",
+    );
+    defer allocator.free(out);
+
+    var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, out, "\n"), '\n');
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    try std.testing.expectEqualStrings("-1", lines.next().?);
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    const withTtl = std.fmt.parseInt(i64, lines.next().?, 10) catch unreachable;
+    try std.testing.expect(withTtl > 0 and withTtl <= 100);
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    try std.testing.expectEqualStrings("-1", lines.next().?);
+    try std.testing.expectEqualStrings("-2", lines.next().?);
+    try std.testing.expectEqual(@as(?[]const u8, null), lines.next());
+}
+
