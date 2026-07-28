@@ -2832,3 +2832,107 @@ test "expire/ttl/persist manage a plain key's TTL like the CLI's same-named comm
     try std.testing.expectEqual(@as(?[]const u8, null), lines.next());
 }
 
+test "expire on a missing key reports NoSuchKey without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "expire ghost 10\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("error: NoSuchKey\n", out);
+}
+
+test "expire-sweep reaps an already-elapsed plain-key TTL" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    try db.put("a", "1");
+    try ttlmod.setExpireSeconds(&db, allocator, "a", std.time.nanoTimestamp() - 10 * std.time.ns_per_s, 1);
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "expire-sweep\nget a\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("reaped: 1\n(nil)\n", out);
+}
+
+test "coll expire/ttl/persist manage a whole collection's TTL, and coll expire-sweep reaps it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(
+        allocator,
+        &repl,
+        "coll counter set hits 1\ncoll counter ttl hits\ncoll counter expire hits 100\n" ++
+            "coll counter ttl hits\ncoll counter persist hits\ncoll counter ttl hits\n",
+    );
+    defer allocator.free(out);
+
+    var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, out, "\n"), '\n');
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    try std.testing.expectEqualStrings("-1", lines.next().?);
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    const withTtl = std.fmt.parseInt(i64, lines.next().?, 10) catch unreachable;
+    try std.testing.expect(withTtl > 0 and withTtl <= 100);
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    try std.testing.expectEqualStrings("-1", lines.next().?);
+    try std.testing.expectEqual(@as(?[]const u8, null), lines.next());
+
+    try collttlmod.setExpireSeconds(&db, allocator, .counter, "hits", std.time.nanoTimestamp() - 10 * std.time.ns_per_s, 1);
+    const swept = try runScript(allocator, &repl, "coll expire-sweep\n");
+    defer allocator.free(swept);
+    try std.testing.expectEqualStrings("reaped: 1\n", swept);
+    try std.testing.expect(!try collectionsmod.collectionExists(&db, allocator, .counter, "hits"));
+}
+
+test "coll expire on a nonexistent collection reports NoSuchKey" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "coll counter expire ghost 10\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("error: NoSuchKey\n", out);
+}
+
+test "coll expires a collection lazily via collttl before the next op sees it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try collectionsmod.Counter.set(&db, allocator, "session", 42);
+    try collttlmod.setExpireSeconds(&db, allocator, .counter, "session", std.time.nanoTimestamp() - 10 * std.time.ns_per_s, 1);
+    try std.testing.expect(try collectionsmod.collectionExists(&db, allocator, .counter, "session"));
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    // Reading it through the REPL must trigger the same lazy-expiry check
+    // the CLI's `runColl` performs before every op, so an already-elapsed
+    // TTL is honored immediately instead of only on the next sweep.
+    const out = try runScript(allocator, &repl, "coll counter get session\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("0\n", out);
+    try std.testing.expect(!try collectionsmod.collectionExists(&db, allocator, .counter, "session"));
+}
