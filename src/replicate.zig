@@ -322,3 +322,487 @@ pub fn saveState(allocator: Allocator, replicaDirPath: []const u8, primaryDirPat
     var dir = try std.fs.cwd().openDir(replicaDirPath, .{});
     defer dir.close();
 
+    var body = std.ArrayList(u8).init(allocator);
+    defer body.deinit();
+    const writer = encode.ByteWriter.init(&body);
+    try writer.slice(stateMagic);
+    try writer.putU32(stateFormatVersion);
+    try writer.putU64(offsetValue);
+    try writer.putU64(generationValue);
+    try writer.putU32(@intCast(primaryDirPath.len));
+    try writer.slice(primaryDirPath);
+    try writer.putU32(encode.crc(body.items));
+
+    {
+        const file = try dir.createFile(stateTmpName, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(body.items);
+        try file.sync();
+    }
+    try dir.rename(stateTmpName, stateFileName);
+}
+
+/// Loads a previously persisted tail offset for a replica directory. Returns
+/// null (not an error) when no state file has ever been written there yet -
+/// callers treat that as "fresh replica, bootstrap via fullResync()" exactly
+/// like before this existed. Returns StateError.PrimaryMismatch if the file
+/// was written while tailing a different primary directory, so a replica
+/// can never silently resume against the wrong primary from a stale offset.
+pub fn loadOffset(allocator: Allocator, replicaDirPath: []const u8, primaryDirPath: []const u8) !?PersistedState {
+    var dir = try std.fs.cwd().openDir(replicaDirPath, .{});
+    defer dir.close();
+
+    const data = dir.readFileAlloc(allocator, stateFileName, maxStateRead) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(data);
+
+    const fixedLen = 4 + 4 + 8 + 8 + 4;
+    if (data.len < fixedLen + 4) return StateError.Truncated;
+    if (!std.mem.eql(u8, data[0..4], stateMagic)) return StateError.BadMagic;
+    const version = encode.readU32(data, 4);
+    if (version != stateFormatVersion) return StateError.UnsupportedVersion;
+    const offsetValue = encode.readU64(data, 8);
+    const generationValue = encode.readU64(data, 16);
+    const pathLen = encode.readU32(data, 24);
+    const pathStart = fixedLen;
+    if (data.len != pathStart + pathLen + 4) return StateError.Truncated;
+    const storedPath = data[pathStart .. pathStart + pathLen];
+    const storedCrc = encode.readU32(data, pathStart + pathLen);
+    if (encode.crc(data[0 .. pathStart + pathLen]) != storedCrc) return StateError.Corrupt;
+    if (!std.mem.eql(u8, storedPath, primaryDirPath)) return StateError.PrimaryMismatch;
+
+    return .{ .offset = offsetValue, .generation = generationValue };
+}
+
+test "replicator mirrors puts and deletes from a live primary" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const primaryDir = try std.fs.path.join(allocator, &.{ base, "primary" });
+    defer allocator.free(primaryDir);
+    const replicaDir = try std.fs.path.join(allocator, &.{ base, "replica" });
+    defer allocator.free(replicaDir);
+
+    var primary = try Db.open(allocator, primaryDir, .{});
+    defer primary.close();
+    var replica = try Db.open(allocator, replicaDir, .{});
+    defer replica.close();
+
+    try primary.put("alpha", "one");
+    try primary.put("bravo", "two");
+
+    var rep = try Replicator.init(allocator, primaryDir, &replica);
+    defer rep.deinit();
+
+    const applied = try rep.syncOnce();
+    try std.testing.expectEqual(@as(usize, 2), applied);
+
+    const a = try replica.get(allocator, "alpha");
+    defer if (a) |v| allocator.free(v);
+    try std.testing.expectEqualStrings("one", a.?);
+    const b = try replica.get(allocator, "bravo");
+    defer if (b) |v| allocator.free(v);
+    try std.testing.expectEqualStrings("two", b.?);
+
+    try primary.delete("alpha");
+    const applied2 = try rep.syncOnce();
+    try std.testing.expectEqual(@as(usize, 1), applied2);
+
+    const a2 = try replica.get(allocator, "alpha");
+    try std.testing.expectEqual(@as(?[]u8, null), a2);
+}
+
+test "replicator syncOnce is idempotent between polls" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const primaryDir = try std.fs.path.join(allocator, &.{ base, "primary" });
+    defer allocator.free(primaryDir);
+    const replicaDir = try std.fs.path.join(allocator, &.{ base, "replica" });
+    defer allocator.free(replicaDir);
+
+    var primary = try Db.open(allocator, primaryDir, .{});
+    defer primary.close();
+    var replica = try Db.open(allocator, replicaDir, .{});
+    defer replica.close();
+
+    var rep = try Replicator.init(allocator, primaryDir, &replica);
+    defer rep.deinit();
+
+    try primary.put("k1", "v1");
+    try std.testing.expectEqual(@as(usize, 1), try rep.syncOnce());
+    try std.testing.expectEqual(@as(usize, 0), try rep.syncOnce());
+
+    try primary.put("k2", "v2");
+    try std.testing.expectEqual(@as(usize, 1), try rep.syncOnce());
+    try std.testing.expectEqual(@as(usize, 0), try rep.syncOnce());
+
+    var count: usize = 0;
+    var iter = try replica.scan(allocator, null, null);
+    defer iter.deinit();
+    while (try iter.next()) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "replicator applies batched writes from Db.apply as one poll" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const primaryDir = try std.fs.path.join(allocator, &.{ base, "primary" });
+    defer allocator.free(primaryDir);
+    const replicaDir = try std.fs.path.join(allocator, &.{ base, "replica" });
+    defer allocator.free(replicaDir);
+
+    var primary = try Db.open(allocator, primaryDir, .{});
+    defer primary.close();
+    var replica = try Db.open(allocator, replicaDir, .{});
+    defer replica.close();
+
+    var writeBatch = WriteBatch.init(allocator);
+    defer writeBatch.deinit();
+    try writeBatch.put("x", "1");
+    try writeBatch.put("y", "2");
+    try writeBatch.delete("z");
+    try primary.apply(&writeBatch);
+
+    var rep = try Replicator.init(allocator, primaryDir, &replica);
+    defer rep.deinit();
+    const applied = try rep.syncOnce();
+    try std.testing.expectEqual(@as(usize, 3), applied);
+
+    const x = try replica.get(allocator, "x");
+    defer if (x) |v| allocator.free(v);
+    try std.testing.expectEqualStrings("1", x.?);
+    const z = try replica.get(allocator, "z");
+    try std.testing.expectEqual(@as(?[]u8, null), z);
+}
+
+test "replicator poll does not consume a torn tail frame" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const primaryDir = try std.fs.path.join(allocator, &.{ base, "primary" });
+    defer allocator.free(primaryDir);
+    const replicaDir = try std.fs.path.join(allocator, &.{ base, "replica" });
+    defer allocator.free(replicaDir);
+
+    var primary = try Db.open(allocator, primaryDir, .{});
+    defer primary.close();
+    var replica = try Db.open(allocator, replicaDir, .{});
+    defer replica.close();
+
+    var rep = try Replicator.init(allocator, primaryDir, &replica);
+    defer rep.deinit();
+
+    try primary.put("good", "data");
+    try std.testing.expectEqual(@as(usize, 1), try rep.syncOnce());
+
+    // Simulate a writer mid-append: raw bytes appended after the good frame
+    // that never form a complete, crc-verified frame.
+    try primary.wal.file.seekFromEnd(0);
+    try primary.wal.file.writeAll(&[_]u8{ 0xAA, 0xBB, 0xCC });
+    try primary.wal.sync();
+
+    try std.testing.expectEqual(@as(usize, 0), try rep.syncOnce());
+
+    // The writer "finishes": a real, complete frame lands after the torn
+    // bytes are naturally never completed (matches wal.zig's own tolerance -
+    // torn tail bytes are simply never a valid prefix of a later frame, so
+    // this models a stalled partial write, not a resumed one).
+    var count: usize = 0;
+    var iter = try replica.scan(allocator, null, null);
+    defer iter.deinit();
+    while (try iter.next()) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "replicator surfaces truncation when it falls behind a primary flush" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const primaryDir = try std.fs.path.join(allocator, &.{ base, "primary" });
+    defer allocator.free(primaryDir);
+    const replicaDir = try std.fs.path.join(allocator, &.{ base, "replica" });
+    defer allocator.free(replicaDir);
+
+    var primary = try Db.open(allocator, primaryDir, .{});
+    defer primary.close();
+    var replica = try Db.open(allocator, replicaDir, .{});
+    defer replica.close();
+
+    try primary.put("k", "v");
+
+    var rep = try Replicator.init(allocator, primaryDir, &replica);
+    defer rep.deinit();
+    // Advance the tailer's offset without applying, then flush the primary
+    // (truncates wal.log to 0) so the tailer's remembered offset now points
+    // past the end of the (now-empty) file.
+    const staleRecords = try rep.tailer.poll();
+    freeAll(allocator, staleRecords);
+    try primary.flush();
+
+    // The primary's flush() bumped its WAL generation, so the generation
+    // check in poll() fires before the (now also true, but weaker) raw
+    // byte-offset comparison would have.
+    try std.testing.expectError(ReplicateError.WalGenerationChanged, rep.syncOnce());
+
+    const recovered = try rep.fullResync(&primary, 500);
+    try std.testing.expectEqual(@as(usize, 1), recovered);
+    try std.testing.expectEqual(@as(u64, 0), rep.offset());
+
+    const v = try replica.get(allocator, "k");
+    defer if (v) |val| allocator.free(val);
+    try std.testing.expectEqualStrings("v", v.?);
+
+    // New writes after the resync are picked up normally through the
+    // freshly-restarted tail at offset 0.
+    try primary.put("k2", "v2");
+    try std.testing.expectEqual(@as(usize, 1), try rep.syncOnce());
+    const v2 = try replica.get(allocator, "k2");
+    defer if (v2) |val| allocator.free(val);
+    try std.testing.expectEqualStrings("v2", v2.?);
+}
+
+test "replicator fullResync bootstraps a brand new replica" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const primaryDir = try std.fs.path.join(allocator, &.{ base, "primary" });
+    defer allocator.free(primaryDir);
+    const replicaDir = try std.fs.path.join(allocator, &.{ base, "replica" });
+    defer allocator.free(replicaDir);
+
+    var primary = try Db.open(allocator, primaryDir, .{});
+    defer primary.close();
+    var replica = try Db.open(allocator, replicaDir, .{});
+    defer replica.close();
+
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        var keyBuf: [16]u8 = undefined;
+        var valBuf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&keyBuf, "key{d}", .{i});
+        const val = try std.fmt.bufPrint(&valBuf, "val{d}", .{i});
+        try primary.put(key, val);
+    }
+
+    var rep = try Replicator.init(allocator, primaryDir, &replica);
+    defer rep.deinit();
+    const applied = try rep.fullResync(&primary, 7);
+    try std.testing.expectEqual(@as(usize, 50), applied);
+
+    var count: usize = 0;
+    var iter = try replica.scan(allocator, null, null);
+    defer iter.deinit();
+    while (try iter.next()) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 50), count);
+
+    // Fresh writes after the bootstrap keep tailing correctly from offset 0.
+    try primary.put("late", "arrival");
+    try std.testing.expectEqual(@as(usize, 1), try rep.syncOnce());
+    const v = try replica.get(allocator, "late");
+    defer if (v) |val| allocator.free(val);
+    try std.testing.expectEqualStrings("arrival", v.?);
+}
+
+test "walTailer rejects a nonexistent primary directory" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.FileNotFound, WalTailer.open(allocator, "/nonexistent", 0, 0));
+}
+
+test "loadOffset returns null for a replica directory that never saved state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    const loaded = try loadOffset(allocator, base, "/some/primary");
+    try std.testing.expectEqual(@as(?PersistedState, null), loaded);
+}
+
+test "saveState then loadOffset round-trips the offset, generation, and primary path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    try saveState(allocator, base, "/data/primary", 4096, 7);
+    const loaded = try loadOffset(allocator, base, "/data/primary");
+    try std.testing.expectEqual(@as(u64, 4096), loaded.?.offset);
+    try std.testing.expectEqual(@as(u64, 7), loaded.?.generation);
+}
+
+test "saveState overwrites a prior state file with the newest offset and generation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    try saveState(allocator, base, "/data/primary", 10, 0);
+    try saveState(allocator, base, "/data/primary", 20, 1);
+    try saveState(allocator, base, "/data/primary", 30, 2);
+    const loaded = try loadOffset(allocator, base, "/data/primary");
+    try std.testing.expectEqual(@as(u64, 30), loaded.?.offset);
+    try std.testing.expectEqual(@as(u64, 2), loaded.?.generation);
+}
+
+test "loadOffset rejects a state file saved for a different primary" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    try saveState(allocator, base, "/data/primary-a", 123, 0);
+    try std.testing.expectError(StateError.PrimaryMismatch, loadOffset(allocator, base, "/data/primary-b"));
+}
+
+test "loadOffset rejects a corrupted state file without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    try saveState(allocator, base, "/data/primary", 55, 3);
+
+    {
+        const file = try tmp.dir.openFile(stateFileName, .{ .mode = .read_write });
+        defer file.close();
+        try file.seekTo(9);
+        try file.writeAll(&[_]u8{0xFF});
+    }
+
+    try std.testing.expectError(StateError.Corrupt, loadOffset(allocator, base, "/data/primary"));
+}
+
+test "loadOffset rejects a truncated state file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    try saveState(allocator, base, "/data/primary", 55, 3);
+
+    {
+        const file = try tmp.dir.openFile(stateFileName, .{ .mode = .read_write });
+        defer file.close();
+        try file.setEndPos(6);
+    }
+
+    try std.testing.expectError(StateError.Truncated, loadOffset(allocator, base, "/data/primary"));
+}
+
+test "loadOffset rejects a bad magic header" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    try saveState(allocator, base, "/data/primary", 55, 3);
+
+    {
+        const file = try tmp.dir.openFile(stateFileName, .{ .mode = .read_write });
+        defer file.close();
+        try file.seekTo(0);
+        try file.writeAll("XXXX");
+    }
+
+    try std.testing.expectError(StateError.BadMagic, loadOffset(allocator, base, "/data/primary"));
+}
+
+test "loadOffset rejects a state file written in the pre-generation v1 format" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    var body = std.ArrayList(u8).init(allocator);
+    defer body.deinit();
+    const writer = encode.ByteWriter.init(&body);
+    try writer.slice("CRPS");
+    try writer.putU32(1);
+    try writer.putU64(999);
+    const primaryPath = "/data/primary";
+    try writer.putU32(@intCast(primaryPath.len));
+    try writer.slice(primaryPath);
+    try writer.putU32(encode.crc(body.items));
+
+    const file = try tmp.dir.createFile(stateFileName, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(body.items);
+
+    try std.testing.expectError(StateError.UnsupportedVersion, loadOffset(allocator, base, "/data/primary"));
+}
+
+test "saveState and loadOffset round-trip through a real replicate directory end to end" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const primaryDir = try std.fs.path.join(allocator, &.{ base, "primary" });
+    defer allocator.free(primaryDir);
+    const replicaDir = try std.fs.path.join(allocator, &.{ base, "replica" });
+    defer allocator.free(replicaDir);
+
+    var primary = try Db.open(allocator, primaryDir, .{});
+    defer primary.close();
+    var replica = try Db.open(allocator, replicaDir, .{});
+    defer replica.close();
+
+    try primary.put("a", "1");
+    try primary.put("b", "2");
+
+    var rep = try Replicator.init(allocator, primaryDir, &replica);
+    defer rep.deinit();
+    _ = try rep.syncOnce();
+    try saveState(allocator, replicaDir, primaryDir, rep.offset(), rep.generation());
+    const savedOffset = rep.offset();
+    try std.testing.expect(savedOffset > 0);
+
+    // A brand new process would reopen the replica Db and reconstruct a
+    // Replicator from the persisted offset instead of offset 0.
+    var replica2 = try Db.open(allocator, replicaDir, .{});
+    defer replica2.close();
+    const resumed = (try loadOffset(allocator, replicaDir, primaryDir)).?;
+    try std.testing.expectEqual(savedOffset, resumed.offset);
+    try std.testing.expectEqual(rep.generation(), resumed.generation);
+
+    var rep2 = try Replicator.initFromOffset(allocator, primaryDir, &replica2, resumed.offset, resumed.generation);
+    defer rep2.deinit();
+    try primary.put("c", "3");
+    const applied = try rep2.syncOnce();
+    try std.testing.expectEqual(@as(usize, 1), applied);
+
+    const c = try replica2.get(allocator, "c");
+    defer if (c) |v| allocator.free(v);
+    try std.testing.expectEqualStrings("3", c.?);
+    // The earlier keys were never re-applied through rep2 (it resumed past
+    // them), yet they are still visible because replica2 is the same
+    // on-disk replica Db that rep already wrote them into.
+    const a = try replica2.get(allocator, "a");
+    defer if (a) |v| allocator.free(v);
+    try std.testing.expectEqualStrings("1", a.?);
+}
