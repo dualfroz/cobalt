@@ -777,3 +777,155 @@ pub const Server = struct {
                 defer self.allocator.free(pairs);
                 for (fields, 0..) |f, i| pairs[i] = .{ .field = f.field, .value = f.value };
                 try self.writeCollReply(writer, .{ .pairList = pairs });
+            },
+            .set_add => {
+                if (a.len < 1) return error.InvalidArgCount;
+                const added = try collmod.Set.add(self.db, self.allocator, args.name, a[0]);
+                try self.writeCollReply(writer, .{ .int = if (added) 1 else 0 });
+            },
+            .set_rem => {
+                if (a.len < 1) return error.InvalidArgCount;
+                const removed = try collmod.Set.remove(self.db, self.allocator, args.name, a[0]);
+                try self.writeCollReply(writer, .{ .int = if (removed) 1 else 0 });
+            },
+            .set_ismember => {
+                if (a.len < 1) return error.InvalidArgCount;
+                const is = try collmod.Set.isMember(self.db, self.allocator, args.name, a[0]);
+                try self.writeCollReply(writer, .{ .int = if (is) 1 else 0 });
+            },
+            .set_card => {
+                const n = try collmod.Set.card(self.db, self.allocator, args.name);
+                try self.writeCollReply(writer, .{ .int = @intCast(n) });
+            },
+            .set_members => {
+                const ms = try collmod.Set.members(self.db, self.allocator, args.name);
+                defer {
+                    for (ms) |m| self.allocator.free(m);
+                    self.allocator.free(ms);
+                }
+                try self.writeCollReply(writer, .{ .stringList = ms });
+            },
+            .set_inter, .set_union => |action| {
+                const names = try self.allocator.alloc([]const u8, a.len + 1);
+                defer self.allocator.free(names);
+                names[0] = args.name;
+                @memcpy(names[1..], a);
+                const ms = if (action == .set_inter)
+                    try collmod.Set.intersect(self.db, self.allocator, names)
+                else
+                    try collmod.Set.unionOf(self.db, self.allocator, names);
+                defer {
+                    for (ms) |m| self.allocator.free(m);
+                    self.allocator.free(ms);
+                }
+                try self.writeCollReply(writer, .{ .stringList = ms });
+            },
+            .set_diff => {
+                const ms = try collmod.Set.difference(self.db, self.allocator, args.name, a);
+                defer {
+                    for (ms) |m| self.allocator.free(m);
+                    self.allocator.free(ms);
+                }
+                try self.writeCollReply(writer, .{ .stringList = ms });
+            },
+            .list_lpush => {
+                if (a.len < 1) return error.InvalidArgCount;
+                try collmod.List.pushLeft(self.db, self.allocator, args.name, a[0]);
+                try self.writeCollReply(writer, .ok);
+            },
+            .list_rpush => {
+                if (a.len < 1) return error.InvalidArgCount;
+                try collmod.List.pushRight(self.db, self.allocator, args.name, a[0]);
+                try self.writeCollReply(writer, .ok);
+            },
+            .list_lpop => {
+                if (try collmod.List.popLeft(self.db, self.allocator, args.name)) |v| {
+                    defer self.allocator.free(v);
+                    try self.writeCollReply(writer, .{ .bytes = v });
+                } else {
+                    try self.writeCollReply(writer, .nil);
+                }
+            },
+            .list_rpop => {
+                if (try collmod.List.popRight(self.db, self.allocator, args.name)) |v| {
+                    defer self.allocator.free(v);
+                    try self.writeCollReply(writer, .{ .bytes = v });
+                } else {
+                    try self.writeCollReply(writer, .nil);
+                }
+            },
+            .list_len => {
+                const n = try collmod.List.len(self.db, self.allocator, args.name);
+                try self.writeCollReply(writer, .{ .int = @intCast(n) });
+            },
+            .list_range => {
+                if (a.len < 2) return error.InvalidArgCount;
+                const rangeStart = std.fmt.parseInt(i64, a[0], 10) catch return error.InvalidNumber;
+                const rangeStop = std.fmt.parseInt(i64, a[1], 10) catch return error.InvalidNumber;
+                const vals = try collmod.List.range(self.db, self.allocator, args.name, rangeStart, rangeStop);
+                defer {
+                    for (vals) |v| self.allocator.free(v);
+                    self.allocator.free(vals);
+                }
+                try self.writeCollReply(writer, .{ .stringList = vals });
+            },
+            .zset_add => {
+                if (a.len < 2) return error.InvalidArgCount;
+                const score = std.fmt.parseFloat(f64, a[1]) catch return error.InvalidNumber;
+                try collmod.ZSet.add(self.db, self.allocator, args.name, a[0], score);
+                try self.writeCollReply(writer, .ok);
+            },
+            .zset_score => {
+                if (a.len < 1) return error.InvalidArgCount;
+                if (try collmod.ZSet.score(self.db, self.allocator, args.name, a[0])) |s| {
+                    try self.writeCollReply(writer, .{ .real = s });
+                } else {
+                    try self.writeCollReply(writer, .nil);
+                }
+            },
+            .zset_incrby => {
+                if (a.len < 2) return error.InvalidArgCount;
+                const delta = std.fmt.parseFloat(f64, a[1]) catch return error.InvalidNumber;
+                const s = try collmod.ZSet.incrBy(self.db, self.allocator, args.name, a[0], delta);
+                try self.writeCollReply(writer, .{ .real = s });
+            },
+            .zset_rem => {
+                if (a.len < 1) return error.InvalidArgCount;
+                const removed = try collmod.ZSet.remove(self.db, self.allocator, args.name, a[0]);
+                try self.writeCollReply(writer, .{ .int = if (removed) 1 else 0 });
+            },
+            .zset_card => {
+                const n = try collmod.ZSet.card(self.db, self.allocator, args.name);
+                try self.writeCollReply(writer, .{ .int = @intCast(n) });
+            },
+            .zset_rangebyrank, .zset_rangebyscore => |action| {
+                if (a.len < 2) return error.InvalidArgCount;
+                const zms = if (action == .zset_rangebyrank) blk: {
+                    const rangeStart = std.fmt.parseInt(i64, a[0], 10) catch return error.InvalidNumber;
+                    const rangeStop = std.fmt.parseInt(i64, a[1], 10) catch return error.InvalidNumber;
+                    break :blk try collmod.ZSet.rangeByRank(self.db, self.allocator, args.name, rangeStart, rangeStop);
+                } else blk: {
+                    const min = std.fmt.parseFloat(f64, a[0]) catch return error.InvalidNumber;
+                    const max = std.fmt.parseFloat(f64, a[1]) catch return error.InvalidNumber;
+                    break :blk try collmod.ZSet.rangeByScore(self.db, self.allocator, args.name, min, max);
+                };
+                defer {
+                    for (zms) |zm| zm.free(self.allocator);
+                    self.allocator.free(zms);
+                }
+                const pairs = try self.allocator.alloc(protocol.CollScorePair, zms.len);
+                defer self.allocator.free(pairs);
+                for (zms, 0..) |zm, i| pairs[i] = .{ .member = zm.member, .score = zm.score };
+                try self.writeCollReply(writer, .{ .scorePairList = pairs });
+            },
+            .zset_rank => {
+                if (a.len < 1) return error.InvalidArgCount;
+                if (try collmod.ZSet.rank(self.db, self.allocator, args.name, a[0])) |r| {
+                    try self.writeCollReply(writer, .{ .int = @intCast(r) });
+                } else {
+                    try self.writeCollReply(writer, .nil);
+                }
+            },
+        }
+    }
+
