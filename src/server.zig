@@ -1243,3 +1243,1249 @@ pub const Server = struct {
         };
         defer right.deinit();
 
+        var leftParsed: ?exprmod.Parsed = null;
+        defer if (leftParsed) |*p| p.deinit();
+        if (args.leftExprText.len > 0) {
+            leftParsed = exprmod.parse(self.allocator, args.leftExprText) catch |err| {
+                return writeErr(writer, .bad_request, @errorName(err));
+            };
+        }
+        const leftPred: ?querymod.Predicate = if (leftParsed) |p| p.predicate else null;
+
+        var rightParsed: ?exprmod.Parsed = null;
+        defer if (rightParsed) |*p| p.deinit();
+        if (args.rightExprText.len > 0) {
+            rightParsed = exprmod.parse(self.allocator, args.rightExprText) catch |err| {
+                return writeErr(writer, .bad_request, @errorName(err));
+            };
+        }
+        const rightPred: ?querymod.Predicate = if (rightParsed) |p| p.predicate else null;
+
+        var pairs = std.ArrayList(protocol.JoinPair).init(self.allocator);
+        defer {
+            for (pairs.items) |*p| {
+                if (p.left) |*l| l.deinit();
+                if (p.right) |*r| r.deinit();
+            }
+            pairs.deinit();
+        }
+
+        const page = querymod.Page{ .offset = args.offset, .limit = args.limit };
+
+        switch (args.mode) {
+            .inner => {
+                const joined = joinmod.innerJoin(self.allocator, &left, args.leftField, leftPred, &right, args.rightField, rightPred) catch |err| {
+                    return writeErr(writer, .internal, @errorName(err));
+                };
+                const paged = joinmod.applyPage(joinmod.JoinedRow, self.allocator, joined, page) catch |err| {
+                    return writeErr(writer, .internal, @errorName(err));
+                };
+                defer self.allocator.free(paged);
+                for (paged) |p| try pairs.append(.{ .left = p.left, .right = p.right });
+            },
+            .left => {
+                const joined = joinmod.leftOuterJoin(self.allocator, &left, args.leftField, leftPred, &right, args.rightField, rightPred) catch |err| {
+                    return writeErr(writer, .internal, @errorName(err));
+                };
+                const paged = joinmod.applyPage(joinmod.OuterJoinedRow, self.allocator, joined, page) catch |err| {
+                    return writeErr(writer, .internal, @errorName(err));
+                };
+                defer self.allocator.free(paged);
+                for (paged) |p| try pairs.append(.{ .left = p.left, .right = p.right });
+            },
+            .right => {
+                const joined = joinmod.rightOuterJoin(self.allocator, &left, args.leftField, leftPred, &right, args.rightField, rightPred) catch |err| {
+                    return writeErr(writer, .internal, @errorName(err));
+                };
+                const paged = joinmod.applyPage(joinmod.RightOuterJoinedRow, self.allocator, joined, page) catch |err| {
+                    return writeErr(writer, .internal, @errorName(err));
+                };
+                defer self.allocator.free(paged);
+                for (paged) |p| try pairs.append(.{ .left = p.left, .right = p.right });
+            },
+            .full => {
+                const joined = joinmod.fullOuterJoin(self.allocator, &left, args.leftField, leftPred, &right, args.rightField, rightPred) catch |err| {
+                    return writeErr(writer, .internal, @errorName(err));
+                };
+                const paged = joinmod.applyPage(joinmod.FullOuterJoinedRow, self.allocator, joined, page) catch |err| {
+                    return writeErr(writer, .internal, @errorName(err));
+                };
+                defer self.allocator.free(paged);
+                for (paged) |p| try pairs.append(.{ .left = p.left, .right = p.right });
+            },
+        }
+
+        const out = protocol.encodeJoinedRows(self.allocator, pairs.items) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer self.allocator.free(out);
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
+    }
+
+    /// Executes a `table_aggregate` request: opens the named table over the
+    /// same `*Db` the rest of the server serves, filters rows with the same
+    /// `expr.zig` grammar `table_select`/`table_join` already use (empty
+    /// text selects every row), then hands the filtered rows to
+    /// `aggregate.zig` - `runGlobal` when `args.groupField` is empty (the
+    /// network counterpart of the CLI's `*` sentinel for "no GROUP BY"),
+    /// `run` otherwise. When `args.havingText` is non-empty, it is parsed
+    /// with the same `expr.zig` grammar and applied AFTER aggregation but
+    /// BEFORE paging - `globalMatchesHaving` on the `runGlobal` path (an
+    /// excluded single result comes back as zero values, not an error) or
+    /// `filterHaving` on the grouped path - then, on the grouped path only,
+    /// a non-empty `args.orderBy` sorts the HAVING-narrowed groups via
+    /// `aggregate.sortGroupsBy` (an unknown order field is `bad_request`,
+    /// same treatment as a malformed HAVING expr) - then windowed by
+    /// `args.offset`/`args.limit` through `aggregate.applyPageGroups` (0/0 =
+    /// unlimited, ignored for the `runGlobal` path since that always
+    /// produces at most one result row, same as `args.orderBy`). Two distinct wire shapes come back
+    /// (`encodeAggGlobalResult` vs `encodeAggGroupRows`) because the client
+    /// already knows which one it asked for (it is the one that chose
+    /// `groupField`), so no extra discriminator byte is needed on the wire -
+    /// the client just decodes with whichever matches its own request, the
+    /// same reasoning `Client.tableAggregateGlobal`/`tableAggregateGroups`
+    /// document. A bad table name, malformed expr, or a spec referencing a
+    /// non-numeric field (`error.NonNumericField`/`error.Overflow` from
+    /// `aggregate.zig`) is a client mistake (`bad_request`), not a server
+    /// fault.
+    fn handleTableAggregate(self: *Server, payload: []const u8, writer: anytype) !void {
+        const args = protocol.decodeTableAggregate(self.allocator, payload) catch {
+            return writeErr(writer, .bad_request, "malformed table_aggregate payload");
+        };
+        defer self.allocator.free(args.specs);
+        defer self.allocator.free(args.orderBy);
+
+        var table = querymod.Table.open(self.db, self.allocator, args.table) catch |err| {
+            return writeErr(writer, .bad_request, @errorName(err));
+        };
+        defer table.deinit();
+
+        var parsed: ?exprmod.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (args.exprText.len > 0) {
+            parsed = exprmod.parse(self.allocator, args.exprText) catch |err| {
+                return writeErr(writer, .bad_request, @errorName(err));
+            };
+        }
+        const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
+
+        var havingParsed: ?exprmod.Parsed = null;
+        defer if (havingParsed) |*p| p.deinit();
+        if (args.havingText.len > 0) {
+            havingParsed = exprmod.parse(self.allocator, args.havingText) catch |err| {
+                return writeErr(writer, .bad_request, @errorName(err));
+            };
+        }
+        const havingPred: ?querymod.Predicate = if (havingParsed) |p| p.predicate else null;
+
+        const rows = table.select(pred) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer querymod.freeRows(self.allocator, rows);
+
+        if (args.groupField.len == 0) {
+            const values = aggregatemod.runGlobal(self.allocator, rows, args.specs) catch |err| {
+                return switch (err) {
+                    error.NonNumericField, error.Overflow => writeErr(writer, .bad_request, @errorName(err)),
+                    else => writeErr(writer, .internal, @errorName(err)),
+                };
+            };
+            defer aggregatemod.freeGlobalResult(self.allocator, values);
+            const matches = if (havingPred) |hp|
+                aggregatemod.globalMatchesHaving(self.allocator, args.specs, values, hp) catch |err| {
+                    return writeErr(writer, .internal, @errorName(err));
+                }
+            else
+                true;
+            const out = protocol.encodeAggGlobalResult(self.allocator, if (matches) values else &.{}) catch |err| {
+                return writeErr(writer, .internal, @errorName(err));
+            };
+            defer self.allocator.free(out);
+            try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
+        } else {
+            const unpaged = aggregatemod.run(self.allocator, rows, args.groupField, args.specs) catch |err| {
+                return switch (err) {
+                    error.NonNumericField, error.Overflow => writeErr(writer, .bad_request, @errorName(err)),
+                    else => writeErr(writer, .internal, @errorName(err)),
+                };
+            };
+            const filtered = if (havingPred) |hp|
+                aggregatemod.filterHaving(self.allocator, unpaged, args.groupField, args.specs, hp) catch |err| {
+                    return writeErr(writer, .internal, @errorName(err));
+                }
+            else
+                unpaged;
+            if (args.orderBy.len > 0) {
+                aggregatemod.sortGroupsBy(self.allocator, filtered, args.groupField, args.specs, args.orderBy) catch |err| {
+                    protocol.freeAggGroupRows(self.allocator, filtered);
+                    return switch (err) {
+                        error.UnknownOrderField => writeErr(writer, .bad_request, @errorName(err)),
+                        else => writeErr(writer, .internal, @errorName(err)),
+                    };
+                };
+            }
+            const page = querymod.Page{ .offset = args.offset, .limit = args.limit };
+            const groups = aggregatemod.applyPageGroups(self.allocator, filtered, page) catch |err| {
+                return writeErr(writer, .internal, @errorName(err));
+            };
+            defer protocol.freeAggGroupRows(self.allocator, groups);
+            const out = protocol.encodeAggGroupRows(self.allocator, groups) catch |err| {
+                return writeErr(writer, .internal, @errorName(err));
+            };
+            defer self.allocator.free(out);
+            try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
+        }
+    }
+
+    /// Executes a `table_window` request: opens the named table, filters
+    /// rows with the same `expr.zig` grammar every other `table_*` opcode
+    /// uses (empty text selects every row), then hands the filtered rows to
+    /// `window.compute` for the single `args.spec` annotation, along with
+    /// `args.frame` (ROWS or RANGE - see `window.zig`'s `FrameMode` doc
+    /// comment) - unlike `table_aggregate`, this NEVER collapses rows, so
+    /// `results[i]` stays aligned 1:1 with `rows[i]` regardless of paging (a
+    /// `NonNumericField`/`Overflow`/`MissingField`/`RangeNotApplicable` from
+    /// `window.zig` is a client mistake, `bad_request`, same treatment as
+    /// `table_aggregate`).
+    /// `args.offset`/`args.limit` then window which rows get PRINTED, walked
+    /// in `window.orderedIndices`' partition-then-order sequence (the same
+    /// display order local `table window` uses, not raw scan order) rather
+    /// than slicing `rows`/`results` directly - the exact bug local `table
+    /// window` hit and fixed (see `window.zig`'s `orderedIndices` doc
+    /// comment) before this network path existed, so it is built paginated
+    /// the correct way from the start instead of repeating that mistake.
+    /// Each surviving row is paired with its already-computed value into a
+    /// `protocol.WindowRow` and sent back via `encodeWindowRows` - the
+    /// client prints them in the order received, no further sorting needed.
+    /// A `subscribe` request never returns in the normal sense: once the
+    /// connection is registered in `self.pubsub`, this function owns the
+    /// rest of the connection's lifetime (both directions of the socket)
+    /// until the client disconnects, then propagates `error.SubscriptionEnded`
+    /// so `handleConnection`'s `catch return` unwinds cleanly - the same
+    /// "any error just ends the connection" contract every other opcode
+    /// already relies on for a plain disconnect mid-frame.
+    ///
+    /// Design: a `subscribe` connection becomes receive-only after the ack.
+    /// A dedicated watcher thread does exactly one blocking read attempt on
+    /// `stream` - whatever it gets back (a byte the client sent, or an
+    /// error/EOF from a disconnect) closes the subscription, since there is
+    /// no way to both keep reading further commands AND push messages on
+    /// one TCP connection without either a second concurrent writer (a
+    /// write race against the push loop below) or re-entering this same
+    /// read/dispatch loop (a read race against the watcher). Unlike a
+    /// protocol like Redis's, which multiplexes further commands
+    /// (UNSUBSCRIBE, PING) onto the same subscribed connection, this
+    /// connection itself never reads another request - but `unsubscribe`
+    /// (see `handleUnsubscribe`) reaches the SAME `sub` from a completely
+    /// different connection, keyed by the id this function's ack carries
+    /// (`sub.id`), so dropping a subset of channels still does not require
+    /// closing the connection outright; only dropping every remaining
+    /// channel does (`pubsub.Hub.unsubscribe`'s doc comment). Once the push loop ends (for any reason - the
+    /// watcher closed `sub`, or a write here failed because the peer is
+    /// gone), `std.posix.shutdown` unblocks the watcher's still-pending read
+    /// (rather than relying on `conn.stream.close()` racing a live read on
+    /// the same fd from another thread, which is a well-known way to
+    /// recycle a file descriptor into an unrelated, concurrently-accepted
+    /// connection) before joining it - so by the time this returns, no
+    /// other thread still touches `stream` or `sub`.
+    fn handleSubscribe(self: *Server, payload: []const u8, stream: std.net.Stream) !void {
+        const args = protocol.decodeSubscribe(self.allocator, payload) catch {
+            return writeErr(stream.writer(), .bad_request, "malformed subscribe payload");
+        };
+        defer args.deinit(self.allocator);
+        if (args.channels.len == 0) {
+            return writeErr(stream.writer(), .bad_request, "subscribe needs at least one channel");
+        }
+
+        const channelNames = try self.allocator.alloc([]const u8, args.channels.len);
+        defer self.allocator.free(channelNames);
+        for (args.channels, 0..) |c, i| channelNames[i] = c;
+
+        const sub = self.pubsub.subscribe(channelNames, pubsubmod.defaultCapacity) catch {
+            return writeErr(stream.writer(), .internal, "failed to register subscription");
+        };
+
+        const ack = try protocol.encodeSubscribeAck(self.allocator, sub.id, @intCast(channelNames.len));
+        defer self.allocator.free(ack);
+        protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Status.ok), ack) catch {
+            self.pubsub.closeSubscriber(sub);
+            self.pubsub.destroySubscriber(sub);
+            return error.SubscriptionEnded;
+        };
+
+        const watcher = try std.Thread.spawn(.{}, watchForDisconnect, .{ &self.pubsub, sub, stream });
+
+        while (sub.waitMessage()) |msg| {
+            defer msg.deinit(self.allocator);
+            const framePayload = protocol.encodePubSubMessage(self.allocator, msg.channel, msg.payload) catch break;
+            defer self.allocator.free(framePayload);
+            protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Status.ok), framePayload) catch break;
+        }
+
+        std.posix.shutdown(stream.handle, .both) catch {};
+        watcher.join();
+        self.pubsub.closeSubscriber(sub);
+        self.pubsub.destroySubscriber(sub);
+        return error.SubscriptionEnded;
+    }
+
+    /// The watcher half of `handleSubscribe`: blocks on exactly one read
+    /// attempt, then closes `sub` regardless of the outcome (data, EOF, or
+    /// an error - all three mean "stop pushing to this connection"). Runs
+    /// on its own thread so `handleSubscribe`'s push loop can block
+    /// independently on `sub.waitMessage()` - see that function's doc
+    /// comment for why this is a single read, not a loop.
+    fn watchForDisconnect(hub: *pubsubmod.Hub, sub: *pubsubmod.Subscriber, stream: std.net.Stream) void {
+        var buf: [1]u8 = undefined;
+        _ = stream.read(&buf) catch {};
+        hub.closeSubscriber(sub);
+    }
+
+    /// Executes a `publish` request: any connection may call this
+    /// regardless of whether it has ever subscribed to anything (see
+    /// `protocol.encodePublish`'s doc comment). Delivery is fire-and-forget
+    /// from this handler's point of view - `pubsub.Hub.publish` never
+    /// blocks on a slow subscriber, so this returns as soon as every
+    /// currently-registered subscriber's mailbox has been handed its own
+    /// copy (or dropped one, under `Subscriber.push`'s backpressure policy).
+    fn handlePublish(self: *Server, payload: []const u8, writer: anytype) !void {
+        const args = protocol.decodePublish(payload) catch {
+            return writeErr(writer, .bad_request, "malformed publish payload");
+        };
+        const count = self.pubsub.publish(self.allocator, args.channel, args.message) catch {
+            return writeErr(writer, .internal, "failed to publish message");
+        };
+        if (count > 0) self.messagesPublishedTotal.incrBy(@intCast(count));
+        const resp = try protocol.encodePublishResult(self.allocator, @intCast(count));
+        defer self.allocator.free(resp);
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), resp);
+    }
+
+    /// Executes an `unsubscribe` request: unlike `subscribe`, this is a
+    /// plain request/response opcode that returns like any other - it never
+    /// touches the connection that originally subscribed, because that
+    /// connection became receive-only the moment its ack arrived (see
+    /// `handleSubscribe`'s doc comment) and this one is always a separate
+    /// connection entirely (see `protocol.encodeUnsubscribe`'s doc
+    /// comment). `pubsub.Hub.unsubscribe`'s `error.UnknownSubscriber` (a
+    /// stale id, a typo, or a subscriber that already disconnected on its
+    /// own - all indistinguishable from here, see that function's doc
+    /// comment) is the caller's mistake, `bad_request`, the same treatment
+    /// `table_window` gives a `MissingField` from a bad field name.
+    fn handleUnsubscribe(self: *Server, payload: []const u8, writer: anytype) !void {
+        const args = protocol.decodeUnsubscribe(self.allocator, payload) catch {
+            return writeErr(writer, .bad_request, "malformed unsubscribe payload");
+        };
+        defer args.deinit(self.allocator);
+        if (args.channels.len == 0) {
+            return writeErr(writer, .bad_request, "unsubscribe needs at least one channel");
+        }
+
+        const channelNames = try self.allocator.alloc([]const u8, args.channels.len);
+        defer self.allocator.free(channelNames);
+        for (args.channels, 0..) |c, i| channelNames[i] = c;
+
+        const removed = self.pubsub.unsubscribe(args.subscriberId, channelNames) catch |err| {
+            return switch (err) {
+                error.UnknownSubscriber => writeErr(writer, .bad_request, "unknown subscriber id"),
+                else => writeErr(writer, .internal, @errorName(err)),
+            };
+        };
+
+        const resp = try protocol.encodeUnsubscribeResult(self.allocator, @intCast(removed));
+        defer self.allocator.free(resp);
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), resp);
+    }
+
+    fn handleTableWindow(self: *Server, payload: []const u8, writer: anytype) !void {
+        const args = protocol.decodeTableWindow(self.allocator, payload) catch {
+            return writeErr(writer, .bad_request, "malformed table_window payload");
+        };
+        defer self.allocator.free(args.specs);
+        defer self.allocator.free(args.partitionBy);
+        defer self.allocator.free(args.orderBy);
+
+        var table = querymod.Table.open(self.db, self.allocator, args.table) catch |err| {
+            return writeErr(writer, .bad_request, @errorName(err));
+        };
+        defer table.deinit();
+
+        var parsed: ?exprmod.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (args.exprText.len > 0) {
+            parsed = exprmod.parse(self.allocator, args.exprText) catch |err| {
+                return writeErr(writer, .bad_request, @errorName(err));
+            };
+        }
+        const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
+
+        const rows = table.select(pred) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer querymod.freeRows(self.allocator, rows);
+
+        const results = windowmod.computeMany(self.allocator, rows, args.partitionBy, args.orderBy, args.specs, args.frame) catch |err| {
+            return switch (err) {
+                error.NonNumericField, error.Overflow, error.MissingField, error.RangeNotApplicable => writeErr(writer, .bad_request, @errorName(err)),
+                else => writeErr(writer, .internal, @errorName(err)),
+            };
+        };
+        defer windowmod.freeManyResults(self.allocator, results);
+
+        const displayOrder = windowmod.orderedIndices(self.allocator, rows, args.partitionBy, args.orderBy) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer self.allocator.free(displayOrder);
+
+        const total = displayOrder.len;
+        const pageStart = @min(args.offset, total);
+        const end = if (args.limit == 0) total else @min(pageStart + args.limit, total);
+
+        // `out`'s WindowRow.values arrays hold SHALLOW copies borrowed from
+        // `results` (safe: `encodeWindowRows` below only reads them to
+        // serialize, never frees them) - `results` stays the true owner,
+        // freed by the `defer` above; only the borrowing arrays themselves
+        // get freed here, same "shallow copy into a throwaway wire-shape
+        // struct, one true owner frees the contents" pattern
+        // `handleTableAggregate`'s `GroupRow`-to-wire path already relies on.
+        var out = std.ArrayList(protocol.WindowRow).init(self.allocator);
+        defer {
+            for (out.items) |wr| self.allocator.free(wr.values);
+            out.deinit();
+        }
+        var i: usize = pageStart;
+        while (i < end) : (i += 1) {
+            const idx = displayOrder[i];
+            const values = try self.allocator.alloc(rowmod.Value, args.specs.len);
+            @memcpy(values, results[idx]);
+            try out.append(.{ .row = rows[idx], .values = values });
+        }
+
+        const encoded = protocol.encodeWindowRows(self.allocator, out.items) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer self.allocator.free(encoded);
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), encoded);
+    }
+
+    /// Executes a `table_explain` request: opens the named table over the
+    /// same `*Db` the rest of the server serves, parses the expr text with
+    /// the same grammar `table_select`/`table_join`/`table_aggregate`
+    /// already use, then reports which strategy `querymod.Table.explain`
+    /// says a matching `table select`/`table_select` would take - without
+    /// running the query or touching any row. A bad table name or malformed
+    /// expression is a client mistake (`bad_request`), not a server fault.
+    fn handleTableExplain(self: *Server, payload: []const u8, writer: anytype) !void {
+        const args = protocol.decodeTableExplain(payload) catch {
+            return writeErr(writer, .bad_request, "malformed table_explain payload");
+        };
+
+        var table = querymod.Table.open(self.db, self.allocator, args.table) catch |err| {
+            return writeErr(writer, .bad_request, @errorName(err));
+        };
+        defer table.deinit();
+
+        var parsed: ?exprmod.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (args.exprText.len > 0) {
+            parsed = exprmod.parse(self.allocator, args.exprText) catch |err| {
+                return writeErr(writer, .bad_request, @errorName(err));
+            };
+        }
+        const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
+
+        var plan = table.explain(self.allocator, pred) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer plan.deinit(self.allocator);
+
+        const out = protocol.encodePlan(self.allocator, plan) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer self.allocator.free(out);
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
+    }
+
+    /// Executes a `table_update` request: the network counterpart of the
+    /// CLI's local `table update <table> --set ... [expr...]`, running
+    /// `query.Table.updateWhere` against the server's `*Db`. The wire
+    /// `sets` field list arrives pre-encoded with `Row.encode` (the same
+    /// trick `decodeTxnOp`'s `fieldsBytes` uses), so it is decoded into a
+    /// real `Row` here before `updateWhere` ever sees it. The response is a
+    /// bare row count reusing `encodeTtlSweepCount`'s u64 wire shape - the
+    /// same "no new response type, an existing shape already fits"
+    /// precedent `coll_ttl_op` set for `ttl_op`'s result encoding.
+    fn handleTableUpdate(self: *Server, payload: []const u8, writer: anytype) !void {
+        const args = protocol.decodeTableUpdate(payload) catch {
+            return writeErr(writer, .bad_request, "malformed table_update payload");
+        };
+
+        var setsRow = rowmod.Row.decode(self.allocator, args.setsBytes) catch {
+            return writeErr(writer, .bad_request, "malformed table_update set fields");
+        };
+        defer setsRow.deinit();
+
+        var table = querymod.Table.open(self.db, self.allocator, args.table) catch |err| {
+            return writeErr(writer, .bad_request, @errorName(err));
+        };
+        defer table.deinit();
+
+        var parsed: ?exprmod.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (args.exprText.len > 0) {
+            parsed = exprmod.parse(self.allocator, args.exprText) catch |err| {
+                return writeErr(writer, .bad_request, @errorName(err));
+            };
+        }
+        const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
+
+        const updated = table.updateWhere(pred, setsRow.fields.items) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+
+        const out = protocol.encodeTtlSweepCount(self.allocator, @intCast(updated)) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer self.allocator.free(out);
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
+    }
+
+    /// Executes a `table_delete` request: the network counterpart of the
+    /// CLI's local `table delete <table> [expr...]`, running
+    /// `query.Table.deleteWhere` against the server's `*Db`. Same wire shape
+    /// as `table_explain` (table + exprText, no `SET` clause) and same
+    /// response shape as `table_update` (a bare row count reusing
+    /// `encodeTtlSweepCount`'s u64 wire shape).
+    fn handleTableDelete(self: *Server, payload: []const u8, writer: anytype) !void {
+        const args = protocol.decodeTableDelete(payload) catch {
+            return writeErr(writer, .bad_request, "malformed table_delete payload");
+        };
+
+        var table = querymod.Table.open(self.db, self.allocator, args.table) catch |err| {
+            return writeErr(writer, .bad_request, @errorName(err));
+        };
+        defer table.deinit();
+
+        var parsed: ?exprmod.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (args.exprText.len > 0) {
+            parsed = exprmod.parse(self.allocator, args.exprText) catch |err| {
+                return writeErr(writer, .bad_request, @errorName(err));
+            };
+        }
+        const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
+
+        const deleted = table.deleteWhere(pred) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+
+        const out = protocol.encodeTtlSweepCount(self.allocator, @intCast(deleted)) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer self.allocator.free(out);
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
+    }
+
+    /// Executes a `table_export` request: the network counterpart of the
+    /// CLI's local `table export <table> csv|json <path>`, rendering the
+    /// whole table through `dump.zig`'s `exportCsvWriter`/`exportJsonWriter`
+    /// (the same functions the local path calls, just pointed at an
+    /// in-memory `ArrayList` writer instead of a file, since there is no
+    /// filesystem path to write to on the server side of a request) and
+    /// sending the row count plus the rendered bytes back in one frame.
+    fn handleTableExport(self: *Server, payload: []const u8, writer: anytype) !void {
+        const args = protocol.decodeTableExport(payload) catch {
+            return writeErr(writer, .bad_request, "malformed table_export payload");
+        };
+
+        var table = querymod.Table.open(self.db, self.allocator, args.table) catch |err| {
+            return writeErr(writer, .bad_request, @errorName(err));
+        };
+        defer table.deinit();
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const rowCount = switch (args.format) {
+            .csv => dumpmod.exportCsvWriter(self.allocator, &table, buf.writer()),
+            .json => dumpmod.exportJsonWriter(self.allocator, &table, buf.writer()),
+        } catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+
+        const out = protocol.encodeExportResult(self.allocator, @intCast(rowCount), buf.items) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer self.allocator.free(out);
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
+    }
+
+    /// Executes a `table_import` request: the network counterpart of the
+    /// CLI's local `table import <table> csv|json <path>`, feeding the
+    /// wire-carried `content` bytes straight into `dump.zig`'s
+    /// `importCsvContent`/`importJsonContent` (the same functions the local
+    /// path calls after reading a file into memory - the client already did
+    /// that reading, so the server only ever sees bytes, never a path)
+    /// against the server's `*Db`. The response is a bare row count, the
+    /// same u64 wire shape `table_update`/`table_delete` already use.
+    fn handleTableImport(self: *Server, payload: []const u8, writer: anytype) !void {
+        const args = protocol.decodeTableImport(payload) catch {
+            return writeErr(writer, .bad_request, "malformed table_import payload");
+        };
+
+        var table = querymod.Table.open(self.db, self.allocator, args.table) catch |err| {
+            return writeErr(writer, .bad_request, @errorName(err));
+        };
+        defer table.deinit();
+
+        const imported = switch (args.format) {
+            .csv => dumpmod.importCsvContent(self.allocator, &table, args.content),
+            .json => dumpmod.importJsonContent(self.allocator, &table, args.content),
+        } catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+
+        const out = protocol.encodeTtlSweepCount(self.allocator, @intCast(imported)) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer self.allocator.free(out);
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
+    }
+
+    /// Executes a `user_admin` request (create/set_password/set_role/delete/
+    /// list) against a fresh `authmod.Store` over the same `*Db` the rest of
+    /// the server serves. Deliberately does NOT consult `self.authStore` -
+    /// that field only controls whether *login enforcement* is turned on
+    /// for this server, not whether the user table exists, so remote user
+    /// management works the same way whether or not `--auth` is active.
+    /// `requiredRole` already gates this opcode behind `admin` whenever
+    /// auth enforcement IS enabled; a server with auth disabled enforces
+    /// nothing on any opcode, this one included, matching every other op's
+    /// documented behavior.
+    fn handleUserAdmin(self: *Server, payload: []const u8, writer: anytype) !void {
+        const args = protocol.decodeUserAdmin(payload) catch {
+            return writeErr(writer, .bad_request, "malformed user_admin payload");
+        };
+        const store = authmod.Store.init(self.db);
+
+        switch (args.action) {
+            .create => {
+                const role = authmod.Role.fromByte(args.roleByte) catch {
+                    return writeErr(writer, .bad_request, "invalid role");
+                };
+                const rounds = if (args.rounds != 0) args.rounds else authmod.recommendedRounds;
+                store.createUser(self.allocator, args.username, args.password, role, rounds) catch |err| {
+                    return switch (err) {
+                        error.UserExists => writeErr(writer, .conflict, "user already exists"),
+                        else => writeErr(writer, .internal, @errorName(err)),
+                    };
+                };
+                try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
+            },
+
+            .set_password => {
+                const rounds = if (args.rounds != 0) args.rounds else authmod.recommendedRounds;
+                store.setPassword(self.allocator, args.username, args.password, rounds) catch |err| {
+                    return switch (err) {
+                        error.UserNotFound => writeErr(writer, .not_found, "user not found"),
+                        else => writeErr(writer, .internal, @errorName(err)),
+                    };
+                };
+                try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
+            },
+
+            .set_role => {
+                const role = authmod.Role.fromByte(args.roleByte) catch {
+                    return writeErr(writer, .bad_request, "invalid role");
+                };
+                store.setRole(self.allocator, args.username, role) catch |err| {
+                    return switch (err) {
+                        error.UserNotFound => writeErr(writer, .not_found, "user not found"),
+                        else => writeErr(writer, .internal, @errorName(err)),
+                    };
+                };
+                try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
+            },
+
+            .delete => {
+                store.deleteUser(self.allocator, args.username) catch |err| {
+                    return switch (err) {
+                        error.UserNotFound => writeErr(writer, .not_found, "user not found"),
+                        else => writeErr(writer, .internal, @errorName(err)),
+                    };
+                };
+                try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
+            },
+
+            .list => {
+                const users = store.listUsers(self.allocator) catch |err| {
+                    return writeErr(writer, .internal, @errorName(err));
+                };
+                defer authmod.freeUserList(self.allocator, users);
+                const out = protocol.encodeUserList(self.allocator, users) catch |err| {
+                    return writeErr(writer, .internal, @errorName(err));
+                };
+                defer self.allocator.free(out);
+                try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
+            },
+        }
+    }
+
+    /// Stops accepting new connections and waits for the accept loop to
+    /// exit. Closing the listening socket while another thread is
+    /// blocked inside `accept()` on that same fd is a race the standard
+    /// library treats as a bug (it asserts on EBADF), so instead we flip
+    /// `stopping` and connect a throwaway client to our own listen
+    /// address: that wakes the pending `accept()` with a real, briefly
+    /// alive connection, which the loop then discards and exits on. Only
+    /// once the accept thread has rejoined is it safe to close the
+    /// listening socket itself.
+    ///
+    /// Already-accepted connections are `.detach()`ed worker threads this
+    /// struct holds no `std.Thread` handle for, so they cannot be `join`ed
+    /// directly - `drainConnections` below waits on the `active` counter
+    /// instead. This used to be entirely the caller's problem ("leave them
+    /// to finish on their own, call `activeConnections()` first if you need
+    /// to wait"), but every real caller in this codebase - every test in
+    /// this file included - called `stop()` and then immediately tore down
+    /// the `Db`/allocator the detached worker's `dispatch()` still reads
+    /// from, with nothing enforcing that the worker had actually noticed
+    /// its connection closed and returned first. Most of the time the
+    /// worker's blocking read already sees EOF and exits before the caller
+    /// gets around to teardown, so the race stayed invisible for a long
+    /// time; occasionally it does not, and a worker thread touches a freed
+    /// `Db`/`Allocator.VTable`, corrupting the heap in a way that only
+    /// surfaces later as an unrelated test's leak/double-free abort - this
+    /// is exactly the flaky `zig build test` failure the gate re-run in
+    /// this session caught (roughly 1 run in 4-6, always attributed to
+    /// whichever unrelated test happened to run next). Waiting here by
+    /// default, bounded so a genuinely long-lived idle connection (still
+    /// blocked in `stream.reader()` with nothing sent and no EOF) cannot
+    /// hang shutdown forever, closes that gap for every caller instead of
+    /// relying on each one to remember `activeConnections()`.
+    pub fn stop(self: *Server) void {
+        if (self.acceptThread == null) return;
+        self.stopping.store(true, .release);
+        const listenAddr = self.net.listen_address;
+        if (std.net.tcpConnectToAddress(listenAddr)) |s| {
+            s.close();
+        } else |_| {}
+        self.acceptThread.?.join();
+        self.acceptThread = null;
+        if (self.sweeperThread) |t| {
+            t.join();
+            self.sweeperThread = null;
+        }
+        if (self.ttlSweeperThread) |t| {
+            t.join();
+            self.ttlSweeperThread = null;
+        }
+        if (self.collTtlSweeperThread) |t| {
+            t.join();
+            self.collTtlSweeperThread = null;
+        }
+        self.drainConnections(500 * std.time.ns_per_ms);
+        self.net.deinit();
+        // Best-effort, same as `drainConnections` above: a subscriber
+        // connection that never disconnects (client vanished without
+        // closing its socket) is still `active` past the drain timeout, so
+        // its `Subscriber` is never `destroySubscriber`'d and leaks for the
+        // remaining life of the process - this `deinit` only frees `Hub`'s
+        // own channel map, which by then holds no dangling entries for any
+        // subscriber that WAS properly torn down.
+        self.pubsub.deinit();
+    }
+
+    /// Polls `activeConnections()` until it reaches zero or `timeoutNanos`
+    /// elapses, whichever comes first. See the doc comment on `stop()` for
+    /// why this exists and why it is bounded rather than unconditional.
+    fn drainConnections(self: *Server, timeoutNanos: u64) void {
+        const startedAt = std.time.nanoTimestamp();
+        while (self.activeConnections() > 0) {
+            if (std.time.nanoTimestamp() - startedAt >= timeoutNanos) return;
+            std.time.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+};
+
+fn testDb(allocator: Allocator, dir: []const u8) !Db {
+    return Db.open(allocator, dir, .{});
+}
+
+// `drainConnections` only ever touches `self.active`/`self.stopping`, so it
+// can be exercised on a `Server` value that was never `init()`ed with a
+// real `Db`/socket - every other field stays `undefined` and is never
+// read. This isolates the drain/timeout contract itself from the (much
+// harder to force deterministically) real-socket race it exists to close.
+fn undefinedServerForDrainTest() Server {
+    var srv: Server = undefined;
+    srv.active = std.atomic.Value(usize).init(0);
+    srv.stopping = std.atomic.Value(bool).init(false);
+    return srv;
+}
+
+test "drainConnections returns immediately when there is nothing to drain" {
+    var srv = undefinedServerForDrainTest();
+    const start = std.time.nanoTimestamp();
+    srv.drainConnections(2 * std.time.ns_per_s);
+    const elapsedNanos = std.time.nanoTimestamp() - start;
+    try std.testing.expect(elapsedNanos < 200 * std.time.ns_per_ms);
+}
+
+test "drainConnections waits for a connection that finishes before the timeout" {
+    var srv = undefinedServerForDrainTest();
+    srv.active.store(1, .release);
+
+    const Ctx = struct {
+        srv: *Server,
+        fn run(ctx: *@This()) void {
+            std.time.sleep(30 * std.time.ns_per_ms);
+            _ = ctx.srv.active.fetchSub(1, .acq_rel);
+        }
+    };
+    var ctx = Ctx{ .srv = &srv };
+    const t = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+    defer t.join();
+
+    const start = std.time.nanoTimestamp();
+    srv.drainConnections(2 * std.time.ns_per_s);
+    const elapsedNanos = std.time.nanoTimestamp() - start;
+
+    try std.testing.expectEqual(@as(usize, 0), srv.activeConnections());
+    // Returned once the worker actually finished, not after burning the
+    // full 2-second timeout - proves this is a real wait-for-drain, not a
+    // fixed sleep in disguise.
+    try std.testing.expect(elapsedNanos < 1 * std.time.ns_per_s);
+}
+
+test "drainConnections gives up after the timeout instead of hanging forever" {
+    var srv = undefinedServerForDrainTest();
+    srv.active.store(1, .release); // never decremented by anyone
+
+    const start = std.time.nanoTimestamp();
+    srv.drainConnections(20 * std.time.ns_per_ms);
+    const elapsedNanos = std.time.nanoTimestamp() - start;
+
+    try std.testing.expect(elapsedNanos >= 20 * std.time.ns_per_ms);
+    // Still stuck at 1 - drainConnections gave up, it did not (and cannot)
+    // force the phantom connection closed itself.
+    try std.testing.expectEqual(@as(usize, 1), srv.activeConnections());
+}
+
+test "server responds to ping, set, get, and delete over loopback" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.ping();
+    try client.set("hello", "world");
+    const got = try client.get(allocator, "hello");
+    defer if (got) |g| allocator.free(g);
+    try std.testing.expectEqualStrings("world", got.?);
+
+    try client.delete("hello");
+    const afterDelete = try client.get(allocator, "hello");
+    try std.testing.expect(afterDelete == null);
+}
+
+test "server scan, prefix, and stats round trip real data" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.set("user:1", "alice");
+    try client.set("user:2", "bob");
+    try client.set("order:1", "widget");
+
+    const prefixed = try client.prefix(allocator, "user:", 0);
+    defer protocol.freeOwnedEntries(allocator, prefixed);
+    try std.testing.expectEqual(@as(usize, 2), prefixed.len);
+
+    const scanned = try client.scan(allocator, .{});
+    defer protocol.freeOwnedEntries(allocator, scanned);
+    try std.testing.expectEqual(@as(usize, 3), scanned.len);
+
+    const s = try client.stats();
+    try std.testing.expectEqual(@as(usize, 3), s.memtableEntries);
+}
+
+test "server batch applies puts and deletes atomically" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.set("keep", "1");
+    const ops = [_]protocol.BatchOp{
+        .{ .put = .{ .key = "a", .value = "1" } },
+        .{ .put = .{ .key = "b", .value = "2" } },
+        .{ .del = "keep" },
+    };
+    try client.batch(&ops);
+
+    const a = try client.get(allocator, "a");
+    defer if (a) |v| allocator.free(v);
+    try std.testing.expectEqualStrings("1", a.?);
+
+    const kept = try client.get(allocator, "keep");
+    try std.testing.expect(kept == null);
+}
+
+test "server rejects a malformed frame with bad_request without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const stream = try std.net.tcpConnectToAddress(server.boundAddress());
+    defer stream.close();
+
+    try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.set), "not a valid set payload with no length prefix boundary");
+    var frame = try protocol.readFrame(allocator, stream.reader());
+    defer frame.deinit();
+    try std.testing.expectEqual(@intFromEnum(protocol.Status.bad_request), frame.tag);
+}
+
+test "server serves multiple concurrent clients without corrupting state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    const WorkerCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        index: usize,
+        ok: bool = false,
+    };
+
+    const worker = struct {
+        fn run(ctx: *WorkerCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var buf: [32]u8 = undefined;
+            const key = std.fmt.bufPrint(&buf, "k{d}", .{ctx.index}) catch return;
+            client.set(key, "v") catch return;
+            const got = client.get(ctx.allocator, key) catch return;
+            defer if (got) |g| ctx.allocator.free(g);
+            ctx.ok = got != null and std.mem.eql(u8, got.?, "v");
+        }
+    }.run;
+
+    var contexts: [8]WorkerCtx = undefined;
+    var threads: [8]std.Thread = undefined;
+    for (0..8) |i| {
+        contexts[i] = .{ .allocator = allocator, .addr = server.boundAddress(), .index = i };
+        threads[i] = try std.Thread.spawn(.{}, worker, .{&contexts[i]});
+    }
+    for (0..8) |i| threads[i].join();
+    for (0..8) |i| try std.testing.expect(contexts[i].ok);
+}
+
+test "server enforces a token-bucket rate limit and rejects the overflow" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    // Slow refill (1 token/sec): the whole burst below completes in well
+    // under a second of wall-clock time, so refill contributes nowhere
+    // near a full token and the outcome is deterministic.
+    server.enableRateLimit(3, 1);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    var allowed: usize = 0;
+    var rejected: usize = 0;
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        client.ping() catch |err| {
+            try std.testing.expectEqual(client_mod.ClientError.ServerRateLimited, err);
+            rejected += 1;
+            continue;
+        };
+        allowed += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), allowed);
+    try std.testing.expectEqual(@as(usize, 3), rejected);
+    try std.testing.expectEqual(@as(u64, 6), server.requestsTotal.get());
+    try std.testing.expectEqual(@as(u64, 3), server.rateLimitedTotal.get());
+}
+
+test "server without an enabled rate limit never rejects" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) try client.ping();
+    try std.testing.expectEqual(@as(u64, 20), server.requestsTotal.get());
+    try std.testing.expectEqual(@as(u64, 0), server.rateLimitedTotal.get());
+}
+
+test "per-connection rate limit gives each connection its own budget" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enablePerConnectionRateLimit(2, 1);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+
+    var clientA = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer clientA.close();
+    var clientB = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer clientB.close();
+
+    // Exhaust A's private budget first: B must be unaffected because each
+    // connection got its own bucket, not a bucket shared across the server.
+    try clientA.ping();
+    try clientA.ping();
+    try std.testing.expectError(client_mod.ClientError.ServerRateLimited, clientA.ping());
+
+    try clientB.ping();
+    try clientB.ping();
+    try std.testing.expectError(client_mod.ClientError.ServerRateLimited, clientB.ping());
+
+    try std.testing.expectEqual(@as(u64, 2), server.connRateLimitedTotal.get());
+    try std.testing.expectEqual(@as(u64, 0), server.rateLimitedTotal.get());
+}
+
+test "per-connection and global rate limits both apply, connection budget checked first" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enablePerConnectionRateLimit(10, 1);
+    server.enableRateLimit(2, 1);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.ping();
+    try client.ping();
+    try std.testing.expectError(client_mod.ClientError.ServerRateLimited, client.ping());
+
+    // The global bucket was the one that actually ran out, not the
+    // per-connection one (which had plenty of headroom left).
+    try std.testing.expectEqual(@as(u64, 1), server.rateLimitedTotal.get());
+    try std.testing.expectEqual(@as(u64, 0), server.connRateLimitedTotal.get());
+}
+
+test "server table_select executes a remote expr against real rows, using an index when available" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var table = try querymod.Table.open(&db, allocator, "users");
+        defer table.deinit();
+        try table.createIndex("city");
+        try table.put(.{ .int = 1 }, &.{
+            .{ .name = "city", .value = .{ .text = "warsaw" } },
+            .{ .name = "age", .value = .{ .int = 20 } },
+        });
+        try table.put(.{ .int = 2 }, &.{
+            .{ .name = "city", .value = .{ .text = "warsaw" } },
+            .{ .name = "age", .value = .{ .int = 40 } },
+        });
+        try table.put(.{ .int = 3 }, &.{
+            .{ .name = "city", .value = .{ .text = "krakow" } },
+            .{ .name = "age", .value = .{ .int = 40 } },
+        });
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const rows = try client.tableSelect(allocator, "users", "city eq s:warsaw and age gte i:30", 0, 0, &.{});
+    defer protocol.freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(i64, 2), rows[0].get(querymod.pkField).?.int);
+
+    const all = try client.tableSelect(allocator, "users", "", 0, 0, &.{});
+    defer protocol.freeRows(allocator, all);
+    try std.testing.expectEqual(@as(usize, 3), all.len);
+}
+
+test "server table_explain reports index_eq, composite_eq, and full_scan over real TCP, matching what table_select would actually use" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var table = try querymod.Table.open(&db, allocator, "users");
+        defer table.deinit();
+        try table.createIndex("age");
+        try table.createCompositeIndex("city_age", &.{ "city", "age" });
+        try table.put(.{ .int = 1 }, &.{
+            .{ .name = "city", .value = .{ .text = "warsaw" } },
+            .{ .name = "age", .value = .{ .int = 30 } },
+        });
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    // Single-field index eq on `age`.
+    var agePlan = try client.tableExplain(allocator, "users", "age eq i:30");
+    defer agePlan.deinit(allocator);
+    try std.testing.expectEqual(querymod.PlanKind.index_eq, agePlan.kind);
+    try std.testing.expectEqualStrings("age", agePlan.indexName.?);
+
+    // Composite index, full prefix matched by equality on both columns.
+    var compositePlan = try client.tableExplain(allocator, "users", "city eq s:warsaw and age eq i:30");
+    defer compositePlan.deinit(allocator);
+    try std.testing.expectEqual(querymod.PlanKind.composite_eq, compositePlan.kind);
+    try std.testing.expectEqualStrings("city_age", compositePlan.indexName.?);
+    try std.testing.expectEqual(@as(usize, 2), compositePlan.matchedFields);
+    try std.testing.expectEqual(@as(usize, 2), compositePlan.totalFields);
+
+    // No predicate on an indexed field anywhere -> full scan.
+    var scanPlan = try client.tableExplain(allocator, "users", "city eq s:warsaw");
+    defer scanPlan.deinit(allocator);
+    try std.testing.expectEqual(querymod.PlanKind.full_scan, scanPlan.kind);
+
+    // Cross-check: what table_explain reports for the composite query is
+    // exactly what table_select actually finds when it runs it - the whole
+    // point of an explain feature is not lying about what execution does.
+    const rows = try client.tableSelect(allocator, "users", "city eq s:warsaw and age eq i:30", 0, 0, &.{});
+    defer protocol.freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+}
+
+test "server table_explain rejects a malformed expr with bad_request, not a crash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
