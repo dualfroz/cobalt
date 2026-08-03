@@ -929,3 +929,317 @@ pub const Server = struct {
         }
     }
 
+    /// Answers the `metrics` opcode: the network counterpart of the CLI's
+    /// `stats --prom` (which only ever renders `Db.stats()` locally) plus
+    /// this server's own request/rate-limit/auth/session counters from
+    /// `registerMetrics` - until now those counters were only ever
+    /// observable in-process, by a test holding a direct `*Server`
+    /// pointer. The registry is built fresh per request and thrown away
+    /// immediately after rendering: there is nothing to keep alive between
+    /// calls, since every counter it reads lives on `self` regardless.
+    fn handleMetrics(self: *Server, writer: anytype) !void {
+        var reg = metrics.Registry.init(self.allocator);
+        defer reg.deinit();
+        self.registerMetrics(&reg) catch |err| return writeErr(writer, .internal, @errorName(err));
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        reg.exportText(self.allocator, buf.writer()) catch |err| return writeErr(writer, .internal, @errorName(err));
+        metrics.formatDbStats(buf.writer(), "cobalt", self.db.stats()) catch |err| return writeErr(writer, .internal, @errorName(err));
+
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), buf.items);
+    }
+
+    /// Verifies credentials against `store` and, on success, stamps the
+    /// resulting role into this connection's `connRole` slot so every
+    /// subsequent request on the same connection is dispatched under it.
+    /// Locks `self.mutex` only around the actual `Db` read `verify`
+    /// performs, same as every other handler here.
+    fn handleAuth(self: *Server, store: authmod.Store, payload: []const u8, writer: anytype, connRole: *?authmod.Role, connExpiresAtNanos: *?i128) !void {
+        const args = protocol.decodeAuth(payload) catch {
+            return writeErr(writer, .bad_request, "malformed auth payload");
+        };
+
+        self.mutex.lock();
+        const result = store.verify(self.allocator, args.username, args.password);
+        self.mutex.unlock();
+
+        const role = result catch |err| {
+            self.unauthorizedTotal.incr();
+            return switch (err) {
+                error.InvalidCredentials, error.Malformed => writeErr(writer, .unauthorized, "invalid credentials"),
+                else => writeErr(writer, .internal, @errorName(err)),
+            };
+        };
+        connRole.* = role;
+        connExpiresAtNanos.* = null;
+
+        if (self.sessions) |store_| {
+            const now = std.time.nanoTimestamp();
+            const token = store_.issue(role, self.sessionTtlNanos, now) catch |err| {
+                return writeErr(writer, .internal, @errorName(err));
+            };
+            defer self.allocator.free(token);
+            connExpiresAtNanos.* = now + self.sessionTtlNanos;
+            const responsePayload = protocol.encodeAuthOk(self.allocator, token) catch |err| {
+                return writeErr(writer, .internal, @errorName(err));
+            };
+            defer self.allocator.free(responsePayload);
+            return protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), responsePayload);
+        }
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
+    }
+
+    /// Authenticates a connection from a previously issued session token
+    /// instead of a username/password pair (see `enableSessions`). Only
+    /// reachable when `self.sessions` is set, since `dispatch` only routes
+    /// `auth_token` here while `self.authStore` is also set.
+    fn handleAuthToken(self: *Server, payload: []const u8, writer: anytype, connRole: *?authmod.Role, connExpiresAtNanos: *?i128) !void {
+        const store = self.sessions orelse {
+            self.unauthorizedTotal.incr();
+            return writeErr(writer, .unauthorized, "session tokens are not enabled on this server");
+        };
+        const token = protocol.decodeAuthToken(payload);
+        const session = store.validate(token, std.time.nanoTimestamp()) orelse {
+            self.unauthorizedTotal.incr();
+            return writeErr(writer, .unauthorized, "invalid or expired session token");
+        };
+        connRole.* = session.role;
+        connExpiresAtNanos.* = session.expiresAtNanos;
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
+    }
+
+    fn handleScan(self: *Server, payload: []const u8, writer: anytype) !void {
+        const args = protocol.decodeScan(payload) catch {
+            return writeErr(writer, .bad_request, "malformed scan payload");
+        };
+        var entries = std.ArrayList(dbmod.Entry).init(self.allocator);
+        defer entries.deinit();
+
+        if (args.reverse) {
+            var it = self.db.scanReverse(self.allocator, .{ .start = args.start, .end = args.end }) catch |err| {
+                return writeErr(writer, .internal, @errorName(err));
+            };
+            defer it.deinit();
+            while (try it.next()) |e| {
+                try entries.append(e);
+                if (args.limit != 0 and entries.items.len >= args.limit) break;
+            }
+        } else {
+            var it = self.db.scanRange(self.allocator, .{ .start = args.start, .end = args.end }) catch |err| {
+                return writeErr(writer, .internal, @errorName(err));
+            };
+            defer it.deinit();
+            while (try it.next()) |e| {
+                try entries.append(e);
+                if (args.limit != 0 and entries.items.len >= args.limit) break;
+            }
+        }
+
+        const out = protocol.encodeEntries(self.allocator, entries.items) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer self.allocator.free(out);
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
+    }
+
+    fn handlePrefix(self: *Server, payload: []const u8, writer: anytype) !void {
+        const args = protocol.decodePrefix(payload) catch {
+            return writeErr(writer, .bad_request, "malformed prefix payload");
+        };
+        var it = self.db.scanPrefix(self.allocator, args.prefix) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer it.deinit();
+
+        var entries = std.ArrayList(dbmod.Entry).init(self.allocator);
+        defer entries.deinit();
+        while (try it.next()) |e| {
+            try entries.append(e);
+            if (args.limit != 0 and entries.items.len >= args.limit) break;
+        }
+
+        const out = protocol.encodeEntries(self.allocator, entries.items) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer self.allocator.free(out);
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
+    }
+
+    fn handleBatch(self: *Server, payload: []const u8, writer: anytype) !void {
+        const ops = protocol.decodeBatch(self.allocator, payload) catch {
+            return writeErr(writer, .bad_request, "malformed batch payload");
+        };
+        defer self.allocator.free(ops);
+
+        var wb = dbmod.WriteBatch.init(self.allocator);
+        defer wb.deinit();
+        for (ops) |op| {
+            switch (op) {
+                .put => |kv| try wb.put(kv.key, kv.value),
+                .del => |key| try wb.delete(key),
+            }
+        }
+        self.db.apply(&wb) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
+    }
+
+    /// Executes a `txn_op` request: the network counterpart of the CLI's
+    /// local `txn <script-file>` (main.zig's `runTxn`), applying every
+    /// put/delete in `entries` as one atomic `Transaction` commit across
+    /// however many tables they touch. Runs entirely inside `dispatch`'s
+    /// single `self.mutex` acquisition, like every other opcode - which
+    /// means, unlike a raw multi-thread `Transaction` against an unguarded
+    /// `*Db` (see `concurrent.zig`'s `GuardedDb` doc comment), no other
+    /// connection's request can ever interleave between this transaction's
+    /// begin and its commit. `txn.commit()`'s OCC conflict check stays in
+    /// place and still maps to `Status.conflict` below, but under this
+    /// server's locking discipline nothing can actually trigger it for a
+    /// request that arrives, stages, and commits within one dispatch call -
+    /// the same reason `concurrent.zig`'s `TableTransferWorker` test treats
+    /// a real `error.Conflict` under `GuardedDb.acquire()` as a bug, not an
+    /// expected outcome.
+    fn handleTxnOp(self: *Server, payload: []const u8, writer: anytype) !void {
+        const entries = protocol.decodeTxnOp(self.allocator, payload) catch {
+            return writeErr(writer, .bad_request, "malformed txn_op payload");
+        };
+        defer self.allocator.free(entries);
+        if (entries.len == 0) return writeErr(writer, .bad_request, "txn_op requires at least one operation");
+
+        var txn = txnmod.Transaction.begin(self.db);
+        defer txn.deinit();
+
+        var tables = std.StringHashMap(txntablemod.TableTxn).init(self.allocator);
+        defer {
+            var it = tables.valueIterator();
+            while (it.next()) |t| t.deinit();
+            tables.deinit();
+        }
+
+        for (entries) |e| {
+            const gop = tables.getOrPut(e.table) catch |err| {
+                return writeErr(writer, .internal, @errorName(err));
+            };
+            if (!gop.found_existing) {
+                gop.value_ptr.* = txntablemod.TableTxn.open(&txn, self.allocator, e.table) catch |err| {
+                    return writeErr(writer, .bad_request, @errorName(err));
+                };
+                gop.key_ptr.* = e.table;
+            }
+            const table = gop.value_ptr;
+
+            const pk = rowmod.decodeValue(self.allocator, e.pkBytes) catch {
+                return writeErr(writer, .bad_request, "malformed primary key");
+            };
+            defer pk.free(self.allocator);
+
+            switch (e.verb) {
+                .put => {
+                    var fieldsRow = rowmod.Row.decode(self.allocator, e.fieldsBytes) catch {
+                        return writeErr(writer, .bad_request, "malformed fields");
+                    };
+                    defer fieldsRow.deinit();
+                    table.put(pk, fieldsRow.fields.items) catch |err| {
+                        return writeErr(writer, .internal, @errorName(err));
+                    };
+                },
+                .del => {
+                    table.delete(pk) catch |err| {
+                        return writeErr(writer, .internal, @errorName(err));
+                    };
+                },
+            }
+        }
+
+        txn.commit() catch |err| {
+            return switch (err) {
+                error.Conflict => writeErr(writer, .conflict, "transaction conflict"),
+                else => writeErr(writer, .internal, @errorName(err)),
+            };
+        };
+
+        const out = protocol.encodeTxnResult(self.allocator, @intCast(entries.len)) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer self.allocator.free(out);
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
+    }
+
+    /// Executes a `table select <table> [expr]` remotely: opens the named
+    /// table over the same `*Db` the rest of the server serves (so it sees
+    /// exactly the indexes/rows a local CLI `table` command would), parses
+    /// the expression text with the same `expr.zig` grammar the CLI uses
+    /// (empty text means "every row", matching `Table.select(null)`), and
+    /// wire-encodes the resulting rows. `args.orderBy`, when present, is
+    /// forwarded to `Table.selectPageOrdered` so the offset/limit window
+    /// applies AFTER sorting, exactly like the local `table select
+    /// --order-by` CLI path - `null` falls through to the plain
+    /// `selectPage` early-stop behavior instead. A bad table name or
+    /// malformed expression is a client mistake (`bad_request`), not a
+    /// server fault.
+    fn handleTableSelect(self: *Server, payload: []const u8, writer: anytype) !void {
+        const args = protocol.decodeTableSelect(self.allocator, payload) catch {
+            return writeErr(writer, .bad_request, "malformed table_select payload");
+        };
+        defer self.allocator.free(args.orderBy);
+
+        var table = querymod.Table.open(self.db, self.allocator, args.table) catch |err| {
+            return writeErr(writer, .bad_request, @errorName(err));
+        };
+        defer table.deinit();
+
+        var parsed: ?exprmod.Parsed = null;
+        defer if (parsed) |*p| p.deinit();
+        if (args.exprText.len > 0) {
+            parsed = exprmod.parse(self.allocator, args.exprText) catch |err| {
+                return writeErr(writer, .bad_request, @errorName(err));
+            };
+        }
+        const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
+
+        const rows = table.selectPageOrdered(pred, .{ .offset = args.offset, .limit = args.limit }, args.orderBy) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer querymod.freeRows(self.allocator, rows);
+
+        const out = protocol.encodeRows(self.allocator, rows) catch |err| {
+            return writeErr(writer, .internal, @errorName(err));
+        };
+        defer self.allocator.free(out);
+        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
+    }
+
+    /// Executes a `table_join` request against `join.zig`'s four equi-join
+    /// variants, chosen by `args.mode` - the network counterpart of the
+    /// CLI's local `table join [--left|--right|--full]`. Each variant
+    /// produces its own result type (`JoinedRow`/`OuterJoinedRow`/
+    /// `RightOuterJoinedRow`/`FullOuterJoinedRow`), but every one of them is
+    /// just two optional `Row`s under the hood, so this flattens whichever
+    /// one came back into `protocol.JoinPair` before encoding - one wire
+    /// format for all four modes, exactly like `coll_op` bundles thirty
+    /// collection actions behind one opcode instead of thirty. Ownership of
+    /// each row is moved (by value) from the mode-specific slice into
+    /// `pairs`, then that mode-specific slice is freed as a raw allocation
+    /// (not through `join.freeJoined`/`freeOuterJoined`/etc, which would
+    /// double-deinit rows already moved into `pairs`) - `pairs`'s own defer
+    /// is what actually frees the row contents, once encoding is done.
+    /// `args.offset`/`args.limit` window the mode-specific slice through
+    /// `join.applyPage` right after it comes back, before the flatten -
+    /// `applyPage` already frees the pre-page slice and hands back a fresh
+    /// one, so the pattern below frees `paged`, never `joined` directly.
+    fn handleTableJoin(self: *Server, payload: []const u8, writer: anytype) !void {
+        const args = protocol.decodeTableJoin(payload) catch {
+            return writeErr(writer, .bad_request, "malformed table_join payload");
+        };
+
+        var left = querymod.Table.open(self.db, self.allocator, args.leftTable) catch |err| {
+            return writeErr(writer, .bad_request, @errorName(err));
+        };
+        defer left.deinit();
+        var right = querymod.Table.open(self.db, self.allocator, args.rightTable) catch |err| {
+            return writeErr(writer, .bad_request, @errorName(err));
+        };
+        defer right.deinit();
+
