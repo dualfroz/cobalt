@@ -3284,3 +3284,620 @@ test "server table_export renders a real table to csv and json over TCP, matchin
     try std.testing.expect(std.mem.indexOf(u8, jsonResult.content, "krakow") != null);
 }
 
+test "server table_import loads csv and json content sent over TCP into a real table" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const csvImported = try client.tableImport("from_csv", .csv, "__pk,city\ni:1,s:warsaw\ni:2,s:krakow\n");
+    try std.testing.expectEqual(@as(u64, 2), csvImported);
+
+    const jsonImported = try client.tableImport("from_json", .json, "[{\"__pk\": \"i:1\", \"city\": \"s:gdansk\"}]");
+    try std.testing.expectEqual(@as(u64, 1), jsonImported);
+
+    const csvRows = try client.tableSelect(allocator, "from_csv", "", 0, 0, &.{});
+    defer protocol.freeRows(allocator, csvRows);
+    try std.testing.expectEqual(@as(usize, 2), csvRows.len);
+
+    const jsonRows = try client.tableSelect(allocator, "from_json", "city eq s:gdansk", 0, 0, &.{});
+    defer protocol.freeRows(allocator, jsonRows);
+    try std.testing.expectEqual(@as(usize, 1), jsonRows.len);
+}
+
+test "server table_export then table_import round trips a real table over two TCP round trips" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var table = try querymod.Table.open(&db, allocator, "source");
+        defer table.deinit();
+        try table.put(.{ .int = 1 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "score", .value = .{ .float = 4.5 } } });
+        try table.put(.{ .int = 2 }, &.{.{ .name = "city", .value = .{ .text = "lodz" } }});
+        try table.put(.{ .int = 3 }, &.{});
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    var exported = try client.tableExport(allocator, "source", .json);
+    defer exported.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), exported.rowCount);
+
+    const imported = try client.tableImport("dest", .json, exported.content);
+    try std.testing.expectEqual(@as(u64, 3), imported);
+
+    const warsawRows = try client.tableSelect(allocator, "dest", "city eq s:warsaw", 0, 0, &.{});
+    defer protocol.freeRows(allocator, warsawRows);
+    try std.testing.expectEqual(@as(usize, 1), warsawRows.len);
+    try std.testing.expectEqual(@as(f64, 4.5), warsawRows[0].get("score").?.float);
+
+    const untouched = try client.tableSelect(allocator, "dest", "city eq s:lodz", 0, 0, &.{});
+    defer protocol.freeRows(allocator, untouched);
+    try std.testing.expectEqual(@as(usize, 1), untouched.len);
+
+    const allRows = try client.tableSelect(allocator, "dest", "", 0, 0, &.{});
+    defer protocol.freeRows(allocator, allRows);
+    try std.testing.expectEqual(@as(usize, 3), allRows.len);
+}
+
+test "server table_export succeeds on a never-written table (schemaless tables have no declare step), table_import rejects malformed content without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    // `table` is just a keyspace prefix, never declared ahead of time (see
+    // `query.Table.open`), so exporting one nothing has ever put a row into
+    // is a valid zero-row export, not an error.
+    var exported = try client.tableExport(allocator, "nosuch", .csv);
+    defer exported.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 0), exported.rowCount);
+
+    const badImport = client.tableImport("nosuch", .json, "not json");
+    try std.testing.expectError(client_mod.ClientError.ServerInternal, badImport);
+
+    // The connection survives an internal error and can still serve a
+    // good request right after.
+    const rowCount = try client.tableImport("nosuch", .json, "[]");
+    try std.testing.expectEqual(@as(u64, 0), rowCount);
+}
+
+test "server rejects a malformed table_export frame (bad format byte) with bad_request without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var table = try querymod.Table.open(&db, allocator, "people");
+        defer table.deinit();
+        try table.put(.{ .int = 1 }, &.{});
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const stream = try std.net.tcpConnectToAddress(server.boundAddress());
+    defer stream.close();
+
+    // A well-formed table name ("people") followed by a format byte
+    // outside the DumpFormat enum (99) - `decodeTableExport` itself must
+    // reject this before `Table.open` is ever reached.
+    var payload = std.ArrayList(u8).init(allocator);
+    defer payload.deinit();
+    var lenBuf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &lenBuf, 6, .little);
+    try payload.appendSlice(&lenBuf);
+    try payload.appendSlice("people");
+    try payload.append(99);
+
+    try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.table_export), payload.items);
+    var frame = try protocol.readFrame(allocator, stream.reader());
+    defer frame.deinit();
+    try std.testing.expectEqual(@intFromEnum(protocol.Status.bad_request), frame.tag);
+
+    // The connection must still be usable afterward.
+    try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.ping), "");
+    var pingFrame = try protocol.readFrame(allocator, stream.reader());
+    defer pingFrame.deinit();
+    try std.testing.expectEqual(@intFromEnum(protocol.Status.ok), pingFrame.tag);
+}
+
+test "table_export requires only readonly role, table_import requires readwrite" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    {
+        var table = try querymod.Table.open(&db, allocator, "people");
+        defer table.deinit();
+        try table.put(.{ .int = 1 }, &.{});
+    }
+
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "viewer", "pass", .readonly, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+    try client.authenticate("viewer", "pass");
+
+    var exported = try client.tableExport(allocator, "people", .csv);
+    defer exported.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 1), exported.rowCount);
+
+    try std.testing.expectError(client_mod.ClientError.ServerForbidden, client.tableImport("people", .csv, exported.content));
+}
+
+// `table_delete` shares the same underlying-sstable-reshaping hazard as
+// `table_update` above (see that test's header comment for the full
+// rationale), but where `updateWhere` reads-then-writes each matched row in
+// place, `deleteWhere` reads-then-REMOVES it - a sharper edge again, since a
+// removed row's index entries must never resurface even if a `flush`/
+// `compact` reshapes the underlying sstables mid-scan. Three buckets
+// (warsaw/krakow/gdansk) stay untouched for the whole test and are the
+// reader threads' stable invariant (always exactly 10 rows each); a fourth
+// bucket (poznan) is what the deleter thread progressively drains one row
+// at a time via a "seq" field unrelated to the "city" index, so every
+// delete is a distinct, real structural change rather than a no-op repeat.
+test "table_delete survives concurrent flush and compact reshaping the underlying sstables" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    // Small target size so a handful of `flush`/`compact` calls do real
+    // structural work instead of needing megabytes of data first - same
+    // trick as `table_update`'s own concurrency test above.
+    var db = try Db.open(allocator, path, .{ .sstableTargetBytes = 512 });
+    defer db.close();
+
+    const stableBucketRows = 10;
+    const poznanRows = 10;
+    {
+        var accounts = try querymod.Table.open(&db, allocator, "accounts");
+        defer accounts.deinit();
+        try accounts.createIndex("city");
+        var pk: i64 = 1;
+        var i: i64 = 0;
+        while (i < stableBucketRows) : (i += 1) {
+            inline for (.{ "warsaw", "krakow", "gdansk" }) |city| {
+                try accounts.put(.{ .int = pk }, &.{.{ .name = "city", .value = .{ .text = city } }});
+                pk += 1;
+            }
+        }
+        var seq: i64 = 0;
+        while (seq < poznanRows) : (seq += 1) {
+            try accounts.put(.{ .int = pk }, &.{
+                .{ .name = "city", .value = .{ .text = "poznan" } },
+                .{ .name = "seq", .value = .{ .int = seq } },
+            });
+            pk += 1;
+        }
+        try db.flush();
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    const readerThreads = 4;
+    const readerIters = 20;
+    const reshapeThreads = 2;
+    const reshapeIters = 15;
+
+    const ReaderCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        ok: bool = false,
+    };
+    const readerWorker = struct {
+        fn run(ctx: *ReaderCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < readerIters) : (i += 1) {
+                inline for (.{ "warsaw", "krakow", "gdansk" }) |city| {
+                    const buf = std.fmt.allocPrint(ctx.allocator, "city eq s:{s}", .{city}) catch return;
+                    defer ctx.allocator.free(buf);
+                    const rows = client.tableSelect(ctx.allocator, "accounts", buf, 0, 0, &.{}) catch return;
+                    defer protocol.freeRows(ctx.allocator, rows);
+                    if (rows.len != stableBucketRows) return;
+                    for (rows) |row| {
+                        const got = row.get("city") orelse return;
+                        if (!std.mem.eql(u8, got.text, city)) return;
+                    }
+                }
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    const ReshapeCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        thread: usize,
+        ok: bool = false,
+    };
+    const reshapeWorker = struct {
+        fn run(ctx: *ReshapeCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < reshapeIters) : (i += 1) {
+                var buf: [32]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "delete-churn-{d}-{d}", .{ ctx.thread, i }) catch return;
+                client.set(key, "x") catch return;
+                client.flush() catch return;
+                client.compact() catch return;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    const DeleterCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        ok: bool = false,
+    };
+    const deleterWorker = struct {
+        fn run(ctx: *DeleterCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var seq: i64 = 0;
+            while (seq < poznanRows) : (seq += 1) {
+                const expr = std.fmt.allocPrint(ctx.allocator, "city eq s:poznan and seq eq i:{d}", .{seq}) catch return;
+                defer ctx.allocator.free(expr);
+                const deleted = client.tableDelete("accounts", expr) catch return;
+                if (deleted != 1) return;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    var readerContexts: [readerThreads]ReaderCtx = undefined;
+    var readerHandles: [readerThreads]std.Thread = undefined;
+    for (0..readerThreads) |i| {
+        readerContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress() };
+        readerHandles[i] = try std.Thread.spawn(.{}, readerWorker, .{&readerContexts[i]});
+    }
+    var reshapeContexts: [reshapeThreads]ReshapeCtx = undefined;
+    var reshapeHandles: [reshapeThreads]std.Thread = undefined;
+    for (0..reshapeThreads) |i| {
+        reshapeContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress(), .thread = i };
+        reshapeHandles[i] = try std.Thread.spawn(.{}, reshapeWorker, .{&reshapeContexts[i]});
+    }
+    var deleterContext = DeleterCtx{ .allocator = allocator, .addr = server.boundAddress() };
+    const deleterHandle = try std.Thread.spawn(.{}, deleterWorker, .{&deleterContext});
+
+    for (0..readerThreads) |i| readerHandles[i].join();
+    for (0..reshapeThreads) |i| reshapeHandles[i].join();
+    deleterHandle.join();
+    for (0..readerThreads) |i| try std.testing.expect(readerContexts[i].ok);
+    for (0..reshapeThreads) |i| try std.testing.expect(reshapeContexts[i].ok);
+    try std.testing.expect(deleterContext.ok);
+
+    // Final sanity check on a fresh connection: the three stable buckets are
+    // still exactly 10 rows each, poznan is completely gone (not just its
+    // index entries - real rows too), and no phantom entry survives under
+    // the "poznan" index bucket for a later put to collide with.
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    inline for (.{ "warsaw", "krakow", "gdansk" }) |city| {
+        const buf = try std.fmt.allocPrint(allocator, "city eq s:{s}", .{city});
+        defer allocator.free(buf);
+        const rows = try client.tableSelect(allocator, "accounts", buf, 0, 0, &.{});
+        defer protocol.freeRows(allocator, rows);
+        try std.testing.expectEqual(@as(usize, stableBucketRows), rows.len);
+    }
+
+    const poznanRowsLeft = try client.tableSelect(allocator, "accounts", "city eq s:poznan", 0, 0, &.{});
+    defer protocol.freeRows(allocator, poznanRowsLeft);
+    try std.testing.expectEqual(@as(usize, 0), poznanRowsLeft.len);
+
+    var plan = try client.tableExplain(allocator, "accounts", "city eq s:poznan");
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(querymod.PlanKind.index_eq, plan.kind);
+}
+
+test "server table_select pages a remote result with offset and limit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var table = try querymod.Table.open(&db, allocator, "users");
+        defer table.deinit();
+        var pk: i64 = 1;
+        while (pk <= 5) : (pk += 1) try table.put(.{ .int = pk }, &.{});
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const page = try client.tableSelect(allocator, "users", "", 1, 2, &.{});
+    defer protocol.freeRows(allocator, page);
+    try std.testing.expectEqual(@as(usize, 2), page.len);
+    try std.testing.expectEqual(@as(i64, 2), page[0].get(querymod.pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 3), page[1].get(querymod.pkField).?.int);
+
+    const rest = try client.tableSelect(allocator, "users", "", 3, 0, &.{});
+    defer protocol.freeRows(allocator, rest);
+    try std.testing.expectEqual(@as(usize, 2), rest.len);
+    try std.testing.expectEqual(@as(i64, 4), rest[0].get(querymod.pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 5), rest[1].get(querymod.pkField).?.int);
+}
+
+// `table_explain` reports which strategy `selectPage` would use, but
+// `table_select`'s own `--order-by` is the one place the network protocol
+// carries a sort key: `handleTableSelect` forwards `args.orderBy` into
+// `Table.selectPageOrdered`, which must sort BEFORE windowing by
+// offset/limit (see query.zig's "applies offset/limit after sorting"
+// test). This exercises that ordering end to end over a real socket,
+// including on a field that has an index (`age`) - `selectAllMatches`
+// still narrows through the index, it just cannot early-stop while a sort
+// is pending, and the wire round trip must not lose that.
+test "server table_select orders a remote result by a field before windowing it, ascending and descending" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var table = try querymod.Table.open(&db, allocator, "users");
+        defer table.deinit();
+        try table.createIndex("age");
+        // pk order deliberately not age order: pk 1 has the highest age
+        // (50), pk 5 the lowest (10) - a bug that sorted only within pk
+        // scan order would fail every assertion below.
+        var pk: i64 = 1;
+        while (pk <= 5) : (pk += 1) {
+            try table.put(.{ .int = pk }, &.{.{ .name = "age", .value = .{ .int = 60 - pk * 10 } }});
+        }
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const asc = try client.tableSelect(allocator, "users", "", 0, 0, &.{.{ .field = "age" }});
+    defer protocol.freeRows(allocator, asc);
+    try std.testing.expectEqual(@as(usize, 5), asc.len);
+    try std.testing.expectEqual(@as(i64, 5), asc[0].get(querymod.pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 10), asc[0].get("age").?.int);
+    try std.testing.expectEqual(@as(i64, 1), asc[4].get(querymod.pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 50), asc[4].get("age").?.int);
+
+    // Descending, windowed to the middle page (offset 1, limit 2). Age
+    // decreases as pk increases here, so descending-by-age happens to land
+    // on the same row order as ascending pk (pk1..5 = ages 50,40,30,20,10)
+    // - the offset/limit window (pk 2, pk 3) is still only correct if the
+    // full 5-row set was sorted first and THEN windowed, not windowed off
+    // the raw scan and left unsorted (which would coincidentally return
+    // the same two rows here, but in the ascending-age windowed case below
+    // would not).
+    const midDesc = try client.tableSelect(allocator, "users", "", 1, 2, &.{.{ .field = "age", .descending = true }});
+    defer protocol.freeRows(allocator, midDesc);
+    try std.testing.expectEqual(@as(usize, 2), midDesc.len);
+    try std.testing.expectEqual(@as(i64, 2), midDesc[0].get(querymod.pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 40), midDesc[0].get("age").?.int);
+    try std.testing.expectEqual(@as(i64, 3), midDesc[1].get(querymod.pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 30), midDesc[1].get("age").?.int);
+
+    // Ascending, same window (offset 1, limit 2): ascending-by-age order is
+    // pk 5,4,3,2,1 (ages 10,20,30,40,50), so offset 1..3 is pk 4 then pk 3
+    // - a DIFFERENT pair than the descending window above, which a
+    // window-before-sort bug (paging the raw pk scan, then sorting only
+    // the already-cut window) would fail to distinguish.
+    const midAsc = try client.tableSelect(allocator, "users", "", 1, 2, &.{.{ .field = "age" }});
+    defer protocol.freeRows(allocator, midAsc);
+    try std.testing.expectEqual(@as(usize, 2), midAsc.len);
+    try std.testing.expectEqual(@as(i64, 4), midAsc[0].get(querymod.pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 20), midAsc[0].get("age").?.int);
+    try std.testing.expectEqual(@as(i64, 3), midAsc[1].get(querymod.pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 30), midAsc[1].get("age").?.int);
+
+    // Cross-check: table_explain reports the `age` index is used for the
+    // predicate that would narrow this query, same as the ordered path's
+    // `selectAllMatches` internally reuses.
+    var plan = try client.tableExplain(allocator, "users", "age gte i:0");
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(querymod.PlanKind.index_range, plan.kind);
+}
+
+// A second, INDEPENDENT `orderBy` column exercises a path the single-column
+// test above cannot: `handleTableSelect` decoding a wire count > 1 and
+// `sortRowsBy`'s tie-breaking chain, both new with multi-column support.
+test "server table_select orders a remote result by two columns, sorting then breaking ties" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var table = try querymod.Table.open(&db, allocator, "people");
+        defer table.deinit();
+        // Two cities, scores deliberately NOT already grouped by city in
+        // scan order, so a single-column `city` sort alone would leave
+        // each city's rows unsorted by `score` - only a real tiebreak
+        // fixes that.
+        try table.put(.{ .int = 1 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "score", .value = .{ .int = 30 } } });
+        try table.put(.{ .int = 2 }, &.{ .{ .name = "city", .value = .{ .text = "krakow" } }, .{ .name = "score", .value = .{ .int = 20 } } });
+        try table.put(.{ .int = 3 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "score", .value = .{ .int = 10 } } });
+        try table.put(.{ .int = 4 }, &.{ .{ .name = "city", .value = .{ .text = "krakow" } }, .{ .name = "score", .value = .{ .int = 40 } } });
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const rows = try client.tableSelect(allocator, "people", "", 0, 0, &.{ .{ .field = "city" }, .{ .field = "score" } });
+    defer protocol.freeRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 4), rows.len);
+    try std.testing.expectEqual(@as(i64, 2), rows[0].get(querymod.pkField).?.int); // krakow/20
+    try std.testing.expectEqual(@as(i64, 4), rows[1].get(querymod.pkField).?.int); // krakow/40
+    try std.testing.expectEqual(@as(i64, 3), rows[2].get(querymod.pkField).?.int); // warsaw/10
+    try std.testing.expectEqual(@as(i64, 1), rows[3].get(querymod.pkField).?.int); // warsaw/30
+}
+
+test "server table_select rejects a malformed expr with bad_request, not a crash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var table = try querymod.Table.open(&db, allocator, "users");
+        defer table.deinit();
+        try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const err = client.tableSelect(allocator, "users", "city bogus s:warsaw", 0, 0, &.{});
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
+}
+
+fn seedAggregateOrders(allocator: Allocator, db: *Db) !void {
+    var orders = try querymod.Table.open(db, allocator, "orders");
+    defer orders.deinit();
+    try orders.put(.{ .int = 1 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "total", .value = .{ .int = 100 } },
+    });
+    try orders.put(.{ .int = 2 }, &.{
+        .{ .name = "city", .value = .{ .text = "warsaw" } },
+        .{ .name = "total", .value = .{ .int = 250 } },
+    });
+    try orders.put(.{ .int = 3 }, &.{
+        .{ .name = "city", .value = .{ .text = "krakow" } },
+        .{ .name = "total", .value = .{ .int = 40 } },
+    });
+}
+
+test "server table_aggregate groups remote rows by field with count/sum, matching the local library result" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const specs = [_]aggregatemod.AggSpec{
+        .{ .field = "", .kind = .count },
+        .{ .field = "total", .kind = .sum },
+    };
+    const groups = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 0, 0, &.{}, "", "");
+    defer protocol.freeAggGroupRows(allocator, groups);
+
