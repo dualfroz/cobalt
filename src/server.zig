@@ -3901,3 +3901,2384 @@ test "server table_aggregate groups remote rows by field with count/sum, matchin
     const groups = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 0, 0, &.{}, "", "");
     defer protocol.freeAggGroupRows(allocator, groups);
 
+    try std.testing.expectEqual(@as(usize, 2), groups.len);
+    try std.testing.expectEqualStrings("warsaw", groups[0].group.text);
+    try std.testing.expectEqual(@as(i64, 2), groups[0].values[0].int);
+    try std.testing.expectEqual(@as(i64, 350), groups[0].values[1].int);
+    try std.testing.expectEqualStrings("krakow", groups[1].group.text);
+    try std.testing.expectEqual(@as(i64, 1), groups[1].values[0].int);
+    try std.testing.expectEqual(@as(i64, 40), groups[1].values[1].int);
+}
+
+test "server table_aggregate honors offset/limit to window the result groups server-side" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+    var orders = try querymod.Table.open(&db, allocator, "orders");
+    try orders.put(.{ .int = 4 }, &.{
+        .{ .name = "city", .value = .{ .text = "gdansk" } },
+        .{ .name = "total", .value = .{ .int = 5 } },
+    });
+    orders.deinit();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const specs = [_]aggregatemod.AggSpec{.{ .field = "", .kind = .count }};
+
+    // Unpaged baseline: 3 distinct cities in first-seen order (warsaw twice
+    // seeded first, then krakow, then gdansk added above).
+    const all = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 0, 0, &.{}, "", "");
+    defer protocol.freeAggGroupRows(allocator, all);
+    try std.testing.expectEqual(@as(usize, 3), all.len);
+
+    const paged = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 1, 1, &.{}, "", "");
+    defer protocol.freeAggGroupRows(allocator, paged);
+    try std.testing.expectEqual(@as(usize, 1), paged.len);
+    try std.testing.expectEqualStrings(all[1].group.text, paged[0].group.text);
+}
+
+test "server table_aggregate with no groupField runs a single global aggregate and honors the expr filter" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const specs = [_]aggregatemod.AggSpec{
+        .{ .field = "", .kind = .count },
+        .{ .field = "total", .kind = .sum },
+    };
+    const all = try client.tableAggregateGlobal(allocator, "orders", &specs, "", "");
+    defer protocol.freeAggValues(allocator, all);
+    try std.testing.expectEqual(@as(i64, 3), all[0].int);
+    try std.testing.expectEqual(@as(i64, 390), all[1].int);
+
+    const filtered = try client.tableAggregateGlobal(allocator, "orders", &specs, "", "total gt i:50");
+    defer protocol.freeAggValues(allocator, filtered);
+    try std.testing.expectEqual(@as(i64, 2), filtered[0].int);
+    try std.testing.expectEqual(@as(i64, 350), filtered[1].int);
+}
+
+test "server table_aggregate applies a HAVING clause to result groups after aggregation, over real TCP" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db); // warsaw: count=2 sum=350, krakow: count=1 sum=40
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const specs = [_]aggregatemod.AggSpec{
+        .{ .field = "", .kind = .count },
+        .{ .field = "total", .kind = .sum },
+    };
+
+    // Referencing the printed aggregate label (sum_total): only warsaw's
+    // group sum clears 100.
+    const bySum = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 0, 0, &.{}, "sum_total gt i:100", "");
+    defer protocol.freeAggGroupRows(allocator, bySum);
+    try std.testing.expectEqual(@as(usize, 1), bySum.len);
+    try std.testing.expectEqualStrings("warsaw", bySum[0].group.text);
+
+    // Referencing the group key itself (city), not just an aggregate result.
+    const byGroup = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 0, 0, &.{}, "city eq s:krakow", "");
+    defer protocol.freeAggGroupRows(allocator, byGroup);
+    try std.testing.expectEqual(@as(usize, 1), byGroup.len);
+    try std.testing.expectEqualStrings("krakow", byGroup[0].group.text);
+
+    // A HAVING clause that excludes every group comes back as zero groups,
+    // not an error.
+    const none = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 0, 0, &.{}, "count gt i:1000", "");
+    defer protocol.freeAggGroupRows(allocator, none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "server table_aggregate HAVING narrows groups before LIMIT/OFFSET windows them, over real TCP" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+    var orders = try querymod.Table.open(&db, allocator, "orders");
+    try orders.put(.{ .int = 4 }, &.{
+        .{ .name = "city", .value = .{ .text = "gdansk" } },
+        .{ .name = "total", .value = .{ .int = 500 } },
+    });
+    orders.deinit();
+    // Groups in first-seen order: warsaw(count=2 sum=350), krakow(count=1
+    // sum=40), gdansk(count=1 sum=500). HAVING count gt 0 keeps all three,
+    // but HAVING sum_total gt i:100 keeps only warsaw and gdansk (in that
+    // order) - a limit of 1 must then return warsaw, not krakow (which
+    // would be first if the window applied before HAVING).
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const specs = [_]aggregatemod.AggSpec{
+        .{ .field = "", .kind = .count },
+        .{ .field = "total", .kind = .sum },
+    };
+    const paged = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 0, 1, &.{}, "sum_total gt i:100", "");
+    defer protocol.freeAggGroupRows(allocator, paged);
+    try std.testing.expectEqual(@as(usize, 1), paged.len);
+    try std.testing.expectEqualStrings("warsaw", paged[0].group.text);
+
+    const pagedOffset = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 1, 1, &.{}, "sum_total gt i:100", "");
+    defer protocol.freeAggGroupRows(allocator, pagedOffset);
+    try std.testing.expectEqual(@as(usize, 1), pagedOffset.len);
+    try std.testing.expectEqualStrings("gdansk", pagedOffset[0].group.text);
+}
+
+test "server table_aggregate HAVING on the global (no groupField) path excludes the single row without erroring, over real TCP" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db); // global: count=3 sum=390
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const specs = [_]aggregatemod.AggSpec{
+        .{ .field = "", .kind = .count },
+        .{ .field = "total", .kind = .sum },
+    };
+
+    const passing = try client.tableAggregateGlobal(allocator, "orders", &specs, "sum_total gt i:100", "");
+    defer protocol.freeAggValues(allocator, passing);
+    try std.testing.expectEqual(@as(usize, 2), passing.len);
+    try std.testing.expectEqual(@as(i64, 390), passing[1].int);
+
+    const excluded = try client.tableAggregateGlobal(allocator, "orders", &specs, "sum_total gt i:100000", "");
+    defer protocol.freeAggValues(allocator, excluded);
+    try std.testing.expectEqual(@as(usize, 0), excluded.len);
+}
+
+test "server table_aggregate reports a malformed HAVING expr as bad_request, not a crash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const specs = [_]aggregatemod.AggSpec{.{ .field = "", .kind = .count }};
+    const err = client.tableAggregateGroups(allocator, "orders", "city", &specs, 0, 0, &.{}, "count bogus i:1", "");
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
+}
+
+test "server table_aggregate count_distinct collapses repeated field values, locally and globally, over real TCP" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    {
+        var orders = try querymod.Table.open(&db, allocator, "orders");
+        defer orders.deinit();
+        // Both warsaw rows share the same region on purpose - the whole
+        // point of this test is that COUNT(DISTINCT region) collapses them
+        // to 1, unlike plain COUNT which would report 2.
+        try orders.put(.{ .int = 1 }, &.{
+            .{ .name = "city", .value = .{ .text = "warsaw" } },
+            .{ .name = "region", .value = .{ .text = "mazovia" } },
+        });
+        try orders.put(.{ .int = 2 }, &.{
+            .{ .name = "city", .value = .{ .text = "warsaw" } },
+            .{ .name = "region", .value = .{ .text = "mazovia" } },
+        });
+        try orders.put(.{ .int = 3 }, &.{
+            .{ .name = "city", .value = .{ .text = "krakow" } },
+            .{ .name = "region", .value = .{ .text = "malopolska" } },
+        });
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const specs = [_]aggregatemod.AggSpec{
+        .{ .field = "", .kind = .count },
+        .{ .field = "region", .kind = .count_distinct },
+    };
+    const groups = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 0, 0, &.{}, "", "");
+    defer protocol.freeAggGroupRows(allocator, groups);
+    try std.testing.expectEqual(@as(usize, 2), groups.len);
+    try std.testing.expectEqualStrings("warsaw", groups[0].group.text);
+    try std.testing.expectEqual(@as(i64, 2), groups[0].values[0].int); // COUNT(*)
+    try std.testing.expectEqual(@as(i64, 1), groups[0].values[1].int); // COUNT(DISTINCT region)
+    try std.testing.expectEqualStrings("krakow", groups[1].group.text);
+    try std.testing.expectEqual(@as(i64, 1), groups[1].values[0].int);
+    try std.testing.expectEqual(@as(i64, 1), groups[1].values[1].int);
+
+    const globalSpecs = [_]aggregatemod.AggSpec{.{ .field = "region", .kind = .count_distinct }};
+    const global = try client.tableAggregateGlobal(allocator, "orders", &globalSpecs, "", "");
+    defer protocol.freeAggValues(allocator, global);
+    try std.testing.expectEqual(@as(i64, 2), global[0].int); // mazovia + malopolska
+}
+
+test "server table_aggregate reports a non-numeric sum field as bad_request, not a crash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const specs = [_]aggregatemod.AggSpec{.{ .field = "city", .kind = .sum }};
+    const err = client.tableAggregateGlobal(allocator, "orders", &specs, "", "");
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
+}
+
+test "server table_window annotates remote rows with row_number, partition-then-order matching the local library result" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const partitionBy = [_][]const u8{"city"};
+    const orderBy = [_]querymod.OrderBy{.{ .field = "total", .descending = false }};
+    const specs = [_]windowmod.WindowSpec{.{ .field = "", .kind = .row_number }};
+    const results = try client.tableWindow(allocator, "orders", &specs, &partitionBy, &orderBy, 0, 0, "", .rows);
+    defer protocol.freeWindowRows(allocator, results);
+
+    // First-seen partition order (warsaw at pk1, krakow at pk3), sorted by
+    // total within each partition: warsaw 100 then 250, krakow 40 alone.
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("warsaw", results[0].row.get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 100), results[0].row.get("total").?.int);
+    try std.testing.expectEqual(@as(i64, 1), results[0].values[0].int);
+    try std.testing.expectEqualStrings("warsaw", results[1].row.get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 250), results[1].row.get("total").?.int);
+    try std.testing.expectEqual(@as(i64, 2), results[1].values[0].int);
+    try std.testing.expectEqualStrings("krakow", results[2].row.get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 1), results[2].values[0].int);
+}
+
+test "server table_window honors offset/limit to page rows in partition-then-order display order, not raw scan order" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const partitionBy = [_][]const u8{"city"};
+    const orderBy = [_]querymod.OrderBy{.{ .field = "total", .descending = false }};
+    const specs = [_]windowmod.WindowSpec{.{ .field = "", .kind = .row_number }};
+
+    const all = try client.tableWindow(allocator, "orders", &specs, &partitionBy, &orderBy, 0, 0, "", .rows);
+    defer protocol.freeWindowRows(allocator, all);
+    try std.testing.expectEqual(@as(usize, 3), all.len);
+
+    const paged = try client.tableWindow(allocator, "orders", &specs, &partitionBy, &orderBy, 1, 1, "", .rows);
+    defer protocol.freeWindowRows(allocator, paged);
+    try std.testing.expectEqual(@as(usize, 1), paged.len);
+    try std.testing.expectEqual(all[1].values[0].int, paged[0].values[0].int);
+    try std.testing.expectEqual(all[1].row.get("total").?.int, paged[0].row.get("total").?.int);
+}
+
+test "server table_window with MULTIPLE specs returns one WindowRow.values entry per spec, in request order, over real TCP" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const partitionBy = [_][]const u8{"city"};
+    const orderBy = [_]querymod.OrderBy{.{ .field = "total", .descending = false }};
+    const specs = [_]windowmod.WindowSpec{
+        .{ .field = "", .kind = .row_number },
+        .{ .field = "total", .kind = .sum },
+    };
+    const results = try client.tableWindow(allocator, "orders", &specs, &partitionBy, &orderBy, 0, 0, "", .rows);
+    defer protocol.freeWindowRows(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqual(@as(usize, 2), results[0].values.len);
+    // warsaw: total 100 then 250 (running sum), krakow: total 40 alone.
+    try std.testing.expectEqualStrings("warsaw", results[0].row.get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 1), results[0].values[0].int);
+    try std.testing.expectEqual(@as(i64, 100), results[0].values[1].int);
+    try std.testing.expectEqualStrings("warsaw", results[1].row.get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 2), results[1].values[0].int);
+    try std.testing.expectEqual(@as(i64, 350), results[1].values[1].int);
+    try std.testing.expectEqualStrings("krakow", results[2].row.get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 1), results[2].values[0].int);
+    try std.testing.expectEqual(@as(i64, 40), results[2].values[1].int);
+}
+
+test "server table_window with a partition but no order runs a whole-partition sum, matching sum:field semantics" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const partitionBy = [_][]const u8{"city"};
+    const specs = [_]windowmod.WindowSpec{.{ .field = "total", .kind = .sum }};
+    const results = try client.tableWindow(allocator, "orders", &specs, &partitionBy, &.{}, 0, 0, "", .rows);
+    defer protocol.freeWindowRows(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    for (results) |wr| {
+        const expected: i64 = if (std.mem.eql(u8, wr.row.get("city").?.text, "warsaw")) 350 else 40;
+        try std.testing.expectEqual(expected, wr.values[0].int);
+    }
+}
+
+test "server table_window RANGE frame groups tied rows by day, ROWS gives each row its own running total, over real TCP" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    {
+        var orders = try querymod.Table.open(&db, allocator, "orders");
+        defer orders.deinit();
+        // Two rows tied at day=1 (10, 20), then one row at day=2 (5).
+        try orders.put(.{ .int = 1 }, &.{
+            .{ .name = "day", .value = .{ .int = 1 } },
+            .{ .name = "amount", .value = .{ .int = 10 } },
+        });
+        try orders.put(.{ .int = 2 }, &.{
+            .{ .name = "day", .value = .{ .int = 1 } },
+            .{ .name = "amount", .value = .{ .int = 20 } },
+        });
+        try orders.put(.{ .int = 3 }, &.{
+            .{ .name = "day", .value = .{ .int = 2 } },
+            .{ .name = "amount", .value = .{ .int = 5 } },
+        });
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const orderBy = [_]querymod.OrderBy{.{ .field = "day", .descending = false }};
+    const specs = [_]windowmod.WindowSpec{.{ .field = "amount", .kind = .sum }};
+
+    const rangeResults = try client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .range);
+    defer protocol.freeWindowRows(allocator, rangeResults);
+    try std.testing.expectEqual(@as(usize, 3), rangeResults.len);
+    // Both day=1 rows share the tie group's combined total (10+20=30).
+    try std.testing.expectEqual(@as(i64, 30), rangeResults[0].values[0].int);
+    try std.testing.expectEqual(@as(i64, 30), rangeResults[1].values[0].int);
+    try std.testing.expectEqual(@as(i64, 35), rangeResults[2].values[0].int);
+
+    const rowsResults = try client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .rows);
+    defer protocol.freeWindowRows(allocator, rowsResults);
+    try std.testing.expectEqual(@as(usize, 3), rowsResults.len);
+    // ROWS: each physical row gets its own running total, even tied ones.
+    try std.testing.expectEqual(@as(i64, 10), rowsResults[0].values[0].int);
+    try std.testing.expectEqual(@as(i64, 30), rowsResults[1].values[0].int);
+    try std.testing.expectEqual(@as(i64, 35), rowsResults[2].values[0].int);
+}
+
+test "server table_window rejects a RANGE frame combined with row_number as bad_request, not a crash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const orderBy = [_]querymod.OrderBy{.{ .field = "total", .descending = false }};
+    const specs = [_]windowmod.WindowSpec{.{ .field = "", .kind = .row_number }};
+    const err = client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .range);
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
+}
+
+test "server table_window lag/lead read the adjacent row's value along order, NULL at the sequence edge, over real TCP" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const orderBy = [_]querymod.OrderBy{.{ .field = "total", .descending = false }};
+    const specs = [_]windowmod.WindowSpec{
+        .{ .field = "total", .kind = .lag },
+        .{ .field = "total", .kind = .lead },
+    };
+    const results = try client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .rows);
+    defer protocol.freeWindowRows(allocator, results);
+
+    // Sorted by total ascending: krakow/40, warsaw/100, warsaw/250.
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqual(@as(i64, 40), results[0].row.get("total").?.int);
+    try std.testing.expectEqual(rowmod.ValueTag.none, @as(rowmod.ValueTag, results[0].values[0]));
+    try std.testing.expectEqual(@as(i64, 100), results[0].values[1].int);
+    try std.testing.expectEqual(@as(i64, 100), results[1].row.get("total").?.int);
+    try std.testing.expectEqual(@as(i64, 40), results[1].values[0].int);
+    try std.testing.expectEqual(@as(i64, 250), results[1].values[1].int);
+    try std.testing.expectEqual(@as(i64, 250), results[2].row.get("total").?.int);
+    try std.testing.expectEqual(@as(i64, 100), results[2].values[0].int);
+    try std.testing.expectEqual(rowmod.ValueTag.none, @as(rowmod.ValueTag, results[2].values[1]));
+}
+
+test "server table_window lag with an explicit offset and a caller-supplied default, over real TCP" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const orderBy = [_]querymod.OrderBy{.{ .field = "total", .descending = false }};
+    const specs = [_]windowmod.WindowSpec{.{ .field = "total", .kind = .lag, .offset = 2, .default = .{ .int = -1 } }};
+    const results = try client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .rows);
+    defer protocol.freeWindowRows(allocator, results);
+
+    // Sorted: krakow/40, warsaw/100, warsaw/250 - lag offset 2 reaches back
+    // two physical positions, so only the LAST row has a real source (40);
+    // the first two fall outside the sequence and get the -1 default.
+    try std.testing.expectEqual(@as(i64, -1), results[0].values[0].int);
+    try std.testing.expectEqual(@as(i64, -1), results[1].values[0].int);
+    try std.testing.expectEqual(@as(i64, 40), results[2].values[0].int);
+}
+
+test "server table_window rejects a RANGE frame combined with lag as bad_request, not a crash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const orderBy = [_]querymod.OrderBy{.{ .field = "total", .descending = false }};
+    const specs = [_]windowmod.WindowSpec{.{ .field = "total", .kind = .lead }};
+    const err = client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .range);
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
+}
+
+test "server table_window first_value/last_value read the current RANGE tie group's edges, over real TCP" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const orderBy = [_]querymod.OrderBy{.{ .field = "total", .descending = false }};
+    const specs = [_]windowmod.WindowSpec{
+        .{ .field = "total", .kind = .first_value },
+        .{ .field = "total", .kind = .last_value },
+    };
+    const results = try client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .range);
+    defer protocol.freeWindowRows(allocator, results);
+
+    // Sorted by total ascending: krakow/40, warsaw/100, warsaw/250 - no ties,
+    // so RANGE reduces to one tie group per row (same as ROWS): first_value
+    // is always the partition's first row (40, frame start is unaffected by
+    // ties), but last_value is each row's OWN value since it is its own
+    // singleton tie group.
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    for (results) |r| try std.testing.expectEqual(@as(i64, 40), r.values[0].int);
+    try std.testing.expectEqual(@as(i64, 40), results[0].values[1].int);
+    try std.testing.expectEqual(@as(i64, 100), results[1].values[1].int);
+    try std.testing.expectEqual(@as(i64, 250), results[2].values[1].int);
+}
+
+test "server table_window nth_value reads a fixed frame position, default at the sequence edge, over real TCP" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const orderBy = [_]querymod.OrderBy{.{ .field = "total", .descending = false }};
+    const specs = [_]windowmod.WindowSpec{.{ .field = "total", .kind = .nth_value, .offset = 2, .default = .{ .int = -1 } }};
+    const results = try client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .rows);
+    defer protocol.freeWindowRows(allocator, results);
+
+    // Sorted: krakow/40, warsaw/100, warsaw/250. Position 2 (n=2) needs a
+    // frame of at least size 2 - the first row's ROWS frame is still just
+    // itself (size 1), so it falls back to the caller's default (-1); the
+    // remaining two rows both see position 2's value, 100.
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqual(@as(i64, -1), results[0].values[0].int);
+    try std.testing.expectEqual(@as(i64, 100), results[1].values[0].int);
+    try std.testing.expectEqual(@as(i64, 100), results[2].values[0].int);
+}
+
+test "server table_window count_distinct runs a distinct-city total over real TCP, matching local semantics" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    // Sorted by total ascending: krakow/40, warsaw/100, warsaw/250 - distinct
+    // "city" running count grows 1 (krakow), 2 (warsaw joins), then stays 2
+    // (warsaw repeats).
+    const orderBy = [_]querymod.OrderBy{.{ .field = "total", .descending = false }};
+    const specs = [_]windowmod.WindowSpec{.{ .field = "city", .kind = .count_distinct }};
+    const results = try client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .rows);
+    defer protocol.freeWindowRows(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqual(@as(i64, 1), results[0].values[0].int);
+    try std.testing.expectEqual(@as(i64, 2), results[1].values[0].int);
+    try std.testing.expectEqual(@as(i64, 2), results[2].values[0].int);
+}
+
+test "server table_window applies the expr filter before annotating, over real TCP" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const specs = [_]windowmod.WindowSpec{.{ .field = "", .kind = .count }};
+    const results = try client.tableWindow(allocator, "orders", &specs, &.{}, &.{}, 0, 0, "city eq s:warsaw", .rows);
+    defer protocol.freeWindowRows(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    for (results) |wr| try std.testing.expectEqual(@as(i64, 2), wr.values[0].int);
+}
+
+test "server table_window reports a malformed expr as bad_request, not a crash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const specs = [_]windowmod.WindowSpec{.{ .field = "", .kind = .count }};
+    const err = client.tableWindow(allocator, "orders", &specs, &.{}, &.{}, 0, 0, "city bogus s:warsaw", .rows);
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
+}
+
+test "server table_window reports a non-numeric sum field as bad_request, not a crash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const specs = [_]windowmod.WindowSpec{.{ .field = "city", .kind = .sum }};
+    const err = client.tableWindow(allocator, "orders", &specs, &.{}, &.{}, 0, 0, "", .rows);
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
+}
+
+test "server table_window reports a sum spec with no field as bad_request, not a crash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedAggregateOrders(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    // The CLI's `parseWindowSpec` would reject this before ever sending it,
+    // but nothing on the wire itself stops a client from asking for it -
+    // `window.computeMany`'s `MissingField` must come back as
+    // `bad_request`, not an internal server error.
+    const specs = [_]windowmod.WindowSpec{.{ .field = "", .kind = .sum }};
+    const err = client.tableWindow(allocator, "orders", &specs, &.{}, &.{}, 0, 0, "", .rows);
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
+}
+
+// `table_aggregate` shares the exact same underlying-sstable-reshaping
+// hazard as `table_select`/`table_join` above (see the `table_select`
+// concurrency test's header comment): `flush`/`compact` swap `Db.sstables`
+// out from under any in-flight reader while `Server.dispatch`'s `self.mutex`
+// is what keeps an aggregate's full-table scan (and the grouping/windowing
+// on top of it in `aggregate.zig`) from tearing. Thirty rows split evenly
+// three ways by `@mod(pk, 3)` so every group lands on an independently
+// checkable count and sum: pk%3==0 -> "warsaw" (pks 3,6,..,30, count 10, sum
+// 165), pk%3==1 -> "krakow" (pks 1,4,..,28, count 10, sum 145), pk%3==2 ->
+// "gdansk" (pks 2,5,..,29, count 10, sum 155) - global count 30, sum 465.
+test "table_aggregate survives concurrent flush and compact reshaping the underlying sstables" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    // Small target size so a handful of `flush`/`compact` calls do real
+    // structural work instead of needing megabytes of data first - same
+    // trick as the `table_select`/`table_join` concurrency tests above.
+    var db = try Db.open(allocator, path, .{ .sstableTargetBytes = 512 });
+    defer db.close();
+
+    const rowCount = 30;
+    {
+        var orders = try querymod.Table.open(&db, allocator, "orders");
+        defer orders.deinit();
+        var pk: i64 = 1;
+        while (pk <= rowCount) : (pk += 1) {
+            const city: []const u8 = switch (@mod(pk, 3)) {
+                0 => "warsaw",
+                1 => "krakow",
+                else => "gdansk",
+            };
+            try orders.put(.{ .int = pk }, &.{
+                .{ .name = "city", .value = .{ .text = city } },
+                .{ .name = "total", .value = .{ .int = pk } },
+            });
+        }
+        try db.flush();
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    const readerThreads = 4;
+    const readerIters = 20;
+    const mutatorThreads = 2;
+    const mutatorIters = 15;
+
+    const expectedCount = struct {
+        fn get(city: []const u8) i64 {
+            return if (std.mem.eql(u8, city, "warsaw") or std.mem.eql(u8, city, "krakow") or std.mem.eql(u8, city, "gdansk")) 10 else -1;
+        }
+    }.get;
+    const expectedSum = struct {
+        fn get(city: []const u8) i64 {
+            if (std.mem.eql(u8, city, "warsaw")) return 165;
+            if (std.mem.eql(u8, city, "krakow")) return 145;
+            if (std.mem.eql(u8, city, "gdansk")) return 155;
+            return -1;
+        }
+    }.get;
+
+    const ReaderCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        ok: bool = false,
+    };
+    const readerWorker = struct {
+        fn run(ctx: *ReaderCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < readerIters) : (i += 1) {
+                const specs = [_]aggregatemod.AggSpec{
+                    .{ .field = "", .kind = .count },
+                    .{ .field = "total", .kind = .sum },
+                };
+                const groups = client.tableAggregateGroups(ctx.allocator, "orders", "city", &specs, 0, 0, &.{}, "", "") catch return;
+                defer protocol.freeAggGroupRows(ctx.allocator, groups);
+                if (groups.len != 3) return;
+                for (groups) |g| {
+                    if (g.values[0].int != expectedCount(g.group.text)) return;
+                    if (g.values[1].int != expectedSum(g.group.text)) return;
+                }
+
+                const global = client.tableAggregateGlobal(ctx.allocator, "orders", &specs, "", "") catch return;
+                defer protocol.freeAggValues(ctx.allocator, global);
+                if (global[0].int != rowCount) return;
+                if (global[1].int != 465) return;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    const MutatorCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        thread: usize,
+        ok: bool = false,
+    };
+    const mutatorWorker = struct {
+        fn run(ctx: *MutatorCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < mutatorIters) : (i += 1) {
+                var buf: [32]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "agg-churn-{d}-{d}", .{ ctx.thread, i }) catch return;
+                client.set(key, "x") catch return;
+                client.flush() catch return;
+                client.compact() catch return;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    var readerContexts: [readerThreads]ReaderCtx = undefined;
+    var readerHandles: [readerThreads]std.Thread = undefined;
+    for (0..readerThreads) |i| {
+        readerContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress() };
+        readerHandles[i] = try std.Thread.spawn(.{}, readerWorker, .{&readerContexts[i]});
+    }
+    var mutatorContexts: [mutatorThreads]MutatorCtx = undefined;
+    var mutatorHandles: [mutatorThreads]std.Thread = undefined;
+    for (0..mutatorThreads) |i| {
+        mutatorContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress(), .thread = i };
+        mutatorHandles[i] = try std.Thread.spawn(.{}, mutatorWorker, .{&mutatorContexts[i]});
+    }
+
+    for (0..readerThreads) |i| readerHandles[i].join();
+    for (0..mutatorThreads) |i| mutatorHandles[i].join();
+    for (0..readerThreads) |i| try std.testing.expect(readerContexts[i].ok);
+    for (0..mutatorThreads) |i| try std.testing.expect(mutatorContexts[i].ok);
+
+    // Final sanity check on a fresh connection: after all the concurrent
+    // churn, the aggregate results are still exactly what they were before
+    // the server ever started - the churn wrote only unrelated
+    // `agg-churn-*` keys and reshaped physical sstable layout, never touched
+    // `orders` values.
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+    const specs = [_]aggregatemod.AggSpec{.{ .field = "", .kind = .count }};
+    const finalGroups = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 0, 0, &.{}, "", "");
+    defer protocol.freeAggGroupRows(allocator, finalGroups);
+    try std.testing.expectEqual(@as(usize, 3), finalGroups.len);
+    for (finalGroups) |g| try std.testing.expectEqual(expectedCount(g.group.text), g.values[0].int);
+}
+
+fn seedJoinTables(allocator: Allocator, db: *Db) !void {
+    var customers = try querymod.Table.open(db, allocator, "customers");
+    defer customers.deinit();
+    try customers.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "alice" } }});
+    try customers.put(.{ .int = 2 }, &.{.{ .name = "name", .value = .{ .text = "bob" } }});
+    try customers.put(.{ .int = 3 }, &.{.{ .name = "name", .value = .{ .text = "carol" } }});
+
+    var orders = try querymod.Table.open(db, allocator, "orders");
+    defer orders.deinit();
+    try orders.put(.{ .int = 101 }, &.{
+        .{ .name = "customer_id", .value = .{ .int = 1 } },
+        .{ .name = "total", .value = .{ .int = 50 } },
+    });
+    try orders.put(.{ .int = 102 }, &.{
+        .{ .name = "customer_id", .value = .{ .int = 1 } },
+        .{ .name = "total", .value = .{ .int = 30 } },
+    });
+    try orders.put(.{ .int = 103 }, &.{
+        .{ .name = "customer_id", .value = .{ .int = 999 } },
+        .{ .name = "total", .value = .{ .int = 999 } },
+    });
+}
+
+test "server table_join runs a remote inner join, using an index when available" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedJoinTables(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const noIndex = try client.tableJoin(allocator, .inner, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "");
+    defer protocol.freeJoinPairs(allocator, noIndex);
+    try std.testing.expectEqual(@as(usize, 2), noIndex.len);
+    for (noIndex) |p| {
+        try std.testing.expect(p.left != null);
+        try std.testing.expect(p.right != null);
+        try std.testing.expectEqualStrings("alice", p.left.?.get("name").?.text);
+    }
+
+    {
+        var orders = try querymod.Table.open(&db, allocator, "orders");
+        defer orders.deinit();
+        try orders.createIndex("customer_id");
+    }
+    const withIndex = try client.tableJoin(allocator, .inner, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "");
+    defer protocol.freeJoinPairs(allocator, withIndex);
+    try std.testing.expectEqual(@as(usize, 2), withIndex.len);
+}
+
+test "server table_join runs left, right, and full outer variants with predicates" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedJoinTables(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const left = try client.tableJoin(allocator, .left, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "");
+    defer protocol.freeJoinPairs(allocator, left);
+    try std.testing.expectEqual(@as(usize, 4), left.len);
+    var carolUnmatched = false;
+    for (left) |p| {
+        if (p.left) |l| {
+            if (std.mem.eql(u8, l.get("name").?.text, "carol")) {
+                try std.testing.expect(p.right == null);
+                carolUnmatched = true;
+            }
+        }
+    }
+    try std.testing.expect(carolUnmatched);
+
+    const right = try client.tableJoin(allocator, .right, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "");
+    defer protocol.freeJoinPairs(allocator, right);
+    try std.testing.expectEqual(@as(usize, 3), right.len);
+    var orphanOrderUnmatched = false;
+    for (right) |p| {
+        if (p.left == null) orphanOrderUnmatched = true;
+    }
+    try std.testing.expect(orphanOrderUnmatched);
+
+    const full = try client.tableJoin(allocator, .full, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "");
+    defer protocol.freeJoinPairs(allocator, full);
+    try std.testing.expectEqual(@as(usize, 5), full.len);
+
+    // rightExprText filters the orders side before the join runs, same as
+    // `innerJoin`'s `rightPred` - narrowing to `total gt i:40` drops one of
+    // alice's two orders.
+    const filtered = try client.tableJoin(allocator, .inner, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "total gt i:40");
+    defer protocol.freeJoinPairs(allocator, filtered);
+    try std.testing.expectEqual(@as(usize, 1), filtered.len);
+    try std.testing.expectEqual(@as(i64, 50), filtered[0].right.?.get("total").?.int);
+}
+
+test "server table_join windows a real TCP result through offset and limit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedJoinTables(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    // Unpaged left outer join order: (alice,101) (alice,102) (bob,nil) (carol,nil).
+    const unpaged = try client.tableJoin(allocator, .left, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "");
+    defer protocol.freeJoinPairs(allocator, unpaged);
+    try std.testing.expectEqual(@as(usize, 4), unpaged.len);
+
+    const windowed = try client.tableJoin(allocator, .left, "customers", querymod.pkField, "orders", "customer_id", 1, 2, "", "");
+    defer protocol.freeJoinPairs(allocator, windowed);
+    try std.testing.expectEqual(@as(usize, 2), windowed.len);
+    try std.testing.expectEqual(@as(i64, 30), windowed[0].right.?.get("total").?.int);
+    try std.testing.expectEqualStrings("bob", windowed[1].left.?.get("name").?.text);
+    try std.testing.expect(windowed[1].right == null);
+
+    const pastEnd = try client.tableJoin(allocator, .left, "customers", querymod.pkField, "orders", "customer_id", 50, 0, "", "");
+    defer protocol.freeJoinPairs(allocator, pastEnd);
+    try std.testing.expectEqual(@as(usize, 0), pastEnd.len);
+}
+
+test "server table_join rejects a malformed expr with bad_request, not a crash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    try seedJoinTables(allocator, &db);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const err = client.tableJoin(allocator, .inner, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "name bogus s:alice", "");
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
+}
+
+// `table_select` is the only networked table opcode - rows can only be
+// written locally (CLI `table put`), never over the wire - so this cannot
+// reuse the coll_op "many writers, one shared counter" shape. What it CAN
+// share with a live server is the sstable storage underneath: `flush` and
+// `compact` (both real networked opcodes) mutate `Db.sstables` in place,
+// closing and destroying old `Reader`s and swapping in new ones while
+// `compact` in particular collapses the whole list down to a single file.
+// A `table_select` cursor concurrently mid-scan over those same readers is
+// exactly the use-after-free/torn-read shape a missing lock around
+// `Server.dispatch` would produce - `self.mutex` must serialize every
+// request regardless of which opcode it is, not just same-opcode traffic.
+test "table_select survives concurrent flush and compact reshaping the underlying sstables" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    // A small target size so a handful of `flush`/`compact` calls do real
+    // structural work instead of needing megabytes of data first.
+    var db = try Db.open(allocator, path, .{ .sstableTargetBytes = 512 });
+    defer db.close();
+
+    const rowCount = 30;
+    {
+        var table = try querymod.Table.open(&db, allocator, "people");
+        defer table.deinit();
+        var pk: i64 = 1;
+        while (pk <= rowCount) : (pk += 1) {
+            const city: []const u8 = switch (@mod(pk, 3)) {
+                0 => "warsaw",
+                1 => "krakow",
+                else => "gdansk",
+            };
+            try table.put(.{ .int = pk }, &.{
+                .{ .name = "city", .value = .{ .text = city } },
+                .{ .name = "age", .value = .{ .int = pk * 2 } },
+            });
+        }
+        try db.flush();
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    const readerThreads = 4;
+    const readerIters = 40;
+    const mutatorThreads = 2;
+    const mutatorIters = 15;
+
+    const ReaderCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        ok: bool = false,
+    };
+    // A multi-element order-by (city ascending, then age descending as a
+    // tiebreak within each city) - `handleTableSelect` decodes a wire
+    // orderBy count > 1 into `Table.selectPageOrdered`, which cannot
+    // early-stop mid-scan the way an unordered `selectPage` can, so it reads
+    // more of the table before sorting. This proves that path survives real
+    // `flush`/`compact` reshaping the underlying sstables mid-scan, not just
+    // the single-column order-by already covered by
+    // "orders a remote result by a field before windowing it" above.
+    const cityOrderBy = [_]querymod.OrderBy{
+        .{ .field = "city" },
+        .{ .field = "age", .descending = true },
+    };
+
+    const readerWorker = struct {
+        fn run(ctx: *ReaderCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < readerIters) : (i += 1) {
+                const warsawRows = client.tableSelect(ctx.allocator, "people", "city eq s:warsaw", 0, 0, &.{}) catch return;
+                defer protocol.freeRows(ctx.allocator, warsawRows);
+                if (warsawRows.len != rowCount / 3) return;
+
+                const allRows = client.tableSelect(ctx.allocator, "people", "", 0, 0, &.{}) catch return;
+                defer protocol.freeRows(ctx.allocator, allRows);
+                if (allRows.len != rowCount) return;
+                for (allRows) |row| {
+                    const pk = row.get(querymod.pkField) orelse return;
+                    const age = row.get("age") orelse return;
+                    if (age.int != pk.int * 2) return;
+                }
+
+                const ordered = client.tableSelect(ctx.allocator, "people", "", 0, 0, &cityOrderBy) catch return;
+                defer protocol.freeRows(ctx.allocator, ordered);
+                if (ordered.len != rowCount) return;
+                var prevCity: ?[]const u8 = null;
+                var prevAge: i64 = std.math.maxInt(i64);
+                for (ordered) |row| {
+                    const city = (row.get("city") orelse return).text;
+                    const age = (row.get("age") orelse return).int;
+                    if (prevCity) |pc| {
+                        const cmp = std.mem.order(u8, pc, city);
+                        if (cmp == .gt) return;
+                        if (cmp == .eq and age > prevAge) return;
+                        if (cmp != .eq) prevAge = std.math.maxInt(i64);
+                    }
+                    prevCity = city;
+                    prevAge = age;
+                }
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    const MutatorCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        thread: usize,
+        ok: bool = false,
+    };
+    const mutatorWorker = struct {
+        fn run(ctx: *MutatorCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < mutatorIters) : (i += 1) {
+                var buf: [32]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "churn-{d}-{d}", .{ ctx.thread, i }) catch return;
+                client.set(key, "x") catch return;
+                client.flush() catch return;
+                client.compact() catch return;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    var readerContexts: [readerThreads]ReaderCtx = undefined;
+    var readerHandles: [readerThreads]std.Thread = undefined;
+    for (0..readerThreads) |i| {
+        readerContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress() };
+        readerHandles[i] = try std.Thread.spawn(.{}, readerWorker, .{&readerContexts[i]});
+    }
+    var mutatorContexts: [mutatorThreads]MutatorCtx = undefined;
+    var mutatorHandles: [mutatorThreads]std.Thread = undefined;
+    for (0..mutatorThreads) |i| {
+        mutatorContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress(), .thread = i };
+        mutatorHandles[i] = try std.Thread.spawn(.{}, mutatorWorker, .{&mutatorContexts[i]});
+    }
+
+    for (0..readerThreads) |i| readerHandles[i].join();
+    for (0..mutatorThreads) |i| mutatorHandles[i].join();
+    for (0..readerThreads) |i| try std.testing.expect(readerContexts[i].ok);
+    for (0..mutatorThreads) |i| try std.testing.expect(mutatorContexts[i].ok);
+
+    // Final sanity check on a fresh connection: after all the concurrent
+    // churn, the table data itself must be byte-for-byte what was written
+    // before the server ever started - `flush`/`compact` change physical
+    // layout, never live values.
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+    const finalAll = try client.tableSelect(allocator, "people", "", 0, 0, &.{});
+    defer protocol.freeRows(allocator, finalAll);
+    try std.testing.expectEqual(@as(usize, rowCount), finalAll.len);
+    const finalWarsaw = try client.tableSelect(allocator, "people", "city eq s:warsaw", 0, 0, &.{});
+    defer protocol.freeRows(allocator, finalWarsaw);
+    try std.testing.expectEqual(@as(usize, rowCount / 3), finalWarsaw.len);
+
+    // Precise check of the multi-column order-by: city groups sorted
+    // alphabetically (gdansk < krakow < warsaw), each group internally by
+    // age (== pk*2) descending. pk%3 maps 2->gdansk, 1->krakow, 0->warsaw,
+    // so each group's highest pk (== highest age) leads that group.
+    const finalOrdered = try client.tableSelect(allocator, "people", "", 0, 0, &cityOrderBy);
+    defer protocol.freeRows(allocator, finalOrdered);
+    try std.testing.expectEqual(@as(usize, rowCount), finalOrdered.len);
+    try std.testing.expectEqualStrings("gdansk", finalOrdered[0].get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 29), finalOrdered[0].get(querymod.pkField).?.int);
+    try std.testing.expectEqualStrings("gdansk", finalOrdered[9].get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 2), finalOrdered[9].get(querymod.pkField).?.int);
+    try std.testing.expectEqualStrings("krakow", finalOrdered[10].get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 28), finalOrdered[10].get(querymod.pkField).?.int);
+    try std.testing.expectEqualStrings("krakow", finalOrdered[19].get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 1), finalOrdered[19].get(querymod.pkField).?.int);
+    try std.testing.expectEqualStrings("warsaw", finalOrdered[20].get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 30), finalOrdered[20].get(querymod.pkField).?.int);
+    try std.testing.expectEqualStrings("warsaw", finalOrdered[29].get("city").?.text);
+    try std.testing.expectEqual(@as(i64, 3), finalOrdered[29].get(querymod.pkField).?.int);
+}
+
+// `table_join` shares the exact same underlying-sstable-reshaping hazard as
+// `table_select` above (see that test's header comment) - `flush`/`compact`
+// swap `Db.sstables` out from under any in-flight reader while
+// `Server.dispatch`'s `self.mutex` is what keeps a join's two-table scan
+// from tearing. Ten customers / ten orders, deliberately NOT 1:1: two
+// customers (9, 10) never appear in `orders`, and two orders (9, 10) carry a
+// `customer_id` nobody has, so inner/left/right/full each land on a
+// different, independently-checkable pair count instead of degenerating to
+// the same number.
+fn seedJoinConcurrencyTables(allocator: Allocator, db: *Db) !void {
+    var customers = try querymod.Table.open(db, allocator, "customers");
+    defer customers.deinit();
+    var pk: i64 = 1;
+    while (pk <= 10) : (pk += 1) {
+        var buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "cust{d}", .{pk});
+        try customers.put(.{ .int = pk }, &.{.{ .name = "name", .value = .{ .text = name } }});
+    }
+
+    var orders = try querymod.Table.open(db, allocator, "orders");
+    defer orders.deinit();
+    pk = 1;
+    while (pk <= 8) : (pk += 1) {
+        try orders.put(.{ .int = pk }, &.{
+            .{ .name = "customer_id", .value = .{ .int = pk } },
+            .{ .name = "total", .value = .{ .int = pk * 10 } },
+        });
+    }
+    try orders.put(.{ .int = 9 }, &.{
+        .{ .name = "customer_id", .value = .{ .int = 999 } },
+        .{ .name = "total", .value = .{ .int = 900 } },
+    });
+    try orders.put(.{ .int = 10 }, &.{
+        .{ .name = "customer_id", .value = .{ .int = 998 } },
+        .{ .name = "total", .value = .{ .int = 800 } },
+    });
+}
+
+test "table_join survives concurrent flush and compact reshaping the underlying sstables" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    // Small target size so a handful of `flush`/`compact` calls do real
+    // structural work instead of needing megabytes of data first - same
+    // trick as the `table_select` concurrency test above.
+    var db = try Db.open(allocator, path, .{ .sstableTargetBytes = 512 });
+    defer db.close();
+    try seedJoinConcurrencyTables(allocator, &db);
+    try db.flush();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    const readerThreads = 4;
+    const readerIters = 20;
+    const mutatorThreads = 2;
+    const mutatorIters = 15;
+    const matchedCount = 8;
+    const customerCount = 10;
+
+    const ReaderCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        ok: bool = false,
+    };
+    const readerWorker = struct {
+        fn run(ctx: *ReaderCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < readerIters) : (i += 1) {
+                const inner = client.tableJoin(ctx.allocator, .inner, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "") catch return;
+                defer protocol.freeJoinPairs(ctx.allocator, inner);
+                if (inner.len != matchedCount) return;
+                for (inner) |pair| {
+                    const left = pair.left orelse return;
+                    const right = pair.right orelse return;
+                    const pk = left.get(querymod.pkField) orelse return;
+                    const total = right.get("total") orelse return;
+                    if (total.int != pk.int * 10) return;
+                }
+
+                const left = client.tableJoin(ctx.allocator, .left, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "") catch return;
+                defer protocol.freeJoinPairs(ctx.allocator, left);
+                if (left.len != customerCount) return;
+
+                const right = client.tableJoin(ctx.allocator, .right, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "") catch return;
+                defer protocol.freeJoinPairs(ctx.allocator, right);
+                if (right.len != matchedCount + 2) return;
+
+                const full = client.tableJoin(ctx.allocator, .full, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "") catch return;
+                defer protocol.freeJoinPairs(ctx.allocator, full);
+                if (full.len != customerCount + 2) return;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    const MutatorCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        thread: usize,
+        ok: bool = false,
+    };
+    const mutatorWorker = struct {
+        fn run(ctx: *MutatorCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < mutatorIters) : (i += 1) {
+                var buf: [32]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "join-churn-{d}-{d}", .{ ctx.thread, i }) catch return;
+                client.set(key, "x") catch return;
+                client.flush() catch return;
+                client.compact() catch return;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    var readerContexts: [readerThreads]ReaderCtx = undefined;
+    var readerHandles: [readerThreads]std.Thread = undefined;
+    for (0..readerThreads) |i| {
+        readerContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress() };
+        readerHandles[i] = try std.Thread.spawn(.{}, readerWorker, .{&readerContexts[i]});
+    }
+    var mutatorContexts: [mutatorThreads]MutatorCtx = undefined;
+    var mutatorHandles: [mutatorThreads]std.Thread = undefined;
+    for (0..mutatorThreads) |i| {
+        mutatorContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress(), .thread = i };
+        mutatorHandles[i] = try std.Thread.spawn(.{}, mutatorWorker, .{&mutatorContexts[i]});
+    }
+
+    for (0..readerThreads) |i| readerHandles[i].join();
+    for (0..mutatorThreads) |i| mutatorHandles[i].join();
+    for (0..readerThreads) |i| try std.testing.expect(readerContexts[i].ok);
+    for (0..mutatorThreads) |i| try std.testing.expect(mutatorContexts[i].ok);
+
+    // Final sanity check on a fresh connection: all four join shapes are
+    // still exactly what they were before the server ever started - the
+    // concurrent churn wrote only unrelated `join-churn-*` keys and
+    // reshaped physical sstable layout, never touched `customers`/`orders`
+    // values.
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+    const finalInner = try client.tableJoin(allocator, .inner, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "");
+    defer protocol.freeJoinPairs(allocator, finalInner);
+    try std.testing.expectEqual(@as(usize, matchedCount), finalInner.len);
+    const finalFull = try client.tableJoin(allocator, .full, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "");
+    defer protocol.freeJoinPairs(allocator, finalFull);
+    try std.testing.expectEqual(@as(usize, customerCount + 2), finalFull.len);
+}
+
+test "server without enableAuth accepts any auth attempt and every op" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.authenticate("nobody", "wrong");
+    try client.set("k", "v");
+}
+
+test "server with auth enabled rejects unauthenticated requests, ping excepted" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readwrite, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.ping();
+    try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, client.get(allocator, "k"));
+    try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, client.set("k", "v"));
+    try std.testing.expectEqual(@as(u64, 2), server.unauthorizedTotal.get());
+}
+
+test "server rejects a bad password and accepts the correct one, then serves requests" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readwrite, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, client.authenticate("alice", "wrong"));
+    try client.authenticate("alice", "hunter2");
+
+    try client.set("k", "v");
+    const got = try client.get(allocator, "k");
+    defer if (got) |g| allocator.free(g);
+    try std.testing.expectEqualStrings("v", got.?);
+}
+
+test "server enforces readonly role: reads succeed, writes are forbidden" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "viewer", "pass", .readonly, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.authenticate("viewer", "pass");
+    const got = try client.get(allocator, "missing");
+    try std.testing.expect(got == null);
+    try std.testing.expectError(client_mod.ClientError.ServerForbidden, client.set("k", "v"));
+    try std.testing.expectError(client_mod.ClientError.ServerForbidden, client.delete("k"));
+    try std.testing.expectError(client_mod.ClientError.ServerForbidden, client.compact());
+    const txnEntries = [_]protocol.TxnOpEntry{
+        .{ .verb = .put, .table = "accounts", .pk = .{ .int = 1 } },
+    };
+    try std.testing.expectError(client_mod.ClientError.ServerForbidden, client.txnOp(&txnEntries));
+    try std.testing.expectEqual(@as(u64, 4), server.forbiddenTotal.get());
+}
+
+test "server without enableSessions returns no token from authenticate" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readwrite, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.authenticate("alice", "hunter2");
+    try std.testing.expect(client.sessionToken() == null);
+}
+
+test "a session token from one connection authenticates a brand new connection without a password" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readwrite, 16);
+
+    var sessions = sessionmod.SessionStore.init(allocator);
+    defer sessions.deinit();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    server.enableSessions(&sessions, 60 * std.time.ns_per_s);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+
+    var first = try client_mod.Client.connect(allocator, server.boundAddress());
+    try first.authenticate("alice", "hunter2");
+    const token = try allocator.dupe(u8, first.sessionToken().?);
+    defer allocator.free(token);
+    first.close();
+
+    // A fully independent second connection, never given the password.
+    var second = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer second.close();
+    try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, second.get(allocator, "k"));
+    try second.authenticateWithToken(token);
+    try second.set("k", "v");
+    const got = try second.get(allocator, "k");
+    defer if (got) |g| allocator.free(g);
+    try std.testing.expectEqualStrings("v", got.?);
+}
+
+test "auth_token is rejected as unauthorized when sessions are not enabled" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readwrite, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+    try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, client.authenticateWithToken("whatever"));
+}
+
+test "an unknown or garbage session token is rejected" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readwrite, 16);
+
+    var sessions = sessionmod.SessionStore.init(allocator);
+    defer sessions.deinit();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    server.enableSessions(&sessions, 60 * std.time.ns_per_s);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+    try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, client.authenticateWithToken("not-a-real-token"));
+}
+
+test "an expired session forces re-authentication even on the same open connection" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readwrite, 16);
+
+    var sessions = sessionmod.SessionStore.init(allocator);
+    defer sessions.deinit();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    server.enableSessions(&sessions, 500 * std.time.ns_per_ms);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.authenticate("alice", "hunter2");
+    try client.set("k", "v");
+
+    std.time.sleep(700 * std.time.ns_per_ms);
+    try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, client.get(allocator, "k"));
+    try std.testing.expectEqual(@as(u64, 1), server.sessionExpiredTotal.get());
+
+    // The very same connection re-authenticates and keeps working - the
+    // socket itself was never the thing that expired, only the session.
+    try client.authenticate("alice", "hunter2");
+    const got = try client.get(allocator, "k");
+    defer if (got) |g| allocator.free(g);
+    try std.testing.expectEqualStrings("v", got.?);
+}
+
+test "each connection authenticates independently under auth enforcement" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readwrite, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var clientA = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer clientA.close();
+    var clientB = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer clientB.close();
+
+    try clientA.authenticate("alice", "hunter2");
+    try clientA.set("shared", "1");
+
+    // clientB never authenticated - a separate socket does not inherit
+    // clientA's role even though it hits the exact same server/store.
+    try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, clientB.get(allocator, "shared"));
+}
+
+test "server without auth enabled allows user_admin to create and list users" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.adminCreateUser("alice", "hunter2", .readwrite, 16);
+    const users = try client.adminListUsers(allocator);
+    defer authmod.freeUserList(allocator, users);
+    try std.testing.expectEqual(@as(usize, 1), users.len);
+    try std.testing.expectEqualStrings("alice", users[0].username);
+    try std.testing.expectEqual(authmod.Role.readwrite, users[0].role);
+
+    // The account just created over the wire really works for real auth.
+    var second = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer second.close();
+    try second.authenticate("alice", "hunter2");
+}
+
+test "user_admin requires admin role once auth is enabled" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "root", "toor", .admin, 16);
+    try store.createUser(allocator, "viewer", "pass", .readonly, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+
+    var viewer = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer viewer.close();
+    try viewer.authenticate("viewer", "pass");
+    try std.testing.expectError(client_mod.ClientError.ServerForbidden, viewer.adminCreateUser("nobody", "x", .readonly, 16));
+
+    var admin = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer admin.close();
+    try admin.authenticate("root", "toor");
+    try admin.adminCreateUser("bob", "b-pass", .readwrite, 16);
+
+    const users = try admin.adminListUsers(allocator);
+    defer authmod.freeUserList(allocator, users);
+    try std.testing.expectEqual(@as(usize, 3), users.len);
+}
+
+test "user_admin set_password, set_role, and delete round trip over the wire, enforced by real auth" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "root", "toor", .admin, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var admin = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer admin.close();
+    try admin.authenticate("root", "toor");
+
+    try admin.adminCreateUser("alice", "old-pass", .readonly, 16);
+
+    // The freshly created account really authenticates against the live,
+    // enforced auth store - not just written to a table nobody checks.
+    var probe = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer probe.close();
+    try probe.authenticate("alice", "old-pass");
+
+    try admin.adminSetPassword("alice", "new-pass", 16);
+    var probe2 = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer probe2.close();
+    try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, probe2.authenticate("alice", "old-pass"));
+    try probe2.authenticate("alice", "new-pass");
+
+    try admin.adminSetRole("alice", .admin);
+    const users = try admin.adminListUsers(allocator);
+    defer authmod.freeUserList(allocator, users);
+    var sawAlice = false;
+    for (users) |u| {
+        if (std.mem.eql(u8, u.username, "alice")) {
+            try std.testing.expectEqual(authmod.Role.admin, u.role);
+            sawAlice = true;
+        }
+    }
+    try std.testing.expect(sawAlice);
+
+    try admin.adminDeleteUser("alice");
+    var probe3 = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer probe3.close();
+    try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, probe3.authenticate("alice", "new-pass"));
+}
+
+test "user_admin reports conflict on duplicate create and not-found on missing user" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.adminCreateUser("alice", "hunter2", .readonly, 16);
+    try std.testing.expectError(client_mod.ClientError.ServerConflict, client.adminCreateUser("alice", "other", .admin, 16));
+    try std.testing.expectError(client_mod.ClientError.ServerUserNotFound, client.adminSetPassword("ghost", "x", 16));
+    try std.testing.expectError(client_mod.ClientError.ServerUserNotFound, client.adminSetRole("ghost", .admin));
+    try std.testing.expectError(client_mod.ClientError.ServerUserNotFound, client.adminDeleteUser("ghost"));
+}
+
+test "server rejects a malformed user_admin frame with bad_request without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const stream = try std.net.tcpConnectToAddress(server.boundAddress());
+    defer stream.close();
+
+    try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.user_admin), "\x00");
+    var frame = try protocol.readFrame(allocator, stream.reader());
+    defer frame.deinit();
+    try std.testing.expectEqual(@intFromEnum(protocol.Status.bad_request), frame.tag);
+}
+
+test "server metrics register into an external Prometheus registry" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableRateLimit(1, 1000);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+    try client.ping();
+    client.ping() catch {};
+
+    var reg = metrics.Registry.init(allocator);
+    defer reg.deinit();
+    try server.registerMetrics(&reg);
+
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    try reg.exportText(allocator, buf.writer());
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "cobalt_server_requests_total 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "cobalt_server_rate_limited_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "cobalt_server_conn_rate_limited_total 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "cobalt_server_unauthorized_total 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "cobalt_server_forbidden_total 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "cobalt_server_session_expired_total 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "cobalt_server_sessions_swept_total 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "cobalt_server_ttl_swept_total 0\n") != null);
+}
+
+test "client.metricsText fetches the server's own counters and db stats over the wire in one payload" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.set("a", "1");
+    try client.set("b", "2");
+    try client.ping();
+
+    const text = try client.metricsText(allocator);
+    defer allocator.free(text);
+
+    // Server's own request counter: 2 sets + 1 ping + this very metrics
+    // request itself, all counted in `requestsTotal` before dispatch even
+    // looks at the opcode.
+    try std.testing.expect(std.mem.indexOf(u8, text, "cobalt_server_requests_total 4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cobalt_server_rate_limited_total 0\n") != null);
+    // Db stats rendered by the same `formatDbStats` `stats --prom` uses
+    // locally, appended after the server's own counters in one response.
+    try std.testing.expect(std.mem.indexOf(u8, text, "cobalt_memtable_entries 2\n") != null);
+}
+
+test "server gates the metrics opcode behind readonly role like every other read op" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "reader", "pw", .readonly, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var unauthed = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer unauthed.close();
+    try std.testing.expectError(error.ServerUnauthorized, unauthed.metricsText(allocator));
+
+    var reader = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer reader.close();
+    try reader.authenticate("reader", "pw");
+    const text = try reader.metricsText(allocator);
+    allocator.free(text);
+}
+
+test "enableSessionSweep periodically drops expired sessions nobody ever presents again" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readwrite, 16);
+
+    var sessions = sessionmod.SessionStore.init(allocator);
+    defer sessions.deinit();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    // A short-lived session that nobody will ever present again: without
+    // the sweeper, this sits in `sessions` forever since `validate()` only
+    // cleans up a token someone actually tries to use.
+    server.enableSessions(&sessions, 100 * std.time.ns_per_ms);
+    server.enableSessionSweep(50 * std.time.ns_per_ms);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    try client.authenticate("alice", "hunter2");
+    client.close();
+
+    try std.testing.expectEqual(@as(usize, 1), sessions.count());
+
+    // Long enough for the session to expire (100ms) and for at least one
+    // sweep tick (every 50ms) to have run past that point.
+    std.time.sleep(400 * std.time.ns_per_ms);
+
+    try std.testing.expectEqual(@as(usize, 0), sessions.count());
+    try std.testing.expect(server.sessionsSweptTotal.get() >= 1);
+}
+
+test "a server with sessions enabled but no sweep interval never sweeps" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "alice", "hunter2", .readwrite, 16);
+
+    var sessions = sessionmod.SessionStore.init(allocator);
+    defer sessions.deinit();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    server.enableSessions(&sessions, 50 * std.time.ns_per_ms);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    try client.authenticate("alice", "hunter2");
+    client.close();
+
+    std.time.sleep(200 * std.time.ns_per_ms);
+
+    // The session expired a while ago, but with no sweeper running it is
+    // still sitting in the store's map until something calls `validate` on
+    // it - `count()` still sees it, unlike the sweeper test above.
+    try std.testing.expectEqual(@as(usize, 1), sessions.count());
+    try std.testing.expectEqual(@as(u64, 0), server.sessionsSweptTotal.get());
+}
+
+test "ttl_op over the wire: expire, query, persist, and sweep round trip against a real server" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    // A key with no ttl at all reads back .noExpiry, not .noKey.
+    try client.set("plain", "v");
+    try std.testing.expectEqual(ttlmod.TtlResult.noExpiry, try client.ttlQuery("plain"));
+
+    // expire on a key that does not exist is a real, distinct failure.
+    try std.testing.expectError(client_mod.ClientError.ServerKeyNotFound, client.ttlExpire("ghost", 60));
+
+    // expire on an existing key sets a marker the query action can see.
+    // Real wall-clock time (both `expire` and `query` stamp their own
+    // `std.time.nanoTimestamp()` server-side) can shave a second off by
+    // the time the second round trip lands, so accept 59 or 60 rather
+    // than pinning an exact value.
+    try client.ttlExpire("plain", 60);
+    const withTtl = try client.ttlQuery("plain");
+    try std.testing.expect(withTtl.seconds == 59 or withTtl.seconds == 60);
+
+    // persist removes the marker again, back to .noExpiry.
+    try client.ttlPersist("plain");
+    try std.testing.expectEqual(ttlmod.TtlResult.noExpiry, try client.ttlQuery("plain"));
+
+    // sweep over a key that is already due for expiry reaps exactly it,
+    // and a real subsequent get proves the delete was real, not marker-only.
+    try client.set("doomed", "x");
+    try client.ttlExpire("doomed", 0);
+    std.time.sleep(5 * std.time.ns_per_ms);
+    const reaped = try client.ttlSweep();
+    try std.testing.expectEqual(@as(u64, 1), reaped);
+    try std.testing.expectEqual(@as(?[]u8, null), try client.get(allocator, "doomed"));
+
+    // querying a key that was never there at all (not merely expired) is
+    // .noKey, distinct from .noExpiry.
+    try std.testing.expectEqual(ttlmod.TtlResult.noKey, try client.ttlQuery("never-existed"));
+}
+
+test "ttl_op gates query as readonly and expire as readwrite" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "reader", "pw", .readonly, 16);
+    try store.createUser(allocator, "writer", "pw", .readwrite, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+
+    var writer = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer writer.close();
+    try writer.authenticate("writer", "pw");
+    try writer.set("k", "v");
+
+    var reader = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer reader.close();
+    try reader.authenticate("reader", "pw");
+
+    // query is readonly: a readonly connection can run it.
+    try std.testing.expectEqual(ttlmod.TtlResult.noExpiry, try reader.ttlQuery("k"));
+
+    // expire/persist/sweep all mutate: forbidden for a readonly connection.
+    try std.testing.expectError(client_mod.ClientError.ServerForbidden, reader.ttlExpire("k", 30));
+    try std.testing.expectError(client_mod.ClientError.ServerForbidden, reader.ttlPersist("k"));
+    try std.testing.expectError(client_mod.ClientError.ServerForbidden, reader.ttlSweep());
+
+    // The readwrite connection can do all four.
+    try writer.ttlExpire("k", 30);
+    try writer.ttlPersist("k");
+    _ = try writer.ttlSweep();
+}
+
+test "server rejects a malformed ttl_op frame with bad_request without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const stream = try std.net.tcpConnectToAddress(server.boundAddress());
+    defer stream.close();
+
+    try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.ttl_op), "\x09");
+    var frame = try protocol.readFrame(allocator, stream.reader());
+    defer frame.deinit();
+    try std.testing.expectEqual(@intFromEnum(protocol.Status.bad_request), frame.tag);
+}
+
+test "enableTtlSweep periodically reaps due keys nobody ever reads again" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableTtlSweep(50 * std.time.ns_per_ms);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.set("a", "1");
+    try client.ttlExpire("a", 0);
+
+    // Long enough for the key to be due and for at least one sweep tick
+    // (every 50ms) to run past that point - nobody ever reads "a" again,
+    // so without the background sweeper it would sit there forever (only
+    // `ttl.getLive`'s lazy path or an explicit sweep would ever catch it).
+    std.time.sleep(300 * std.time.ns_per_ms);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try client.get(allocator, "a"));
+    try std.testing.expect(server.ttlSweptTotal.get() >= 1);
+}
+
+test "a server with no ttl sweep interval never runs the ttl sweeper" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
