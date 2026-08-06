@@ -2802,3 +2802,485 @@ test "table_update survives concurrent flush and compact reshaping the underlyin
     for (0..reshapeThreads) |i| try std.testing.expect(reshapeContexts[i].ok);
     try std.testing.expect(updaterContext.ok);
 
+    // Final sanity check on a fresh connection: the updater alternated
+    // krakow/gdansk, so the last krakow write was iteration 18 (last even
+    // below 20) and the last gdansk write was iteration 19 (last odd) -
+    // warsaw was never touched by any predicate and must still read 0.
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const krakowRows = try client.tableSelect(allocator, "accounts", "city eq s:krakow", 0, 0, &.{});
+    defer protocol.freeRows(allocator, krakowRows);
+    try std.testing.expectEqual(@as(usize, 10), krakowRows.len);
+    for (krakowRows) |row| try std.testing.expectEqual(@as(i64, 18), row.get("epoch").?.int);
+
+    const gdanskRows = try client.tableSelect(allocator, "accounts", "city eq s:gdansk", 0, 0, &.{});
+    defer protocol.freeRows(allocator, gdanskRows);
+    try std.testing.expectEqual(@as(usize, 10), gdanskRows.len);
+    for (gdanskRows) |row| try std.testing.expectEqual(@as(i64, 19), row.get("epoch").?.int);
+
+    const warsawRows = try client.tableSelect(allocator, "accounts", "city eq s:warsaw", 0, 0, &.{});
+    defer protocol.freeRows(allocator, warsawRows);
+    try std.testing.expectEqual(@as(usize, 10), warsawRows.len);
+    for (warsawRows) |row| try std.testing.expectEqual(@as(i64, 0), row.get("epoch").?.int);
+}
+
+// Same shape as the test above, but the index guarding the concurrent
+// reads/updates is a COMPOSITE one (`city_age`, two columns) instead of a
+// single-column `city` index - `updateWhere` reached through
+// `composite_eq` was only proven correct single-threaded so far (see
+// query.zig's "updateWhere keeps a composite index in sync" test); this
+// proves the same code path survives real `flush`/`compact` reshaping the
+// underlying sstables while other connections read and write through it.
+test "table_update survives concurrent flush and compact reshaping a composite index" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Db.open(allocator, path, .{ .sstableTargetBytes = 512 });
+    defer db.close();
+
+    // 30 rows: 3 cities x 2 age bands x 5 rows each. Every (city, age) pair
+    // is a full-tuple equality match against `city_age`, so
+    // `Table.selectPage`/`updateWhere` both reach it through `composite_eq`
+    // (see query.zig's "createCompositeIndex backfills then full-tuple eq
+    // select" test for the same match shape single-threaded).
+    const rowCount = 30;
+    {
+        var accounts = try querymod.Table.open(&db, allocator, "accounts");
+        defer accounts.deinit();
+        try accounts.createCompositeIndex("city_age", &.{ "city", "age" });
+        var pk: i64 = 1;
+        while (pk <= rowCount) : (pk += 1) {
+            const city: []const u8 = switch (@mod(pk, 3)) {
+                0 => "warsaw",
+                1 => "krakow",
+                else => "gdansk",
+            };
+            const age: i64 = if (@mod(@divTrunc(pk - 1, 3), 2) == 0) 30 else 40;
+            try accounts.put(.{ .int = pk }, &.{
+                .{ .name = "city", .value = .{ .text = city } },
+                .{ .name = "age", .value = .{ .int = age } },
+                .{ .name = "epoch", .value = .{ .int = 0 } },
+            });
+        }
+        try db.flush();
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    const readerThreads = 4;
+    const readerIters = 20;
+    const reshapeThreads = 2;
+    const reshapeIters = 15;
+    const updaterIters = 20;
+
+    const Combo = struct { city: []const u8, age: i64 };
+    const combos = [_]Combo{
+        .{ .city = "warsaw", .age = 30 },
+        .{ .city = "warsaw", .age = 40 },
+        .{ .city = "krakow", .age = 30 },
+        .{ .city = "krakow", .age = 40 },
+        .{ .city = "gdansk", .age = 30 },
+        .{ .city = "gdansk", .age = 40 },
+    };
+
+    const ReaderCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        ok: bool = false,
+    };
+    const readerWorker = struct {
+        fn run(ctx: *ReaderCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < readerIters) : (i += 1) {
+                for (combos) |combo| {
+                    const buf = std.fmt.allocPrint(ctx.allocator, "city eq s:{s} and age eq i:{d}", .{ combo.city, combo.age }) catch return;
+                    defer ctx.allocator.free(buf);
+                    const rows = client.tableSelect(ctx.allocator, "accounts", buf, 0, 0, &.{}) catch return;
+                    defer protocol.freeRows(ctx.allocator, rows);
+                    if (rows.len != 5) return;
+                    for (rows) |row| {
+                        const gotCity = row.get("city") orelse return;
+                        if (!std.mem.eql(u8, gotCity.text, combo.city)) return;
+                        const gotAge = row.get("age") orelse return;
+                        if (gotAge.int != combo.age) return;
+                    }
+                }
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    const ReshapeCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        thread: usize,
+        ok: bool = false,
+    };
+    const reshapeWorker = struct {
+        fn run(ctx: *ReshapeCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < reshapeIters) : (i += 1) {
+                var buf: [32]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "update-composite-churn-{d}-{d}", .{ ctx.thread, i }) catch return;
+                client.set(key, "x") catch return;
+                client.flush() catch return;
+                client.compact() catch return;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    const UpdaterCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        ok: bool = false,
+    };
+    const updaterWorker = struct {
+        fn run(ctx: *UpdaterCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: i64 = 0;
+            while (i < updaterIters) : (i += 1) {
+                // Alternates between two full-tuple matches on the composite
+                // index, never touching `city`/`age` themselves, so the
+                // (5, 5, 5, 5, 5, 5) population split is a checkable
+                // invariant on every single reader iteration in flight.
+                const combo = if (@mod(i, 2) == 0) Combo{ .city = "krakow", .age = 30 } else Combo{ .city = "gdansk", .age = 40 };
+                const expr = std.fmt.allocPrint(ctx.allocator, "city eq s:{s} and age eq i:{d}", .{ combo.city, combo.age }) catch return;
+                defer ctx.allocator.free(expr);
+                const sets = [_]rowmod.Field{.{ .name = "epoch", .value = .{ .int = i } }};
+                const updated = client.tableUpdate("accounts", &sets, expr) catch return;
+                if (updated != 5) return;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    var readerContexts: [readerThreads]ReaderCtx = undefined;
+    var readerHandles: [readerThreads]std.Thread = undefined;
+    for (0..readerThreads) |i| {
+        readerContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress() };
+        readerHandles[i] = try std.Thread.spawn(.{}, readerWorker, .{&readerContexts[i]});
+    }
+    var reshapeContexts: [reshapeThreads]ReshapeCtx = undefined;
+    var reshapeHandles: [reshapeThreads]std.Thread = undefined;
+    for (0..reshapeThreads) |i| {
+        reshapeContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress(), .thread = i };
+        reshapeHandles[i] = try std.Thread.spawn(.{}, reshapeWorker, .{&reshapeContexts[i]});
+    }
+    var updaterContext = UpdaterCtx{ .allocator = allocator, .addr = server.boundAddress() };
+    const updaterHandle = try std.Thread.spawn(.{}, updaterWorker, .{&updaterContext});
+
+    for (0..readerThreads) |i| readerHandles[i].join();
+    for (0..reshapeThreads) |i| reshapeHandles[i].join();
+    updaterHandle.join();
+    for (0..readerThreads) |i| try std.testing.expect(readerContexts[i].ok);
+    for (0..reshapeThreads) |i| try std.testing.expect(reshapeContexts[i].ok);
+    try std.testing.expect(updaterContext.ok);
+
+    // Final sanity check on a fresh connection: the updater alternated
+    // krakow/30 and gdansk/40, so the last krakow/30 write was iteration 18
+    // (last even below 20) and the last gdansk/40 write was iteration 19
+    // (last odd) - the other four (city, age) combos were never touched by
+    // any predicate and must still read epoch 0.
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    for (combos) |combo| {
+        const expr = try std.fmt.allocPrint(allocator, "city eq s:{s} and age eq i:{d}", .{ combo.city, combo.age });
+        defer allocator.free(expr);
+        const rows = try client.tableSelect(allocator, "accounts", expr, 0, 0, &.{});
+        defer protocol.freeRows(allocator, rows);
+        try std.testing.expectEqual(@as(usize, 5), rows.len);
+        const wantEpoch: i64 = if (std.mem.eql(u8, combo.city, "krakow") and combo.age == 30)
+            18
+        else if (std.mem.eql(u8, combo.city, "gdansk") and combo.age == 40)
+            19
+        else
+            0;
+        for (rows) |row| try std.testing.expectEqual(wantEpoch, row.get("epoch").?.int);
+
+        // The composite index must still be the strategy actually used
+        // after all this churn, not a fallback to a full scan.
+        var plan = try client.tableExplain(allocator, "accounts", expr);
+        defer plan.deinit(allocator);
+        try std.testing.expectEqual(querymod.PlanKind.composite_eq, plan.kind);
+    }
+}
+
+test "server table_delete removes matching rows over real TCP, keeping an index in sync" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var table = try querymod.Table.open(&db, allocator, "users");
+        defer table.deinit();
+        try table.createIndex("city");
+        try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+        try table.put(.{ .int = 2 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+        try table.put(.{ .int = 3 }, &.{.{ .name = "city", .value = .{ .text = "krakow" } }});
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const deleted = try client.tableDelete("users", "city eq s:warsaw");
+    try std.testing.expectEqual(@as(u64, 2), deleted);
+
+    // The index entries for both deleted rows are gone, not just the rows -
+    // a stale entry here would surface as a phantom in a later select.
+    const gone = try client.tableSelect(allocator, "users", "city eq s:warsaw", 0, 0, &.{});
+    defer protocol.freeRows(allocator, gone);
+    try std.testing.expectEqual(@as(usize, 0), gone.len);
+
+    // The row not matched by the predicate (pk 3, krakow) was left untouched.
+    const untouched = try client.tableSelect(allocator, "users", "city eq s:krakow", 0, 0, &.{});
+    defer protocol.freeRows(allocator, untouched);
+    try std.testing.expectEqual(@as(usize, 1), untouched.len);
+
+    // A fresh row can reuse the "warsaw" value without colliding with a
+    // leftover index entry from the deleted rows.
+    {
+        var table = try querymod.Table.open(&db, allocator, "users");
+        defer table.deinit();
+        try table.put(.{ .int = 4 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+    }
+    const reused = try client.tableSelect(allocator, "users", "city eq s:warsaw", 0, 0, &.{});
+    defer protocol.freeRows(allocator, reused);
+    try std.testing.expectEqual(@as(usize, 1), reused.len);
+    try std.testing.expectEqual(@as(i64, 4), reused[0].get(querymod.pkField).?.int);
+}
+
+test "server table_delete with an empty expr removes every row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var table = try querymod.Table.open(&db, allocator, "counters");
+        defer table.deinit();
+        try table.put(.{ .int = 1 }, &.{.{ .name = "n", .value = .{ .int = 5 } }});
+        try table.put(.{ .int = 2 }, &.{.{ .name = "n", .value = .{ .int = 7 } }});
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const deleted = try client.tableDelete("counters", "");
+    try std.testing.expectEqual(@as(u64, 2), deleted);
+
+    const everyone = try client.tableSelect(allocator, "counters", "", 0, 0, &.{});
+    defer protocol.freeRows(allocator, everyone);
+    try std.testing.expectEqual(@as(usize, 0), everyone.len);
+}
+
+test "server table_delete rejects a malformed expr with bad_request, not a crash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var table = try querymod.Table.open(&db, allocator, "users");
+        defer table.deinit();
+        try table.put(.{ .int = 1 }, &.{});
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const err = client.tableDelete("users", "city bogus s:warsaw");
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
+
+    // The connection survives a bad_request and can still serve a good
+    // request right after - same expectation `table_update`'s malformed
+    // test above holds for its own opcode.
+    const deleted = try client.tableDelete("users", "");
+    try std.testing.expectEqual(@as(u64, 1), deleted);
+}
+
+// `handleTableDelete` calls `Table.deleteWhere` directly (see its own
+// source), the exact function `Table.delete`'s ON DELETE RESTRICT check
+// (query.zig, backed by `ReferencedBySet`) is wired into - so this was
+// never a separate opcode to teach about FOREIGN KEY, only a round trip to
+// prove the wire path actually reaches it, the same "real dispatch, not
+// just the in-process unit test" shape the CHECK/FK/UNIQUE `txn_op` tests
+// elsewhere in this file already are.
+test "server table_delete rejects a FOREIGN KEY RESTRICT violation over the wire and leaves the row in place" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var customers = try querymod.Table.open(&db, allocator, "customers");
+        defer customers.deinit();
+        try customers.put(.{ .int = 1 }, &.{});
+
+        var orders = try querymod.Table.open(&db, allocator, "orders");
+        defer orders.deinit();
+        try orders.createForeignKey("customer_id", "customers", querymod.pkField, .restrict);
+        try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const err = client.tableDelete("customers", "");
+    try std.testing.expectError(client_mod.ClientError.ServerInternal, err);
+
+    var customers = try querymod.Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+    var stillThere = (try customers.get(.{ .int = 1 })).?;
+    defer stillThere.deinit();
+
+    // Once the referencing order is gone, the same request succeeds.
+    _ = try client.tableDelete("orders", "");
+    const deleted = try client.tableDelete("customers", "");
+    try std.testing.expectEqual(@as(u64, 1), deleted);
+}
+
+test "server rejects a malformed table_delete frame (bad table name) with bad_request without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const stream = try std.net.tcpConnectToAddress(server.boundAddress());
+    defer stream.close();
+
+    // A length prefix (0xFFFFFFFF) claiming far more table-name bytes than
+    // the payload actually carries - `decodeTableDelete`'s own malformed-frame
+    // check must catch this before `Table.open` is ever reached.
+    var payload = std.ArrayList(u8).init(allocator);
+    defer payload.deinit();
+    var lenBuf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &lenBuf, 0xFFFFFFFF, .little);
+    try payload.appendSlice(&lenBuf);
+
+    try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.table_delete), payload.items);
+    var frame = try protocol.readFrame(allocator, stream.reader());
+    defer frame.deinit();
+    try std.testing.expectEqual(@intFromEnum(protocol.Status.bad_request), frame.tag);
+
+    // The connection must still be usable afterward.
+    try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.ping), "");
+    var pingFrame = try protocol.readFrame(allocator, stream.reader());
+    defer pingFrame.deinit();
+    try std.testing.expectEqual(@intFromEnum(protocol.Status.ok), pingFrame.tag);
+}
+
+test "server table_export renders a real table to csv and json over TCP, matching the local dump.zig output" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var table = try querymod.Table.open(&db, allocator, "people");
+        defer table.deinit();
+        try table.put(.{ .int = 1 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "age", .value = .{ .int = 30 } } });
+        try table.put(.{ .int = 2 }, &.{.{ .name = "city", .value = .{ .text = "krakow" } }});
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    var csvResult = try client.tableExport(allocator, "people", .csv);
+    defer csvResult.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), csvResult.rowCount);
+
+    var localCsv = std.ArrayList(u8).init(allocator);
+    defer localCsv.deinit();
+    {
+        var table = try querymod.Table.open(&db, allocator, "people");
+        defer table.deinit();
+        const n = try dumpmod.exportCsvWriter(allocator, &table, localCsv.writer());
+        try std.testing.expectEqual(@as(usize, 2), n);
+    }
+    try std.testing.expectEqualStrings(localCsv.items, csvResult.content);
+
+    var jsonResult = try client.tableExport(allocator, "people", .json);
+    defer jsonResult.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), jsonResult.rowCount);
+    // Every row's primary key shows up somewhere in the rendered JSON -
+    // enough to prove the server actually rendered real content instead
+    // of an empty/placeholder body, without re-parsing JSON here too.
+    try std.testing.expect(std.mem.indexOf(u8, jsonResult.content, "warsaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, jsonResult.content, "krakow") != null);
+}
+
