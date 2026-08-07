@@ -8031,3 +8031,115 @@ test "server unsubscribe from every remaining channel ends the subscription like
     const path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(path);
 
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var sub = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer sub.close();
+    const subId = try sub.subscribe(&.{"ch"});
+
+    var ctrl = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer ctrl.close();
+    try std.testing.expectEqual(@as(u32, 1), try ctrl.unsubscribe(subId, &.{"ch"}));
+
+    // The push loop must notice the close exactly like a real disconnect -
+    // `nextMessage` returns `null`, never blocks forever or errors.
+    try std.testing.expect((try sub.nextMessage(allocator)) == null);
+
+    const startedAt = std.time.nanoTimestamp();
+    while (server.pubsub.channelSubscriberCount("ch") != 0) {
+        if (std.time.nanoTimestamp() - startedAt > 2 * std.time.ns_per_s) break;
+        std.time.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.pubsub.channelSubscriberCount("ch"));
+}
+
+test "server rejects unsubscribe with an unknown subscriber id as bad_request" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, client.unsubscribe(999999, &.{"ch"}));
+    // A rejected unsubscribe must not leave the connection in some
+    // half-dispatched state - `ping` still works right after.
+    try client.ping();
+}
+
+test "server rejects an empty unsubscribe channel list as bad_request" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var sub = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer sub.close();
+    const subId = try sub.subscribe(&.{"ch"});
+
+    var ctrl = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer ctrl.close();
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, ctrl.unsubscribe(subId, &.{}));
+}
+
+test "server with auth enabled requires authentication before unsubscribe, readonly role suffices" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "viewer", "hunter2", .readonly, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var sub = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer sub.close();
+    try sub.authenticate("viewer", "hunter2");
+    const subId = try sub.subscribe(&.{"ch"});
+
+    var anon = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer anon.close();
+    try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, anon.unsubscribe(subId, &.{"ch"}));
+
+    var ctrl = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer ctrl.close();
+    try ctrl.authenticate("viewer", "hunter2");
+    try std.testing.expectEqual(@as(u32, 1), try ctrl.unsubscribe(subId, &.{"ch"}));
+}
