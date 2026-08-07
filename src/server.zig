@@ -6282,3 +6282,1594 @@ test "a server with no ttl sweep interval never runs the ttl sweeper" {
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
 
+    try client.set("a", "1");
+    try client.ttlExpire("a", 0);
+    std.time.sleep(100 * std.time.ns_per_ms);
+
+    // Nothing swept it in the background, but the key IS logically due -
+    // client.get goes straight through db.get (not the lazy ttl path), so
+    // the underlying value is still physically present until something
+    // sweeps it.
+    try std.testing.expectEqual(@as(u64, 0), server.ttlSweptTotal.get());
+    const v = (try client.get(allocator, "a")).?;
+    allocator.free(v);
+}
+
+test "coll_ttl_op over the wire: expire, query, persist, and sweep round trip against a real server" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    // A hash with no ttl at all reads back .noExpiry, not .noKey - the
+    // collection itself has to actually exist server-side first, created
+    // directly through `db` here for brevity (the `coll_op` opcode below
+    // is this same test file's own coverage for reaching it remotely).
+    _ = try collmod.Hash.set(&db, allocator, "profile", "name", "ada");
+    try std.testing.expectEqual(ttlmod.TtlResult.noExpiry, try client.collTtlQuery(.hash, "profile"));
+
+    // expire on a collection that does not exist is a real, distinct failure.
+    try std.testing.expectError(client_mod.ClientError.ServerCollectionNotFound, client.collTtlExpire(.hash, "ghost", 60));
+
+    // expire on an existing collection sets a marker the query action can
+    // see. Real wall-clock time can shave a second off by the time the
+    // second round trip lands, so accept 59 or 60 rather than an exact value.
+    try client.collTtlExpire(.hash, "profile", 60);
+    const withTtl = try client.collTtlQuery(.hash, "profile");
+    try std.testing.expect(withTtl.seconds == 59 or withTtl.seconds == 60);
+
+    // persist removes the marker again, back to .noExpiry.
+    try client.collTtlPersist(.hash, "profile");
+    try std.testing.expectEqual(ttlmod.TtlResult.noExpiry, try client.collTtlQuery(.hash, "profile"));
+
+    // sweep over a collection that is already due for expiry reaps exactly
+    // it, and the whole hash (not just one field) is really gone afterwards.
+    _ = try collmod.Hash.set(&db, allocator, "doomed", "k", "v");
+    try client.collTtlExpire(.hash, "doomed", 0);
+    std.time.sleep(5 * std.time.ns_per_ms);
+    const reaped = try client.collTtlSweep();
+    try std.testing.expectEqual(@as(u64, 1), reaped);
+    try std.testing.expect(!try collmod.collectionExists(&db, allocator, .hash, "doomed"));
+
+    // querying a collection that was never there at all (not merely
+    // expired) is .noKey, distinct from .noExpiry.
+    try std.testing.expectEqual(ttlmod.TtlResult.noKey, try client.collTtlQuery(.set, "never-existed"));
+}
+
+test "coll_ttl_op gates query as readonly and expire as readwrite" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    _ = try collmod.Hash.set(&db, allocator, "k", "f", "v");
+
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "reader", "pw", .readonly, 16);
+    try store.createUser(allocator, "writer", "pw", .readwrite, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+
+    var writer = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer writer.close();
+    try writer.authenticate("writer", "pw");
+
+    var reader = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer reader.close();
+    try reader.authenticate("reader", "pw");
+
+    // query is readonly: a readonly connection can run it.
+    try std.testing.expectEqual(ttlmod.TtlResult.noExpiry, try reader.collTtlQuery(.hash, "k"));
+
+    // expire/persist/sweep all mutate: forbidden for a readonly connection.
+    try std.testing.expectError(client_mod.ClientError.ServerForbidden, reader.collTtlExpire(.hash, "k", 30));
+    try std.testing.expectError(client_mod.ClientError.ServerForbidden, reader.collTtlPersist(.hash, "k"));
+    try std.testing.expectError(client_mod.ClientError.ServerForbidden, reader.collTtlSweep());
+
+    // The readwrite connection can do all four.
+    try writer.collTtlExpire(.hash, "k", 30);
+    try writer.collTtlPersist(.hash, "k");
+    _ = try writer.collTtlSweep();
+}
+
+test "server rejects a malformed coll_ttl_op frame with bad_request without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const stream = try std.net.tcpConnectToAddress(server.boundAddress());
+    defer stream.close();
+
+    // A single byte is enough for an action but not the kind byte that
+    // must follow it, so `decodeCollTtlOp` fails on the second `takeByte`.
+    try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.coll_ttl_op), "\x02");
+    var frame = try protocol.readFrame(allocator, stream.reader());
+    defer frame.deinit();
+    try std.testing.expectEqual(@intFromEnum(protocol.Status.bad_request), frame.tag);
+}
+
+test "enableCollTtlSweep periodically reaps due collections nobody ever touches again" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableCollTtlSweep(50 * std.time.ns_per_ms);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    _ = try collmod.ZSet.add(&db, allocator, "board", "alice", 10);
+    try client.collTtlExpire(.zset, "board", 0);
+
+    // Long enough for the collection to be due and for at least one sweep
+    // tick (every 50ms) to run past that point - nobody ever reads "board"
+    // again, so without the background sweeper it would sit there forever.
+    std.time.sleep(300 * std.time.ns_per_ms);
+
+    try std.testing.expect(!try collmod.collectionExists(&db, allocator, .zset, "board"));
+    try std.testing.expect(server.collTtlSweptTotal.get() >= 1);
+}
+
+test "a server with no coll ttl sweep interval never runs the coll ttl sweeper" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    _ = try collmod.Set.add(&db, allocator, "tags", "zig");
+    try client.collTtlExpire(.set, "tags", 0);
+    std.time.sleep(100 * std.time.ns_per_ms);
+
+    // Nothing swept it in the background, but the collection IS logically
+    // due - it is still physically present until something sweeps it.
+    try std.testing.expectEqual(@as(u64, 0), server.collTtlSweptTotal.get());
+    try std.testing.expect(try collmod.collectionExists(&db, allocator, .set, "tags"));
+}
+
+test "a server with the flat ttl sweeper and the coll ttl sweeper enabled at once runs both independently" {
+    // Every prior session's notes on both sweepers flagged the same gap:
+    // `enableTtlSweep` and `enableCollTtlSweep` start two structurally
+    // independent background threads on the same `Server` (separate
+    // fields, separate `std.Thread.spawn` calls, separate join calls in
+    // `stop()`), but nothing had ever exercised them running at the same
+    // time. This proves three things at once: a flat key due for
+    // expiry and a whole collection due for expiry both get reaped by
+    // their OWN sweeper without either one starving or double-counting
+    // the other's target, and `stop()` cleanly joins both sweeper threads
+    // (the exact bug class caught and fixed in session #28, where a
+    // missing join on one sweeper thread left it alive past `db.close()`
+    // and segfaulted the next test).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableTtlSweep(50 * std.time.ns_per_ms);
+    server.enableCollTtlSweep(50 * std.time.ns_per_ms);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.set("flatkey", "1");
+    try client.ttlExpire("flatkey", 0);
+    _ = try collmod.Hash.set(&db, allocator, "session:1", "user", "ada");
+    try client.collTtlExpire(.hash, "session:1", 0);
+
+    // Poll rather than sleep a single fixed window: two background
+    // sweeper threads plus the accept/connection threads contending for
+    // `self.mutex` on a loaded host can occasionally push either sweeper's
+    // tick past a fixed 300ms, which is not a correctness bug in the
+    // sweeper - it is exactly the kind of host-load flakiness this
+    // project's own frostbyte sessions document repeatedly. Waiting up to
+    // 3s in 50ms increments keeps the assertion meaningful (still fails
+    // for real if a sweeper never runs) without being a coin flip on a
+    // busy machine.
+    var waited: u64 = 0;
+    while (waited < 3000 and (server.ttlSweptTotal.get() == 0 or server.collTtlSweptTotal.get() == 0)) {
+        std.time.sleep(50 * std.time.ns_per_ms);
+        waited += 50;
+    }
+
+    try std.testing.expectEqual(@as(?[]u8, null), try client.get(allocator, "flatkey"));
+    try std.testing.expect(!try collmod.collectionExists(&db, allocator, .hash, "session:1"));
+    try std.testing.expect(server.ttlSweptTotal.get() >= 1);
+    try std.testing.expect(server.collTtlSweptTotal.get() >= 1);
+
+    // Neither sweeper's counter absorbed the other's reap: exactly one
+    // flat key was due and exactly one collection was due, so each
+    // counter reads exactly 1, not a shared/blended total.
+    try std.testing.expectEqual(@as(u64, 1), server.ttlSweptTotal.get());
+    try std.testing.expectEqual(@as(u64, 1), server.collTtlSweptTotal.get());
+}
+
+test "coll_op over the wire exercises all five collection kinds against a real server" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    // Counter: get on a name nobody ever touched defaults to 0, set
+    // pins an exact value, incrby accumulates - the same three-step
+    // shape `collections.test.counter incrBy accumulates` already
+    // covers locally, now round-tripped over the wire.
+    {
+        var got = try client.collOp(allocator, .counter_get, "visits", &.{});
+        defer got.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 0), got.int);
+
+        var setReply = try client.collOp(allocator, .counter_set, "visits", &[_][]const u8{"10"});
+        defer setReply.deinit(allocator);
+        try std.testing.expect(setReply == .ok);
+
+        var incrReply = try client.collOp(allocator, .counter_incrby, "visits", &[_][]const u8{"5"});
+        defer incrReply.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 15), incrReply.int);
+    }
+
+    // Hash: set reports created vs updated as 1/0, get returns the
+    // value or nil, del removes a field, len/getall reflect what remains.
+    {
+        var created = try client.collOp(allocator, .hash_set, "profile", &[_][]const u8{ "name", "ada" });
+        defer created.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 1), created.int);
+
+        var updated = try client.collOp(allocator, .hash_set, "profile", &[_][]const u8{ "name", "grace" });
+        defer updated.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 0), updated.int);
+
+        _ = try client.collOp(allocator, .hash_set, "profile", &[_][]const u8{ "age", "36" });
+
+        var got = try client.collOp(allocator, .hash_get, "profile", &[_][]const u8{"name"});
+        defer got.deinit(allocator);
+        try std.testing.expectEqualStrings("grace", got.bytes);
+
+        var missing = try client.collOp(allocator, .hash_get, "profile", &[_][]const u8{"ghost"});
+        defer missing.deinit(allocator);
+        try std.testing.expect(missing == .nil);
+
+        var lenReply = try client.collOp(allocator, .hash_len, "profile", &.{});
+        defer lenReply.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 2), lenReply.int);
+
+        var delReply = try client.collOp(allocator, .hash_del, "profile", &[_][]const u8{"age"});
+        defer delReply.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 1), delReply.int);
+
+        var all = try client.collOp(allocator, .hash_getall, "profile", &.{});
+        defer all.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), all.pairList.len);
+        try std.testing.expectEqualStrings("name", all.pairList[0].field);
+        try std.testing.expectEqualStrings("grace", all.pairList[0].value);
+    }
+
+    // Set: add/rem/ismember/card/members plus the three multi-set ops,
+    // where `name` is the first set and the extra `args` are the rest -
+    // the same split `runColl` uses locally for `args[0]` vs `args[1..]`.
+    {
+        _ = try client.collOp(allocator, .set_add, "a", &[_][]const u8{"x"});
+        _ = try client.collOp(allocator, .set_add, "a", &[_][]const u8{"y"});
+        _ = try client.collOp(allocator, .set_add, "b", &[_][]const u8{"y"});
+        _ = try client.collOp(allocator, .set_add, "b", &[_][]const u8{"z"});
+
+        var isMem = try client.collOp(allocator, .set_ismember, "a", &[_][]const u8{"x"});
+        defer isMem.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 1), isMem.int);
+
+        var card = try client.collOp(allocator, .set_card, "a", &.{});
+        defer card.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 2), card.int);
+
+        var inter = try client.collOp(allocator, .set_inter, "a", &[_][]const u8{"b"});
+        defer inter.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), inter.stringList.len);
+        try std.testing.expectEqualStrings("y", inter.stringList[0]);
+
+        var uni = try client.collOp(allocator, .set_union, "a", &[_][]const u8{"b"});
+        defer uni.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 3), uni.stringList.len);
+
+        var diff = try client.collOp(allocator, .set_diff, "a", &[_][]const u8{"b"});
+        defer diff.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), diff.stringList.len);
+        try std.testing.expectEqualStrings("x", diff.stringList[0]);
+
+        var rem = try client.collOp(allocator, .set_rem, "a", &[_][]const u8{"x"});
+        defer rem.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 1), rem.int);
+    }
+
+    // List: push both ends, pop both ends, range with a redis-style
+    // negative index, len reflecting what remains.
+    {
+        _ = try client.collOp(allocator, .list_rpush, "queue", &[_][]const u8{"one"});
+        _ = try client.collOp(allocator, .list_rpush, "queue", &[_][]const u8{"two"});
+        _ = try client.collOp(allocator, .list_lpush, "queue", &[_][]const u8{"zero"});
+
+        var ranged = try client.collOp(allocator, .list_range, "queue", &[_][]const u8{ "0", "-1" });
+        defer ranged.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 3), ranged.stringList.len);
+        try std.testing.expectEqualStrings("zero", ranged.stringList[0]);
+        try std.testing.expectEqualStrings("two", ranged.stringList[2]);
+
+        var popped = try client.collOp(allocator, .list_lpop, "queue", &.{});
+        defer popped.deinit(allocator);
+        try std.testing.expectEqualStrings("zero", popped.bytes);
+
+        var lenReply = try client.collOp(allocator, .list_len, "queue", &.{});
+        defer lenReply.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 2), lenReply.int);
+
+        var emptyPop = try client.collOp(allocator, .list_rpop, "never-existed", &.{});
+        defer emptyPop.deinit(allocator);
+        try std.testing.expect(emptyPop == .nil);
+    }
+
+    // ZSet: add/incrby/score/rank/card/rangebyrank/rangebyscore, with a
+    // real fractional score to exercise the f64 wire encoding end to end.
+    {
+        _ = try client.collOp(allocator, .zset_add, "board", &[_][]const u8{ "alice", "10.5" });
+        _ = try client.collOp(allocator, .zset_add, "board", &[_][]const u8{ "bob", "20" });
+
+        var score = try client.collOp(allocator, .zset_score, "board", &[_][]const u8{"alice"});
+        defer score.deinit(allocator);
+        try std.testing.expectEqual(@as(f64, 10.5), score.real);
+
+        var incr = try client.collOp(allocator, .zset_incrby, "board", &[_][]const u8{ "alice", "1.5" });
+        defer incr.deinit(allocator);
+        try std.testing.expectEqual(@as(f64, 12.0), incr.real);
+
+        var rank = try client.collOp(allocator, .zset_rank, "board", &[_][]const u8{"alice"});
+        defer rank.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 0), rank.int);
+
+        var byRank = try client.collOp(allocator, .zset_rangebyrank, "board", &[_][]const u8{ "0", "-1" });
+        defer byRank.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 2), byRank.scorePairList.len);
+        try std.testing.expectEqualStrings("alice", byRank.scorePairList[0].member);
+        try std.testing.expectEqualStrings("bob", byRank.scorePairList[1].member);
+
+        var byScore = try client.collOp(allocator, .zset_rangebyscore, "board", &[_][]const u8{ "15", "25" });
+        defer byScore.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), byScore.scorePairList.len);
+        try std.testing.expectEqualStrings("bob", byScore.scorePairList[0].member);
+
+        var card = try client.collOp(allocator, .zset_card, "board", &.{});
+        defer card.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 2), card.int);
+
+        var removed = try client.collOp(allocator, .zset_rem, "board", &[_][]const u8{"bob"});
+        defer removed.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 1), removed.int);
+    }
+}
+
+// Closes the gap every `coll_op` session note since #30 has flagged and
+// deferred: every existing `coll_op` test drives ONE connection at a
+// time, so nothing has ever proven that many independent TCP connections
+// hammering `coll_op` against the SAME named collection concurrently are
+// safe - `Server.dispatch` takes `self.mutex` once per request exactly
+// like every other opcode, but that claim had never been exercised here
+// with real OS threads and real sockets the way `concurrent.zig`'s
+// `GuardedDb` tests already exercise `Db`/`TableTxn` directly.
+test "coll_op survives many real concurrent connections hammering the same counter" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    const threadCount = 8;
+    const perThread = 50;
+
+    const IncrCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        ok: bool = false,
+    };
+
+    const incrWorker = struct {
+        fn run(ctx: *IncrCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < perThread) : (i += 1) {
+                var reply = client.collOp(ctx.allocator, .counter_incrby, "shared-counter", &[_][]const u8{"1"}) catch return;
+                reply.deinit(ctx.allocator);
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    var incrContexts: [threadCount]IncrCtx = undefined;
+    var incrThreads: [threadCount]std.Thread = undefined;
+    for (0..threadCount) |i| {
+        incrContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress() };
+        incrThreads[i] = try std.Thread.spawn(.{}, incrWorker, .{&incrContexts[i]});
+    }
+    for (0..threadCount) |i| incrThreads[i].join();
+    for (0..threadCount) |i| try std.testing.expect(incrContexts[i].ok);
+
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+    var total = try client.collOp(allocator, .counter_get, "shared-counter", &.{});
+    defer total.deinit(allocator);
+    // Every increment is a separate request from a separate connection, so
+    // a missing lock around `runColl`'s read-modify-write would show up
+    // here as a total strictly less than threadCount*perThread (lost
+    // updates), not as a crash - the mutex in `Server.dispatch` must make
+    // this land on the exact total every single run.
+    try std.testing.expectEqual(@as(i64, threadCount * perThread), total.int);
+}
+
+// Same shape as the counter test above but for a structural collection
+// (`Set`) instead of a single scalar: many connections each add their OWN
+// disjoint members to one shared set, so a race would show up as a
+// missing member (an add silently lost to a concurrent writer) rather
+// than a wrong total, which is a different failure mode than incrBy's
+// lost-update and worth its own proof.
+test "coll_op survives many real concurrent connections adding disjoint members to the same set" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    const threadCount = 8;
+    const perThread = 50;
+
+    const AddCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        thread: usize,
+        ok: bool = false,
+    };
+
+    const addWorker = struct {
+        fn run(ctx: *AddCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < perThread) : (i += 1) {
+                var buf: [32]u8 = undefined;
+                const member = std.fmt.bufPrint(&buf, "t{d}-m{d}", .{ ctx.thread, i }) catch return;
+                var reply = client.collOp(ctx.allocator, .set_add, "shared-set", &[_][]const u8{member}) catch return;
+                reply.deinit(ctx.allocator);
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    var addContexts: [threadCount]AddCtx = undefined;
+    var addThreads: [threadCount]std.Thread = undefined;
+    for (0..threadCount) |i| {
+        addContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress(), .thread = i };
+        addThreads[i] = try std.Thread.spawn(.{}, addWorker, .{&addContexts[i]});
+    }
+    for (0..threadCount) |i| addThreads[i].join();
+    for (0..threadCount) |i| try std.testing.expect(addContexts[i].ok);
+
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+    var card = try client.collOp(allocator, .set_card, "shared-set", &.{});
+    defer card.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, threadCount * perThread), card.int);
+
+    // Spot-check a member from every thread, not just the aggregate count -
+    // a bug that dropped exactly one member per thread but "gained" one
+    // duplicate elsewhere could still pass the cardinality check above.
+    for (0..threadCount) |t| {
+        var buf: [32]u8 = undefined;
+        const member = try std.fmt.bufPrint(&buf, "t{d}-m0", .{t});
+        var isMem = try client.collOp(allocator, .set_ismember, "shared-set", &[_][]const u8{member});
+        defer isMem.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 1), isMem.int);
+    }
+}
+
+test "coll_op applies the same lazy-expiry check as coll_ttl_op before every dispatch" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    _ = try collmod.Hash.set(&db, allocator, "session", "user", "ada");
+    try client.collTtlExpire(.hash, "session", 0);
+    std.time.sleep(5 * std.time.ns_per_ms);
+
+    // The lazy check in `handleCollOp` reaps "session" before hash_get
+    // ever runs, so the field reads back as gone, not as its old value.
+    var got = try client.collOp(allocator, .hash_get, "session", &[_][]const u8{"user"});
+    defer got.deinit(allocator);
+    try std.testing.expect(got == .nil);
+    try std.testing.expect(!try collmod.collectionExists(&db, allocator, .hash, "session"));
+}
+
+test "coll_op set_inter/union/diff lazily expire every extra set name, not just the first" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    _ = try collmod.Set.add(&db, allocator, "a", "x");
+    _ = try collmod.Set.add(&db, allocator, "b", "x");
+    try client.collTtlExpire(.set, "b", 0);
+    std.time.sleep(5 * std.time.ns_per_ms);
+
+    // "b" is due but is only referenced through `args`, never `name` - if
+    // the handler only checked `name` (like it does for every single-name
+    // action), "b" would still look alive here and `intersect` would see
+    // its stale "x" member. It must come back empty instead.
+    var inter = try client.collOp(allocator, .set_inter, "a", &[_][]const u8{"b"});
+    defer inter.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), inter.stringList.len);
+}
+
+test "coll_op gates a read action as readonly and a write action as readwrite" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    _ = try collmod.Hash.set(&db, allocator, "k", "f", "v");
+
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "reader", "pw", .readonly, 16);
+    try store.createUser(allocator, "writer", "pw", .readwrite, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+
+    var writer = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer writer.close();
+    try writer.authenticate("writer", "pw");
+
+    var reader = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer reader.close();
+    try reader.authenticate("reader", "pw");
+
+    // hash_get is read-only: a readonly connection can run it.
+    var got = try reader.collOp(allocator, .hash_get, "k", &[_][]const u8{"f"});
+    defer got.deinit(allocator);
+    try std.testing.expectEqualStrings("v", got.bytes);
+
+    // hash_set mutates: forbidden for a readonly connection.
+    try std.testing.expectError(client_mod.ClientError.ServerForbidden, reader.collOp(allocator, .hash_set, "k", &[_][]const u8{ "f", "v2" }));
+
+    // The readwrite connection can do it. "f" already exists, so hash_set
+    // reports it as updated (0), not created (1) - same int-flag shape as
+    // set_add/set_rem/hash_del elsewhere in this opcode, not `.ok`.
+    var setReply = try writer.collOp(allocator, .hash_set, "k", &[_][]const u8{ "f", "v2" });
+    defer setReply.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 0), setReply.int);
+}
+
+test "server rejects a malformed coll_op frame with bad_request without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const stream = try std.net.tcpConnectToAddress(server.boundAddress());
+    defer stream.close();
+
+    // A single action byte is not enough to decode the length-prefixed
+    // name that must follow it.
+    try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.coll_op), "\x00");
+    var frame = try protocol.readFrame(allocator, stream.reader());
+    defer frame.deinit();
+    try std.testing.expectEqual(@intFromEnum(protocol.Status.bad_request), frame.tag);
+}
+
+test "server answers coll_op with bad_request when an action gets too few arguments" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    // counter_set needs a value argument - a well-formed frame that omits
+    // it should come back as a clean bad_request, not an internal error or
+    // a crash from indexing into an empty args slice.
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, client.collOp(allocator, .counter_set, "n", &.{}));
+}
+
+// Same ksztalt of proof as the two `coll_op` concurrency tests above
+// (many real OS threads, each its own TCP connection, hammering shared
+// server state) but for `ttl_op` instead - the next direction flagged at
+// the end of session solo #32 (cobalt-postep.md). `ttl_op` has no shared
+// mutable VALUE the way a counter or set does (each writer's key is its
+// own, disjoint from every other writer's), so the race worth proving
+// here is different: writer connections racing `set`+`expire` against
+// sweeper connections racing `sweep`, all against the SAME `Db.sstables`/
+// memtable underneath. `ttl.sweepExpired` reads its own prefix scan and
+// deletes what it found within a single `handleTtlOp` call, which the
+// `self.mutex` in `Server.dispatch` executes atomically end-to-end, so a
+// key can never be swept twice and no swept count can double-count - the
+// grand total across every sweep response plus one final mop-up sweep
+// must land on exactly the number of keys written, with zero lost and
+// zero duplicated, no matter how the OS interleaves the connections.
+test "ttl_op survives many real concurrent connections racing writes against sweeps" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    const writerCount = 6;
+    const perWriter = 40;
+    const sweeperCount = 3;
+    const sweepsPerSweeper = 200;
+
+    const WriteCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        thread: usize,
+        ok: bool = false,
+    };
+
+    const writeWorker = struct {
+        fn run(ctx: *WriteCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < perWriter) : (i += 1) {
+                var buf: [32]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "ttl-conc-{d}-{d}", .{ ctx.thread, i }) catch return;
+                client.set(key, "v") catch return;
+                client.ttlExpire(key, 0) catch return;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    const SweepCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        reaped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        ok: bool = false,
+    };
+
+    const sweepWorker = struct {
+        fn run(ctx: *SweepCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < sweepsPerSweeper) : (i += 1) {
+                const n = client.ttlSweep() catch return;
+                _ = ctx.reaped.fetchAdd(n, .monotonic);
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    var writeContexts: [writerCount]WriteCtx = undefined;
+    var writeThreads: [writerCount]std.Thread = undefined;
+    var sweepContexts: [sweeperCount]SweepCtx = undefined;
+    var sweepThreads: [sweeperCount]std.Thread = undefined;
+
+    for (0..sweeperCount) |i| {
+        sweepContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress() };
+        sweepThreads[i] = try std.Thread.spawn(.{}, sweepWorker, .{&sweepContexts[i]});
+    }
+    for (0..writerCount) |i| {
+        writeContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress(), .thread = i };
+        writeThreads[i] = try std.Thread.spawn(.{}, writeWorker, .{&writeContexts[i]});
+    }
+    for (0..writerCount) |i| writeThreads[i].join();
+    for (0..sweeperCount) |i| sweepThreads[i].join();
+    for (0..writerCount) |i| try std.testing.expect(writeContexts[i].ok);
+    for (0..sweeperCount) |i| try std.testing.expect(sweepContexts[i].ok);
+
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    // Any key that lost the race against every sweeper (written after the
+    // last sweep call landed) is mopped up by one final sweep here.
+    const finalReaped = try client.ttlSweep();
+
+    var total: u64 = finalReaped;
+    for (0..sweeperCount) |i| total += sweepContexts[i].reaped.load(.monotonic);
+    try std.testing.expectEqual(@as(u64, writerCount * perWriter), total);
+
+    // Spot-check one key from every writer thread: all must be truly gone
+    // (not just marker-cleared), proving the sweeps were real deletes.
+    for (0..writerCount) |t| {
+        var buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buf, "ttl-conc-{d}-0", .{t});
+        try std.testing.expectEqual(@as(?[]u8, null), try client.get(allocator, key));
+        try std.testing.expectEqual(ttlmod.TtlResult.noKey, try client.ttlQuery(key));
+    }
+}
+
+// Mirrors the `ttl_op` concurrency test above but against `coll_ttl_op`
+// and a real collection (`Counter`) instead of a flat key - the sibling
+// gap the same end-of-#32 note called out explicitly ("ttl_op dziala na
+// plaskim keyspace... analogiczny test... jest wykonalny, ale odlozony").
+// `collttl.sweepExpired` (collttl.zig) shares the exact same
+// scan-then-delete-within-one-call shape as `ttl.sweepExpired`, so the
+// same exactly-once accounting argument applies.
+test "coll_ttl_op survives many real concurrent connections racing writes against sweeps" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    const writerCount = 6;
+    const perWriter = 40;
+    const sweeperCount = 3;
+    const sweepsPerSweeper = 200;
+
+    const WriteCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        thread: usize,
+        ok: bool = false,
+    };
+
+    const writeWorker = struct {
+        fn run(ctx: *WriteCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < perWriter) : (i += 1) {
+                var buf: [32]u8 = undefined;
+                const name = std.fmt.bufPrint(&buf, "ttlcoll-conc-{d}-{d}", .{ ctx.thread, i }) catch return;
+                var reply = client.collOp(ctx.allocator, .counter_incrby, name, &[_][]const u8{"1"}) catch return;
+                reply.deinit(ctx.allocator);
+                client.collTtlExpire(.counter, name, 0) catch return;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    const SweepCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        reaped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        ok: bool = false,
+    };
+
+    const sweepWorker = struct {
+        fn run(ctx: *SweepCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < sweepsPerSweeper) : (i += 1) {
+                const n = client.collTtlSweep() catch return;
+                _ = ctx.reaped.fetchAdd(n, .monotonic);
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    var writeContexts: [writerCount]WriteCtx = undefined;
+    var writeThreads: [writerCount]std.Thread = undefined;
+    var sweepContexts: [sweeperCount]SweepCtx = undefined;
+    var sweepThreads: [sweeperCount]std.Thread = undefined;
+
+    for (0..sweeperCount) |i| {
+        sweepContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress() };
+        sweepThreads[i] = try std.Thread.spawn(.{}, sweepWorker, .{&sweepContexts[i]});
+    }
+    for (0..writerCount) |i| {
+        writeContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress(), .thread = i };
+        writeThreads[i] = try std.Thread.spawn(.{}, writeWorker, .{&writeContexts[i]});
+    }
+    for (0..writerCount) |i| writeThreads[i].join();
+    for (0..sweeperCount) |i| sweepThreads[i].join();
+    for (0..writerCount) |i| try std.testing.expect(writeContexts[i].ok);
+    for (0..sweeperCount) |i| try std.testing.expect(sweepContexts[i].ok);
+
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const finalReaped = try client.collTtlSweep();
+
+    var total: u64 = finalReaped;
+    for (0..sweeperCount) |i| total += sweepContexts[i].reaped.load(.monotonic);
+    try std.testing.expectEqual(@as(u64, writerCount * perWriter), total);
+
+    // Spot-check one collection from every writer thread: the WHOLE
+    // counter namespace must be gone, not merely its TTL marker.
+    for (0..writerCount) |t| {
+        var buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "ttlcoll-conc-{d}-0", .{t});
+        try std.testing.expect(!try collmod.collectionExists(&db, allocator, .counter, name));
+        try std.testing.expectEqual(ttlmod.TtlResult.noKey, try client.collTtlQuery(.counter, name));
+    }
+}
+
+// `coll_op`/`ttl_op`/`coll_ttl_op`/`table_select` above all have their own
+// concurrency proof now (#31/#32/#33's end-of-session notes tracked this
+// gap explicitly); `user_admin` was the one opcode still missing one. Its
+// shared mutable state is `auth.Store` (auth.zig), itself just a thin
+// get/put layer over the same `*Db` - `createUser` is a plain
+// check-then-write (`db.get` then `db.put`, no compare-and-swap), so a
+// missing lock around it would let two concurrent `create` calls for the
+// SAME username both observe "absent" and both write, silently doubling
+// the account (or worse, interleaving two different `UserRecord.encode()`
+// outputs into one key). `self.mutex` in `Server.dispatch` is the only
+// thing standing between that and reality here, same as every other
+// opcode's concurrency test in this file.
+test "user_admin survives many real concurrent connections racing to create the same username" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    const threadCount = 8;
+
+    const CreateCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        thread: usize,
+        created: bool = false,
+        conflicted: bool = false,
+        ok: bool = false,
+    };
+
+    const createWorker = struct {
+        fn run(ctx: *CreateCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var buf: [16]u8 = undefined;
+            const password = std.fmt.bufPrint(&buf, "pw-{d}", .{ctx.thread}) catch return;
+            if (client.adminCreateUser("shared-user", password, .readwrite, 4)) |_| {
+                ctx.created = true;
+            } else |err| {
+                if (err != client_mod.ClientError.ServerConflict) return;
+                ctx.conflicted = true;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    var contexts: [threadCount]CreateCtx = undefined;
+    var threads: [threadCount]std.Thread = undefined;
+    for (0..threadCount) |i| {
+        contexts[i] = .{ .allocator = allocator, .addr = server.boundAddress(), .thread = i };
+        threads[i] = try std.Thread.spawn(.{}, createWorker, .{&contexts[i]});
+    }
+    for (0..threadCount) |i| threads[i].join();
+
+    var createdCount: usize = 0;
+    var conflictedCount: usize = 0;
+    for (0..threadCount) |i| {
+        try std.testing.expect(contexts[i].ok);
+        if (contexts[i].created) createdCount += 1;
+        if (contexts[i].conflicted) conflictedCount += 1;
+    }
+    // A missing lock around the check-then-write in `createUser` would let
+    // more than one racer observe "absent" and both succeed, so this must
+    // land on EXACTLY one winner - not "at least one".
+    try std.testing.expectEqual(@as(usize, 1), createdCount);
+    try std.testing.expectEqual(@as(usize, threadCount - 1), conflictedCount);
+
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+    const users = try client.adminListUsers(allocator);
+    defer authmod.freeUserList(allocator, users);
+    // Guards against the OTHER failure mode a lost lock could produce: the
+    // two racing `db.put` calls interleaving their encoded bytes into one
+    // corrupted record instead of cleanly overwriting each other, which
+    // would still leave exactly one key but might fail to decode, or a
+    // duplicate row under the same key if compaction ever saw two
+    // physically distinct writes land as one logically doubled entry.
+    try std.testing.expectEqual(@as(usize, 1), users.len);
+    try std.testing.expectEqualStrings("shared-user", users[0].username);
+}
+
+// Same shared-mutex proof as the create-race test above, but for the
+// read-modify-write shape (`setPassword`/`setRole`, each its own
+// `mustGet` then `db.put`) rather than the check-then-write shape of
+// `create`, plus a concurrent reader (`list`) racing the writers - the
+// third distinct access pattern `user_admin` exposes over the wire.
+test "user_admin survives many real concurrent connections mutating and listing the same account" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+
+    var setup = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer setup.close();
+    try setup.adminCreateUser("shared-admin", "init-pw", .readonly, 4);
+
+    const writerCount = 6;
+    const perWriter = 40;
+    const readerCount = 3;
+    const readsPerReader = 200;
+
+    const WriteCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        thread: usize,
+        ok: bool = false,
+    };
+
+    const writeWorker = struct {
+        fn run(ctx: *WriteCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < perWriter) : (i += 1) {
+                var buf: [32]u8 = undefined;
+                const password = std.fmt.bufPrint(&buf, "pw-{d}-{d}", .{ ctx.thread, i }) catch return;
+                client.adminSetPassword("shared-admin", password, 4) catch return;
+                const role: authmod.Role = if (i % 2 == 0) .readwrite else .readonly;
+                client.adminSetRole("shared-admin", role) catch return;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    const ReadCtx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        ok: bool = false,
+    };
+
+    const readWorker = struct {
+        fn run(ctx: *ReadCtx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var i: usize = 0;
+            while (i < readsPerReader) : (i += 1) {
+                // Any decode failure inside the server (a torn/corrupted
+                // record) surfaces here as `error.ServerInternal`, not a
+                // silently wrong answer, since `handleUserAdmin` maps every
+                // `UserRecord.decode` error straight to an `internal`
+                // status frame.
+                const users = client.adminListUsers(ctx.allocator) catch return;
+                defer authmod.freeUserList(ctx.allocator, users);
+                if (users.len != 1) return;
+                if (!std.mem.eql(u8, users[0].username, "shared-admin")) return;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    var writeContexts: [writerCount]WriteCtx = undefined;
+    var writeThreads: [writerCount]std.Thread = undefined;
+    var readContexts: [readerCount]ReadCtx = undefined;
+    var readThreads: [readerCount]std.Thread = undefined;
+
+    for (0..readerCount) |i| {
+        readContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress() };
+        readThreads[i] = try std.Thread.spawn(.{}, readWorker, .{&readContexts[i]});
+    }
+    for (0..writerCount) |i| {
+        writeContexts[i] = .{ .allocator = allocator, .addr = server.boundAddress(), .thread = i };
+        writeThreads[i] = try std.Thread.spawn(.{}, writeWorker, .{&writeContexts[i]});
+    }
+    for (0..writerCount) |i| writeThreads[i].join();
+    for (0..readerCount) |i| readThreads[i].join();
+    for (0..writerCount) |i| try std.testing.expect(writeContexts[i].ok);
+    for (0..readerCount) |i| try std.testing.expect(readContexts[i].ok);
+
+    // A final, deterministic write from the main thread after every racer
+    // has joined, then verified through `auth.Store.verify` directly
+    // (bypassing the network entirely) against the SAME `*Db` the server
+    // just hammered concurrently: this proves the record surviving on disk
+    // is not merely "decodable" (the readers above already checked that)
+    // but functionally intact - the exact salt/rounds/hash triple that
+    // `setPassword` wrote is still paired correctly with the role
+    // `setRole` wrote after it, not a torn mix of two different racers'
+    // writes.
+    try setup.adminSetPassword("shared-admin", "final-known-pw", 4);
+    try setup.adminSetRole("shared-admin", .admin);
+
+    const store = authmod.Store.init(&db);
+    const role = try store.verify(allocator, "shared-admin", "final-known-pw");
+    try std.testing.expectEqual(authmod.Role.admin, role);
+
+    const finalUsers = try setup.adminListUsers(allocator);
+    defer authmod.freeUserList(allocator, finalUsers);
+    try std.testing.expectEqual(@as(usize, 1), finalUsers.len);
+    try std.testing.expectEqual(authmod.Role.admin, finalUsers[0].role);
+}
+
+// `txn_op` is the network counterpart of the local CLI's `txn <script>`
+// (main.zig's `runTxn`) - until now atomic multi-row/multi-table commits
+// were reachable only from a process holding the `Db` directly, the same
+// gap `table_select`/`coll_op`/`ttl_op` already closed for their own
+// subsystems. This round trip exercises both verbs across two tables in
+// one commit, including a pre-existing secondary index, to prove the field
+// list and primary key survive the wire encoding (`Row.encode`/
+// `rowmod.encodeValue`) intact enough for `TableTxn.put`'s index
+// maintenance to run correctly on the decoded side, not just for the raw
+// bytes to round-trip in isolation the way protocol.zig's own unit tests
+// already check.
+test "server txn_op commits put and del atomically across two tables, keeping an index in sync" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var accounts = try querymod.Table.open(&db, allocator, "accounts");
+        defer accounts.deinit();
+        try accounts.put(.{ .int = 1 }, &.{.{ .name = "balance", .value = .{ .int = 100 } }});
+        try accounts.put(.{ .int = 2 }, &.{.{ .name = "balance", .value = .{ .int = 5 } }});
+
+        var people = try querymod.Table.open(&db, allocator, "people");
+        defer people.deinit();
+        try people.createIndex("city");
+        try people.put(.{ .int = 10 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const peopleFields = [_]rowmod.Field{.{ .name = "city", .value = .{ .text = "warsaw" } }};
+    const entries = [_]protocol.TxnOpEntry{
+        .{ .verb = .put, .table = "accounts", .pk = .{ .int = 2 }, .fields = &.{.{ .name = "balance", .value = .{ .int = 999 } }} },
+        .{ .verb = .put, .table = "people", .pk = .{ .int = 11 }, .fields = &peopleFields },
+        .{ .verb = .del, .table = "accounts", .pk = .{ .int = 1 } },
+    };
+    const applied = try client.txnOp(&entries);
+    try std.testing.expectEqual(@as(u32, 3), applied);
+
+    var accounts = try querymod.Table.open(&db, allocator, "accounts");
+    defer accounts.deinit();
+    try std.testing.expect((try accounts.get(.{ .int = 1 })) == null);
+    var row2 = (try accounts.get(.{ .int = 2 })).?;
+    defer row2.deinit();
+    try std.testing.expectEqual(@as(i64, 999), row2.get("balance").?.int);
+
+    var people = try querymod.Table.open(&db, allocator, "people");
+    defer people.deinit();
+    const warsaw = try people.select(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
+    defer querymod.freeRows(allocator, warsaw);
+    try std.testing.expectEqual(@as(usize, 2), warsaw.len);
+}
+
+// Closes a gap left open by the CHECK constraint's introduction alongside
+// UNIQUE/FOREIGN KEY: `TableTxn.put` enforces all three identically (see
+// txn_table.zig), and this server's only write path (`handleTxnOp`) already
+// runs every entry through `TableTxn.put` - so a remote `txn_op` rejecting a
+// CHECK violation was already true the moment `TableTxn.put` gained the
+// check, never separately wired. This test is the same kind of "prove the
+// wire path actually exercises it, not just the in-process unit test" round
+// trip the FK/UNIQUE `txn_op` test above already is.
+test "server txn_op rejects a CHECK constraint violation over the wire and commits nothing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var orders = try querymod.Table.open(&db, allocator, "orders");
+        defer orders.deinit();
+        try orders.createCheckConstraint("qty_positive", "qty gt i:0");
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const entries = [_]protocol.TxnOpEntry{
+        .{ .verb = .put, .table = "orders", .pk = .{ .int = 1 }, .fields = &.{.{ .name = "qty", .value = .{ .int = 5 } }} },
+        .{ .verb = .put, .table = "orders", .pk = .{ .int = 2 }, .fields = &.{.{ .name = "qty", .value = .{ .int = -1 } }} },
+    };
+    try std.testing.expectError(client_mod.ClientError.ServerInternal, client.txnOp(&entries));
+
+    // Whole transaction is atomic across both entries: the earlier,
+    // individually-valid row 1 must not have been committed either.
+    var orders = try querymod.Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try std.testing.expect((try orders.get(.{ .int = 1 })) == null);
+    try std.testing.expect((try orders.get(.{ .int = 2 })) == null);
+}
+
+// `handleTxnOp` runs every entry through `TableTxn.put`/`TableTxn.delete`
+// (see txn_table.zig), which now enforce ON DELETE RESTRICT exactly like
+// CHECK/UNIQUE/FOREIGN KEY on put above - never separately wired for this
+// opcode either. The interesting case a plain `table_delete` test cannot
+// cover: both the child insert AND the restricted parent delete are only
+// staged within this ONE `txn_op` batch, never durable on their own -
+// `TableTxn.delete`'s RESTRICT check has to see the child through
+// `Transaction.scanPrefix`'s same-transaction visibility (see
+// txn_table.zig's own unit test for this), not a plain Db scan, or this
+// would wrongly let the delete through.
+test "server txn_op rejects an ON DELETE RESTRICT violation over the wire, seeing a child staged earlier in the same batch" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var customers = try querymod.Table.open(&db, allocator, "customers");
+        defer customers.deinit();
+        try customers.put(.{ .int = 1 }, &.{});
+
+        var orders = try querymod.Table.open(&db, allocator, "orders");
+        defer orders.deinit();
+        try orders.createForeignKey("customer_id", "customers", querymod.pkField, .restrict);
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    const entries = [_]protocol.TxnOpEntry{
+        .{ .verb = .put, .table = "orders", .pk = .{ .int = 100 }, .fields = &.{.{ .name = "customer_id", .value = .{ .int = 1 } }} },
+        .{ .verb = .del, .table = "customers", .pk = .{ .int = 1 } },
+    };
+    try std.testing.expectError(client_mod.ClientError.ServerInternal, client.txnOp(&entries));
+
+    // Nothing committed: neither the staged order nor the rejected delete.
+    var orders = try querymod.Table.open(&db, allocator, "orders");
+    defer orders.deinit();
+    try std.testing.expect((try orders.get(.{ .int = 100 })) == null);
+
+    var customers = try querymod.Table.open(&db, allocator, "customers");
+    defer customers.deinit();
+    var stillThere = (try customers.get(.{ .int = 1 })).?;
+    stillThere.deinit();
+}
+
+test "server txn_op rejects an empty operation list with bad_request" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, client.txnOp(&.{}));
+}
+
+test "server rejects a malformed txn_op frame with bad_request without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const stream = try std.net.tcpConnectToAddress(server.boundAddress());
+    defer stream.close();
+
+    // A u32 entry count of 1 promises one full entry, but the payload ends
+    // right after it - not even a verb byte follows.
+    var payload: [4]u8 = undefined;
+    std.mem.writeInt(u32, &payload, 1, .little);
+    try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.txn_op), &payload);
+    var frame = try protocol.readFrame(allocator, stream.reader());
+    defer frame.deinit();
+    try std.testing.expectEqual(@intFromEnum(protocol.Status.bad_request), frame.tag);
+
+    // The connection must still be usable afterward - a malformed frame is
+    // a client mistake, not a fatal error for the server.
+    try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.ping), "");
+    var pingFrame = try protocol.readFrame(allocator, stream.reader());
+    defer pingFrame.deinit();
+    try std.testing.expectEqual(@intFromEnum(protocol.Status.ok), pingFrame.tag);
+}
+
+// Proves the `txn_op` code path (decode -> `Transaction`/`TableTxn` ->
+// index maintenance -> commit, all under `Server.dispatch`'s single
+// `self.mutex`) holds up under real concurrent OS threads each on their
+// own real TCP connection - the same rigor `coll_op`'s/`table_select`'s
+// own concurrency tests apply, but for the table+index layer instead of
+// the flat keyspace or the Redis-like collections, which is a genuinely
+// different code path (this is the first concurrency test to drive
+// `TableTxn`/index maintenance through a live socket at all;
+// `concurrent.zig`'s own `TableTxn` concurrency test bypasses the network
+// entirely via `GuardedDb`). Each worker writes into two disjoint rows per
+// round (its own row in `widgets`, indexed by `owner`, and a companion row
+// in `tags`) so a lost or duplicated write from bad interleaving would
+// show up as a wrong row count or a wrong index membership, not just a
+// wrong number.
+test "server txn_op survives many real concurrent connections writing disjoint rows across two tables" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    {
+        var widgets = try querymod.Table.open(&db, allocator, "widgets");
+        defer widgets.deinit();
+        try widgets.createIndex("owner");
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    const threadCount = 6;
+    const perThread = 40;
+
+    const Ctx = struct {
+        allocator: Allocator,
+        addr: std.net.Address,
+        thread: i64,
+        ok: bool = false,
+    };
+
+    const worker = struct {
+        fn run(ctx: *Ctx) void {
+            var client = client_mod.Client.connect(ctx.allocator, ctx.addr) catch return;
+            defer client.close();
+            var buf: [32]u8 = undefined;
+            var i: i64 = 0;
+            while (i < perThread) : (i += 1) {
+                const ownerTag = std.fmt.bufPrint(&buf, "owner-{d}", .{ctx.thread}) catch return;
+                const widgetPk: i64 = ctx.thread * 1_000_000 + i;
+                const entries = [_]protocol.TxnOpEntry{
+                    .{ .verb = .put, .table = "widgets", .pk = .{ .int = widgetPk }, .fields = &.{.{ .name = "owner", .value = .{ .text = ownerTag } }} },
+                    .{ .verb = .put, .table = "tags", .pk = .{ .int = widgetPk }, .fields = &.{.{ .name = "seq", .value = .{ .int = i } }} },
+                };
+                const applied = client.txnOp(&entries) catch return;
+                if (applied != 2) return;
+            }
+            ctx.ok = true;
+        }
+    }.run;
+
+    var contexts: [threadCount]Ctx = undefined;
+    var threads: [threadCount]std.Thread = undefined;
+    for (0..threadCount) |t| {
+        contexts[t] = .{ .allocator = allocator, .addr = server.boundAddress(), .thread = @intCast(t) };
+        threads[t] = try std.Thread.spawn(.{}, worker, .{&contexts[t]});
+    }
+    for (0..threadCount) |t| threads[t].join();
+    for (0..threadCount) |t| try std.testing.expect(contexts[t].ok);
+
+    var widgets = try querymod.Table.open(&db, allocator, "widgets");
+    defer widgets.deinit();
+    var tags = try querymod.Table.open(&db, allocator, "tags");
+    defer tags.deinit();
+
+    var total: usize = 0;
+    for (0..threadCount) |t| {
+        var buf: [32]u8 = undefined;
+        const ownerTag = try std.fmt.bufPrint(&buf, "owner-{d}", .{t});
+        const owned = try widgets.select(.{ .eq = .{ .field = "owner", .value = .{ .text = ownerTag } } });
+        defer querymod.freeRows(allocator, owned);
+        // Every widget this thread wrote must show up under its own index
+        // entry, exactly `perThread` of them - not fewer (a lost write)
+        // and not more (a duplicated one).
+        try std.testing.expectEqual(@as(usize, perThread), owned.len);
+        total += owned.len;
+    }
+    try std.testing.expectEqual(@as(usize, threadCount * perThread), total);
+
+    const allTags = try tags.select(null);
+    defer querymod.freeRows(allocator, allTags);
+    try std.testing.expectEqual(@as(usize, threadCount * perThread), allTags.len);
+}
+
+test "server delivers a published message to a subscriber over real TCP" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var sub = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer sub.close();
+    _ = try sub.subscribe(&.{"weather"});
+
+    var pub_ = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer pub_.close();
+    const delivered = try pub_.publish("weather", "sunny");
+    try std.testing.expectEqual(@as(u64, 1), delivered);
+
+    const msg = (try sub.nextMessage(allocator)).?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("weather", msg.channel);
+    try std.testing.expectEqualStrings("sunny", msg.payload);
+    try std.testing.expectEqual(@as(u64, 1), server.messagesPublishedTotal.get());
+}
+
+test "server delivers to a subscriber's own copy per channel it named, every subscriber on a channel reached" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var subA = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer subA.close();
+    _ = try subA.subscribe(&.{ "orders", "alerts" });
+
+    var subB = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer subB.close();
+    _ = try subB.subscribe(&.{"orders"});
+
+    var pub_ = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer pub_.close();
+    try std.testing.expectEqual(@as(u64, 2), try pub_.publish("orders", "order-1"));
+    try std.testing.expectEqual(@as(u64, 1), try pub_.publish("alerts", "disk-full"));
+
+    const aFirst = (try subA.nextMessage(allocator)).?;
+    defer aFirst.deinit(allocator);
+    try std.testing.expectEqualStrings("orders", aFirst.channel);
+    try std.testing.expectEqualStrings("order-1", aFirst.payload);
+    const aSecond = (try subA.nextMessage(allocator)).?;
+    defer aSecond.deinit(allocator);
+    try std.testing.expectEqualStrings("alerts", aSecond.channel);
+    try std.testing.expectEqualStrings("disk-full", aSecond.payload);
+
+    const bOnly = (try subB.nextMessage(allocator)).?;
+    defer bOnly.deinit(allocator);
+    try std.testing.expectEqualStrings("orders", bOnly.channel);
+    try std.testing.expectEqualStrings("order-1", bOnly.payload);
+}
+
+test "server publish to a channel with no subscribers returns 0 without crashing, over real TCP" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
