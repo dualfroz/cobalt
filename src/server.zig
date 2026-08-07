@@ -7873,3 +7873,161 @@ test "server publish to a channel with no subscribers returns 0 without crashing
     try server.start();
     defer server.stop();
 
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try std.testing.expectEqual(@as(u64, 0), try client.publish("nobody-home", "hello"));
+    // A no-receiver publish is not a mutation of anything - `ping` still
+    // works on the same connection right after, proving `publish` never
+    // left the connection or the server in some half-dispatched state.
+    try client.ping();
+}
+
+test "server rejects an empty subscribe channel list as bad_request, connection stays diagnosable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try std.testing.expectError(client_mod.ClientError.ServerBadRequest, client.subscribe(&.{}));
+}
+
+test "closing a subscriber's connection unregisters it - a later publish no longer reaches it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var sub = try client_mod.Client.connect(allocator, server.boundAddress());
+    _ = try sub.subscribe(&.{"ch"});
+    try std.testing.expectEqual(@as(usize, 1), server.pubsub.channelSubscriberCount("ch"));
+    sub.close();
+
+    // The watcher thread's disconnect detection runs asynchronously - poll
+    // with a bounded timeout instead of a fixed sleep, the same style
+    // `drainConnections` already uses elsewhere in this file.
+    const startedAt = std.time.nanoTimestamp();
+    while (server.pubsub.channelSubscriberCount("ch") != 0) {
+        if (std.time.nanoTimestamp() - startedAt > 2 * std.time.ns_per_s) break;
+        std.time.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.pubsub.channelSubscriberCount("ch"));
+
+    var pub_ = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer pub_.close();
+    try std.testing.expectEqual(@as(u64, 0), try pub_.publish("ch", "too-late"));
+}
+
+test "server with auth enabled requires authentication before subscribe or publish, readonly role suffices" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    const store = authmod.Store.init(&db);
+    try store.createUser(allocator, "viewer", "hunter2", .readonly, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    server.enableAuth(store);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var anon = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer anon.close();
+    try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, anon.subscribe(&.{"ch"}));
+    try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, anon.publish("ch", "x"));
+
+    var viewer = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer viewer.close();
+    try viewer.authenticate("viewer", "hunter2");
+    _ = try viewer.subscribe(&.{"ch"});
+
+    var writer_ = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer writer_.close();
+    try writer_.authenticate("viewer", "hunter2");
+    try std.testing.expectEqual(@as(u64, 1), try writer_.publish("ch", "hi"));
+
+    const msg = (try viewer.nextMessage(allocator)).?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("hi", msg.payload);
+}
+
+test "server unsubscribe over real TCP drops one channel while the other keeps flowing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var sub = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer sub.close();
+    const subId = try sub.subscribe(&.{ "orders", "alerts" });
+
+    // The subscribe connection itself never answers another request (see
+    // `handleSubscribe`'s doc comment) - unsubscribe always goes over its
+    // own, separate connection.
+    var ctrl = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer ctrl.close();
+    const removed = try ctrl.unsubscribe(subId, &.{"orders"});
+    try std.testing.expectEqual(@as(u32, 1), removed);
+    // `ctrl` is an ordinary connection - it must still answer further
+    // requests normally after an unsubscribe, proving `handleUnsubscribe`
+    // returns like any other opcode rather than hijacking the connection.
+    try ctrl.ping();
+
+    var pub_ = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer pub_.close();
+    try std.testing.expectEqual(@as(u64, 0), try pub_.publish("orders", "too-late"));
+    try std.testing.expectEqual(@as(u64, 1), try pub_.publish("alerts", "fire"));
+
+    const msg = (try sub.nextMessage(allocator)).?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("alerts", msg.channel);
+    try std.testing.expectEqualStrings("fire", msg.payload);
+}
+
+test "server unsubscribe from every remaining channel ends the subscription like a disconnect" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
