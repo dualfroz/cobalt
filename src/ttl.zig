@@ -156,3 +156,138 @@ fn openTemp(tmp: *std.testing.TmpDir, allocator: Allocator) !Db {
     return Db.open(allocator, dbPath, .{});
 }
 
+test "remaining reports noKey, noExpiry, and counted seconds" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try std.testing.expectEqual(TtlResult.noKey, try remaining(&db, allocator, "missing", 0));
+
+    try db.put("plain", "v");
+    try std.testing.expectEqual(TtlResult.noExpiry, try remaining(&db, allocator, "plain", 0));
+
+    try setExpireSeconds(&db, allocator, "plain", 1000, 30);
+    const r = try remaining(&db, allocator, "plain", 1000);
+    try std.testing.expectEqual(@as(u64, 30), r.seconds);
+}
+
+test "expireIfDue removes value and marker only once due" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try db.put("session:1", "payload");
+    try setExpireSeconds(&db, allocator, "session:1", 0, 5);
+
+    try std.testing.expect(!try expireIfDue(&db, allocator, "session:1", 4 * secondNanos));
+    const stillThere = (try db.get(allocator, "session:1")).?;
+    allocator.free(stillThere);
+
+    try std.testing.expect(try expireIfDue(&db, allocator, "session:1", 5 * secondNanos));
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "session:1"));
+    try std.testing.expectEqual(@as(?i128, null), try getExpiresAt(&db, allocator, "session:1"));
+}
+
+test "getLive lazily expires exactly at the deadline" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try putWithTtl(&db, allocator, "cache:x", "hot", 0, 2);
+
+    const before = (try getLive(&db, allocator, "cache:x", 1 * secondNanos)).?;
+    defer allocator.free(before);
+    try std.testing.expectEqualStrings("hot", before);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try getLive(&db, allocator, "cache:x", 2 * secondNanos));
+    // A plain db.get after the lazy expiry proves the delete was real, not
+    // getLive-only bookkeeping - the tombstone is now the source of truth.
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "cache:x"));
+}
+
+test "clearExpire makes a key immortal again" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try putWithTtl(&db, allocator, "note", "keep me", 0, 1);
+    try clearExpire(&db, allocator, "note");
+
+    try std.testing.expectEqual(TtlResult.noExpiry, try remaining(&db, allocator, "note", 100 * secondNanos));
+    const v = (try getLive(&db, allocator, "note", 100 * secondNanos)).?;
+    defer allocator.free(v);
+    try std.testing.expectEqualStrings("keep me", v);
+}
+
+test "sweepExpired reaps every due key without touching live or unrelated keys" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try putWithTtl(&db, allocator, "a", "1", 0, 1);
+    try putWithTtl(&db, allocator, "b", "2", 0, 100);
+    try putWithTtl(&db, allocator, "c", "3", 0, 1);
+    try db.put("d", "forever");
+
+    const reaped = try sweepExpired(&db, allocator, 2 * secondNanos);
+    try std.testing.expectEqual(@as(usize, 2), reaped);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "a"));
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "c"));
+
+    const b = (try db.get(allocator, "b")).?;
+    defer allocator.free(b);
+    try std.testing.expectEqualStrings("2", b);
+
+    const d = (try db.get(allocator, "d")).?;
+    defer allocator.free(d);
+    try std.testing.expectEqualStrings("forever", d);
+
+    // Idempotent: a second sweep at the same instant finds nothing left.
+    try std.testing.expectEqual(@as(usize, 0), try sweepExpired(&db, allocator, 2 * secondNanos));
+}
+
+test "sweep survives a wal reopen: markers are durable, not in-memory bookkeeping" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try openTemp(&tmp, allocator);
+        defer db.close();
+        try putWithTtl(&db, allocator, "durable-ttl", "v", 0, 5);
+    }
+
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    const r = try remaining(&db, allocator, "durable-ttl", 1 * secondNanos);
+    try std.testing.expectEqual(@as(u64, 4), r.seconds);
+
+    try std.testing.expectEqual(@as(usize, 1), try sweepExpired(&db, allocator, 10 * secondNanos));
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "durable-ttl"));
+}
+
+test "setExpireAt on a nonexistent key is a real marker, not silently rejected" {
+    // Documents the PEXPIREAT-like looseness of setExpireAt directly (the
+    // CLI layer is what adds the Redis EXPIRE existence check on top).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try setExpireSeconds(&db, allocator, "ghost", 0, 10);
+    try std.testing.expectEqual(TtlResult.noKey, try remaining(&db, allocator, "ghost", 0));
+    const expiresAt = (try getExpiresAt(&db, allocator, "ghost")).?;
+    try std.testing.expectEqual(@as(i128, 10 * secondNanos), expiresAt);
+}
