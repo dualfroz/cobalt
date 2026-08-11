@@ -789,3 +789,241 @@ test "TableTxn `txn <script>` shape: a CHECK violation on the second put leaves 
         try setup.createCheckConstraint("qty_positive", "qty gt i:0");
     }
 
+    var txn = Transaction.begin(&db);
+    defer txn.deinit();
+    var t = try TableTxn.open(&txn, allocator, "orders");
+    defer t.deinit();
+
+    try t.put(.{ .int = 1 }, &.{.{ .name = "qty", .value = .{ .int = 5 } }});
+    try std.testing.expectError(error.CheckViolation, t.put(.{ .int = 2 }, &.{
+        .{ .name = "qty", .value = .{ .int = -5 } },
+    }));
+
+    // A real `txn <script>` dispatch (main.zig's `runTxn`/server.zig's
+    // `handleTxnOp`) aborts the whole script on the first line that fails
+    // instead of continuing - `t.deinit()`/`txn.deinit()` above discard the
+    // transaction without ever calling `commit()`, so even row 1 (which was
+    // individually valid) must never become visible.
+    var plain = try querymod.Table.open(&db, allocator, "orders");
+    defer plain.deinit();
+    try std.testing.expect((try plain.get(.{ .int = 1 })) == null);
+}
+
+test "TableTxn delete enforces ON DELETE RESTRICT against a committed child row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    {
+        var customers = try querymod.Table.open(&db, allocator, "customers");
+        defer customers.deinit();
+        try customers.put(.{ .int = 1 }, &.{});
+
+        var orders = try querymod.Table.open(&db, allocator, "orders");
+        defer orders.deinit();
+        try orders.createForeignKey("customer_id", "customers", pkField, .restrict);
+        try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
+    }
+
+    var txn = Transaction.begin(&db);
+    defer txn.deinit();
+    var t = try TableTxn.open(&txn, allocator, "customers");
+    defer t.deinit();
+
+    try std.testing.expectError(error.ForeignKeyInUse, t.delete(.{ .int = 1 }));
+    try txn.commit();
+
+    var plain = try querymod.Table.open(&db, allocator, "customers");
+    defer plain.deinit();
+    var stillThere = (try plain.get(.{ .int = 1 })).?;
+    stillThere.deinit();
+}
+
+test "TableTxn delete RESTRICT sees a child row staged earlier in the same uncommitted transaction" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    {
+        var customers = try querymod.Table.open(&db, allocator, "customers");
+        defer customers.deinit();
+        try customers.put(.{ .int = 1 }, &.{});
+
+        var orders = try querymod.Table.open(&db, allocator, "orders");
+        defer orders.deinit();
+        try orders.createForeignKey("customer_id", "customers", pkField, .restrict);
+    }
+
+    var txn = Transaction.begin(&db);
+    defer txn.deinit();
+
+    // The order referencing customer 1 is only staged in this SAME
+    // transaction's write set (via a sibling TableTxn on "orders"), never
+    // committed - `Transaction.scanPrefix` (not a plain Db scan, which
+    // would see nothing under the orders row prefix yet) is what makes
+    // this count as a live reference before the transaction ever commits.
+    var ordersTxn = try TableTxn.open(&txn, allocator, "orders");
+    defer ordersTxn.deinit();
+    try ordersTxn.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
+
+    var customersTxn = try TableTxn.open(&txn, allocator, "customers");
+    defer customersTxn.deinit();
+    try std.testing.expectError(error.ForeignKeyInUse, customersTxn.delete(.{ .int = 1 }));
+}
+
+test "TableTxn delete RESTRICT does not block deleting a parent once its only child is deleted in the same transaction" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    {
+        var customers = try querymod.Table.open(&db, allocator, "customers");
+        defer customers.deinit();
+        try customers.put(.{ .int = 1 }, &.{});
+
+        var orders = try querymod.Table.open(&db, allocator, "orders");
+        defer orders.deinit();
+        try orders.createForeignKey("customer_id", "customers", pkField, .restrict);
+        try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
+    }
+
+    var txn = Transaction.begin(&db);
+    defer txn.deinit();
+
+    var ordersTxn = try TableTxn.open(&txn, allocator, "orders");
+    defer ordersTxn.deinit();
+    try ordersTxn.delete(.{ .int = 100 });
+
+    var customersTxn = try TableTxn.open(&txn, allocator, "customers");
+    defer customersTxn.deinit();
+    try customersTxn.delete(.{ .int = 1 });
+
+    try txn.commit();
+
+    var plain = try querymod.Table.open(&db, allocator, "customers");
+    defer plain.deinit();
+    try std.testing.expect((try plain.get(.{ .int = 1 })) == null);
+}
+
+test "TableTxn delete RESTRICT excludes the row being deleted from its own self-referencing check" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    {
+        var employees = try querymod.Table.open(&db, allocator, "employees");
+        defer employees.deinit();
+        try employees.put(.{ .int = 1 }, &.{});
+        try employees.createForeignKey("manager_id", "employees", pkField, .restrict);
+        try employees.put(.{ .int = 2 }, &.{.{ .name = "manager_id", .value = .{ .int = 1 } }});
+    }
+
+    var txn = Transaction.begin(&db);
+    defer txn.deinit();
+    var t = try TableTxn.open(&txn, allocator, "employees");
+    defer t.deinit();
+
+    // The manager (pk 1) has a report (pk 2) -> restricted.
+    try std.testing.expectError(error.ForeignKeyInUse, t.delete(.{ .int = 1 }));
+    // The report itself has no reports of its own -> deletes cleanly,
+    // scanning the same table it belongs to without restricting itself.
+    try t.delete(.{ .int = 2 });
+    try txn.commit();
+
+    var plain = try querymod.Table.open(&db, allocator, "employees");
+    defer plain.deinit();
+    try std.testing.expect((try plain.get(.{ .int = 2 })) == null);
+}
+
+test "TableTxn put is restricted from changing a UNIQUE foreign key target a committed child still references" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    {
+        var products = try querymod.Table.open(&db, allocator, "products");
+        defer products.deinit();
+        try products.createUniqueIndex("sku");
+        try products.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "WIDGET-1" } }});
+
+        var lineItems = try querymod.Table.open(&db, allocator, "line_items");
+        defer lineItems.deinit();
+        try lineItems.createForeignKey("product_sku", "products", "sku", .restrict);
+        try lineItems.put(.{ .int = 1 }, &.{.{ .name = "product_sku", .value = .{ .text = "WIDGET-1" } }});
+    }
+
+    var txn = Transaction.begin(&db);
+    defer txn.deinit();
+    var t = try TableTxn.open(&txn, allocator, "products");
+    defer t.deinit();
+
+    try std.testing.expectError(error.ForeignKeyInUse, t.put(.{ .int = 1 }, &.{
+        .{ .name = "sku", .value = .{ .text = "WIDGET-2" } },
+    }));
+    // Unchanged is always exempt.
+    try t.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "WIDGET-1" } }});
+    try txn.commit();
+
+    var plain = try querymod.Table.open(&db, allocator, "products");
+    defer plain.deinit();
+    var stillThere = (try plain.get(.{ .int = 1 })).?;
+    defer stillThere.deinit();
+    try std.testing.expectEqualStrings("WIDGET-1", stillThere.get("sku").?.text);
+}
+
+test "TableTxn put update-restrict sees a child row staged earlier in the same uncommitted transaction" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    {
+        var products = try querymod.Table.open(&db, allocator, "products");
+        defer products.deinit();
+        try products.createUniqueIndex("sku");
+        try products.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "WIDGET-1" } }});
+
+        var lineItems = try querymod.Table.open(&db, allocator, "line_items");
+        defer lineItems.deinit();
+        try lineItems.createForeignKey("product_sku", "products", "sku", .restrict);
+    }
+
+    var txn = Transaction.begin(&db);
+    defer txn.deinit();
+
+    // The line item referencing "WIDGET-1" is only staged in this SAME
+    // transaction's write set, never committed - `Transaction.scanPrefix`
+    // is what makes this count as a live reference before commit.
+    var lineItemsTxn = try TableTxn.open(&txn, allocator, "line_items");
+    defer lineItemsTxn.deinit();
+    try lineItemsTxn.put(.{ .int = 1 }, &.{.{ .name = "product_sku", .value = .{ .text = "WIDGET-1" } }});
+
+    var productsTxn = try TableTxn.open(&txn, allocator, "products");
+    defer productsTxn.deinit();
+    try std.testing.expectError(error.ForeignKeyInUse, productsTxn.put(.{ .int = 1 }, &.{
+        .{ .name = "sku", .value = .{ .text = "WIDGET-2" } },
+    }));
+
+    // Once the referencing line item is removed in the same transaction,
+    // the rename goes through.
+    try lineItemsTxn.delete(.{ .int = 1 });
+    try productsTxn.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "WIDGET-2" } }});
+    try txn.commit();
+
+    var plain = try querymod.Table.open(&db, allocator, "products");
+    defer plain.deinit();
+    var renamed = (try plain.get(.{ .int = 1 })).?;
+    defer renamed.deinit();
+    try std.testing.expectEqualStrings("WIDGET-2", renamed.get("sku").?.text);
+}
