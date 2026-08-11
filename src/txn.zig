@@ -81,6 +81,62 @@ pub const Transaction = struct {
         try self.reads.put(keyCopy, {});
     }
 
+    /// One key/value pair from `scanPrefix`, owned by the caller (free with
+    /// `freeEntries`).
+    pub const Entry = struct {
+        key: []u8,
+        value: []u8,
+
+        fn free(self: Entry, allocator: Allocator) void {
+            allocator.free(self.key);
+            allocator.free(self.value);
+        }
+    };
+
+    pub fn freeEntries(allocator: Allocator, entries: []Entry) void {
+        for (entries) |e| e.free(allocator);
+        allocator.free(entries);
+    }
+
+    /// Prefix scan that reflects this transaction's own uncommitted writes,
+    /// the same read-your-writes promise `get` makes for a single key
+    /// extended to a whole key range: a row staged here shadows whatever the
+    /// committed snapshot has under that exact key (a staged tombstone hides
+    /// it entirely, a staged value replaces it), and a brand-new key staged
+    /// here that falls under `prefix` shows up even though the underlying
+    /// `Db` has never durably seen it. Every entry the underlying snapshot
+    /// contributes is also recorded as a read for OCC purposes, same as
+    /// `get` - a concurrent external write to one of those existing keys
+    /// between now and `commit()` is still caught as `error.Conflict`. A
+    /// concurrent external INSERT of a brand-new key under `prefix` is not
+    /// caught (there is no key to register a read against before it
+    /// exists) - the same phantom-read gap every OCC scheme without
+    /// range-locks has, not something specific to this method.
+    pub fn scanPrefix(self: *Transaction, allocator: Allocator, prefix: []const u8) ![]Entry {
+        var results = std.ArrayList(Entry).init(allocator);
+        errdefer {
+            for (results.items) |e| e.free(allocator);
+            results.deinit();
+        }
+
+        var it = try self.db.scanPrefixAsOf(allocator, prefix, self.snapshotSeq);
+        defer it.deinit();
+        while (try it.next()) |entry| {
+            if (self.writes.contains(entry.key)) continue;
+            try self.recordRead(entry.key);
+            try results.append(.{ .key = try allocator.dupe(u8, entry.key), .value = try allocator.dupe(u8, entry.value) });
+        }
+
+        var writeEntries = self.writes.iterator();
+        while (writeEntries.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
+            if (entry.value_ptr.kind == .tombstone) continue;
+            try results.append(.{ .key = try allocator.dupe(u8, entry.key_ptr.*), .value = try allocator.dupe(u8, entry.value_ptr.value) });
+        }
+
+        return results.toOwnedSlice();
+    }
+
     pub fn commit(self: *Transaction) !void {
         var readKeys = self.reads.keyIterator();
         while (readKeys.next()) |key| {
@@ -185,4 +241,75 @@ test "conflicting commit is rejected but clean commit succeeds" {
     const note = (try db.get(allocator, "note")).?;
     defer allocator.free(note);
     try std.testing.expectEqualStrings("ok", note);
+}
+
+test "scanPrefix sees committed rows and a staged brand-new key under the same prefix" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try db.put("idx:a", "1");
+    try db.put("idx:b", "2");
+    try db.put("other:z", "9");
+
+    var txn = Transaction.begin(&db);
+    defer txn.deinit();
+    try txn.put("idx:c", "3");
+
+    const entries = try txn.scanPrefix(allocator, "idx:");
+    defer Transaction.freeEntries(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+
+    var seenC = false;
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.key, "idx:c")) {
+            try std.testing.expectEqualStrings("3", e.value);
+            seenC = true;
+        }
+    }
+    try std.testing.expect(seenC);
+}
+
+test "scanPrefix shadows a committed key with its staged replacement and hides a staged tombstone" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try db.put("idx:a", "old-a");
+    try db.put("idx:b", "old-b");
+
+    var txn = Transaction.begin(&db);
+    defer txn.deinit();
+    try txn.put("idx:a", "new-a");
+    try txn.delete("idx:b");
+
+    const entries = try txn.scanPrefix(allocator, "idx:");
+    defer Transaction.freeEntries(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("idx:a", entries[0].key);
+    try std.testing.expectEqualStrings("new-a", entries[0].value);
+}
+
+test "scanPrefix registers committed keys as reads, so a concurrent external write under it still conflicts at commit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try db.put("idx:a", "1");
+
+    var txn = Transaction.begin(&db);
+    defer txn.deinit();
+    const entries = try txn.scanPrefix(allocator, "idx:");
+    Transaction.freeEntries(allocator, entries);
+
+    try db.put("idx:a", "external-change");
+
+    try txn.put("unrelated", "1");
+    try std.testing.expectError(error.Conflict, txn.commit());
 }
