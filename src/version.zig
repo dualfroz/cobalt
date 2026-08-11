@@ -473,3 +473,186 @@ test "manifest rotates once pending records outgrow live file count" {
         try opened.set.logAndApply(&edit, &opened.state);
     }
 
+    var n: usize = 0;
+    while (n < 20) : (n += 1) {
+        var edit = VersionEdit.init(allocator);
+        defer edit.deinit();
+        try edit.deleteFile(fileId);
+        fileId += 1;
+        try edit.addFile(fileId, 0);
+        try opened.set.logAndApply(&edit, &opened.state);
+    }
+
+    try std.testing.expect(opened.set.manifestId > 1);
+    try std.testing.expectEqual(@as(usize, 1), opened.state.count());
+    try std.testing.expectEqual(@as(usize, 0), opened.state.get(fileId).?);
+
+    var nameBuf: [64]u8 = undefined;
+    const oldName = try manifestFileName(&nameBuf, 1);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(oldName, .{}));
+}
+
+test "reopen after rotation still reflects live state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var lastId: u64 = 0;
+    var finalFileId: u64 = 1;
+    {
+        var opened = try VersionSet.open(allocator, tmp.dir);
+        defer opened.state.deinit();
+        defer opened.set.close();
+
+        {
+            var edit = VersionEdit.init(allocator);
+            defer edit.deinit();
+            try edit.addFile(finalFileId, 0);
+            try opened.set.logAndApply(&edit, &opened.state);
+        }
+        var n: usize = 0;
+        while (n < 12) : (n += 1) {
+            var edit = VersionEdit.init(allocator);
+            defer edit.deinit();
+            try edit.deleteFile(finalFileId);
+            finalFileId += 1;
+            try edit.addFile(finalFileId, 0);
+            try opened.set.logAndApply(&edit, &opened.state);
+        }
+        lastId = opened.set.manifestId;
+    }
+
+    try std.testing.expect(lastId > 1);
+
+    var reopened = try VersionSet.open(allocator, tmp.dir);
+    defer reopened.state.deinit();
+    defer reopened.set.close();
+    try std.testing.expectEqual(@as(usize, 1), reopened.state.count());
+    try std.testing.expectEqual(@as(usize, 0), reopened.state.get(finalFileId).?);
+    try std.testing.expectEqual(reopened.set.manifestId, lastId);
+}
+
+test "torn trailing record is ignored on recovery" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var opened = try VersionSet.open(allocator, tmp.dir);
+        defer opened.state.deinit();
+        defer opened.set.close();
+
+        var edit = VersionEdit.init(allocator);
+        defer edit.deinit();
+        try edit.addFile(7, 0);
+        try opened.set.logAndApply(&edit, &opened.state);
+
+        try opened.set.file.seekFromEnd(0);
+        try opened.set.file.writeAll(&[_]u8{ 0xde, 0xad, 0xbe });
+        try opened.set.file.sync();
+    }
+
+    var reopened = try VersionSet.open(allocator, tmp.dir);
+    defer reopened.state.deinit();
+    defer reopened.set.close();
+    try std.testing.expectEqual(@as(usize, 1), reopened.state.count());
+    try std.testing.expectEqual(@as(usize, 0), reopened.state.get(7).?);
+}
+
+test "logAndApply persists nextFileId and nextSeq counters across reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var opened = try VersionSet.open(allocator, tmp.dir);
+        defer opened.state.deinit();
+        defer opened.set.close();
+        try std.testing.expectEqual(@as(?u64, null), opened.set.counters.nextFileId);
+
+        var edit = VersionEdit.init(allocator);
+        defer edit.deinit();
+        try edit.addFile(1, 0);
+        edit.setNextFileId(2);
+        edit.setNextSeq(500);
+        try opened.set.logAndApply(&edit, &opened.state);
+
+        try std.testing.expectEqual(@as(?u64, 2), opened.set.counters.nextFileId);
+        try std.testing.expectEqual(@as(?u64, 500), opened.set.counters.nextSeq);
+    }
+
+    var reopened = try VersionSet.open(allocator, tmp.dir);
+    defer reopened.state.deinit();
+    defer reopened.set.close();
+    try std.testing.expectEqual(@as(?u64, 2), reopened.set.counters.nextFileId);
+    try std.testing.expectEqual(@as(?u64, 500), reopened.set.counters.nextSeq);
+}
+
+test "counters survive manifest rotation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var lastId: u64 = 0;
+    {
+        var opened = try VersionSet.open(allocator, tmp.dir);
+        defer opened.state.deinit();
+        defer opened.set.close();
+
+        var fileId: u64 = 1;
+        {
+            var edit = VersionEdit.init(allocator);
+            defer edit.deinit();
+            try edit.addFile(fileId, 0);
+            edit.setNextFileId(fileId + 1);
+            edit.setNextSeq(10);
+            try opened.set.logAndApply(&edit, &opened.state);
+        }
+        // Force rotation the same way the existing rotation test does, each
+        // round bumping the seq counter so the final persisted value is
+        // distinguishable from an earlier one if rotation dropped it.
+        var n: usize = 0;
+        while (n < 20) : (n += 1) {
+            var edit = VersionEdit.init(allocator);
+            defer edit.deinit();
+            try edit.deleteFile(fileId);
+            fileId += 1;
+            try edit.addFile(fileId, 0);
+            edit.setNextFileId(fileId + 1);
+            edit.setNextSeq(10 + n + 1);
+            try opened.set.logAndApply(&edit, &opened.state);
+        }
+        lastId = opened.set.manifestId;
+        try std.testing.expectEqual(@as(?u64, fileId + 1), opened.set.counters.nextFileId);
+        try std.testing.expectEqual(@as(?u64, 30), opened.set.counters.nextSeq);
+    }
+    try std.testing.expect(lastId > 1);
+
+    var reopened = try VersionSet.open(allocator, tmp.dir);
+    defer reopened.state.deinit();
+    defer reopened.set.close();
+    try std.testing.expectEqual(@as(?u64, 30), reopened.set.counters.nextSeq);
+}
+
+test "missing CURRENT after previous run bootstraps fresh, empty state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var opened = try VersionSet.open(allocator, tmp.dir);
+        defer opened.state.deinit();
+        defer opened.set.close();
+        var edit = VersionEdit.init(allocator);
+        defer edit.deinit();
+        try edit.addFile(1, 0);
+        try opened.set.logAndApply(&edit, &opened.state);
+    }
+
+    try tmp.dir.deleteFile(currentName);
+
+    var reopened = try VersionSet.open(allocator, tmp.dir);
+    defer reopened.state.deinit();
+    defer reopened.set.close();
+    try std.testing.expectEqual(@as(usize, 0), reopened.state.count());
+}

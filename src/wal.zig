@@ -165,6 +165,102 @@ fn applyFrame(memtable: *Memtable, body: []const u8) !u64 {
     return seq;
 }
 
+const genFileName = "wal.gen";
+const genTmpName = "wal.gen.tmp";
+const genMagic = "CGEN";
+const genRecordLen = 4 + 8 + 4;
+
+pub const GenerationError = error{ BadMagic, Truncated, Corrupt };
+
+/// Reads the WAL's current generation counter from a db directory, next to
+/// wal.log itself. Returns 0 (not an error) if the generation file has never
+/// been written - a db that has never truncated its WAL is, by definition,
+/// still on generation 0, the same value any tailer starts at.
+pub fn currentGeneration(dir: std.fs.Dir) !u64 {
+    var buf: [genRecordLen]u8 = undefined;
+    const file = dir.openFile(genFileName, .{}) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer file.close();
+    const n = try file.readAll(&buf);
+    if (n != genRecordLen) return GenerationError.Truncated;
+    if (!std.mem.eql(u8, buf[0..4], genMagic)) return GenerationError.BadMagic;
+    const gen = encode.readU64(&buf, 4);
+    const storedCrc = encode.readU32(&buf, 12);
+    if (encode.crc(buf[0..12]) != storedCrc) return GenerationError.Corrupt;
+    return gen;
+}
+
+/// Bumps and atomically persists the WAL generation counter. Called once per
+/// truncation (see reset(), invoked from Db.flush()) so a tailer that reads
+/// this stamp can tell "same WAL contents since I last looked" from "primary
+/// truncated, and may have already regrown past whatever byte offset I had"
+/// from an explicit marker instead of a byte-size heuristic - a pure
+/// endPos-vs-offset comparison is fooled exactly when the post-truncation
+/// file reaches or exceeds the old offset before the next poll.
+pub fn bumpGeneration(dir: std.fs.Dir) !u64 {
+    const gen = (try currentGeneration(dir)) + 1;
+    var buf: [genRecordLen]u8 = undefined;
+    @memcpy(buf[0..4], genMagic);
+    std.mem.writeInt(u64, buf[4..12], gen, encode.endian);
+    std.mem.writeInt(u32, buf[12..16], encode.crc(buf[0..12]), encode.endian);
+    {
+        const file = try dir.createFile(genTmpName, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(&buf);
+        try file.sync();
+    }
+    try dir.rename(genTmpName, genFileName);
+    return gen;
+}
+
+test "currentGeneration is 0 before any bump" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectEqual(@as(u64, 0), try currentGeneration(tmp.dir));
+}
+
+test "bumpGeneration increments and persists across reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std.testing.expectEqual(@as(u64, 1), try bumpGeneration(tmp.dir));
+    try std.testing.expectEqual(@as(u64, 2), try bumpGeneration(tmp.dir));
+    try std.testing.expectEqual(@as(u64, 3), try bumpGeneration(tmp.dir));
+    try std.testing.expectEqual(@as(u64, 3), try currentGeneration(tmp.dir));
+}
+
+test "currentGeneration rejects a corrupted generation file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    _ = try bumpGeneration(tmp.dir);
+
+    const file = try tmp.dir.openFile(genFileName, .{ .mode = .read_write });
+    defer file.close();
+    try file.seekTo(4);
+    try file.writeAll(&[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF });
+
+    try std.testing.expectError(GenerationError.Corrupt, currentGeneration(tmp.dir));
+}
+
+test "Wal.reset does not itself touch the generation counter" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var wal = try Wal.open(allocator, tmp.dir, "wal.log");
+    defer wal.close();
+    try wal.append(.value, 1, "k", "v");
+    try wal.reset();
+
+    // reset() only truncates the WAL file itself - generation bumping is a
+    // separate, explicit call made by Db.flush() at the same call site, kept
+    // out of Wal so tests exercising reset() in isolation (elsewhere in this
+    // file) do not need a directory-wide side effect they never asked for.
+    try std.testing.expectEqual(@as(u64, 0), try currentGeneration(tmp.dir));
+}
+
 test "wal append and replay" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
