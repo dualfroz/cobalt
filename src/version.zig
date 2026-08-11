@@ -154,3 +154,322 @@ pub const VersionSet = struct {
         const data = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
         defer allocator.free(data);
 
+        var pos: usize = 0;
+        var goodEnd: usize = 0;
+        var records: usize = 0;
+        var counters = Counters{};
+        while (pos + 8 <= data.len) {
+            const storedCrc = encode.readU32(data, pos);
+            const bodyStart = pos + 4;
+            const bodyLen = recordBodyLen(data, bodyStart) orelse break;
+            if (bodyStart + bodyLen > data.len) break;
+            const body = data[bodyStart .. bodyStart + bodyLen];
+            if (encode.crc(body) != storedCrc) break;
+
+            try replayRecord(&state, &counters, body);
+            records += 1;
+            pos = bodyStart + bodyLen;
+            goodEnd = pos;
+        }
+
+        if (goodEnd != data.len) {
+            try file.setEndPos(goodEnd);
+            try file.sync();
+        }
+        try file.seekFromEnd(0);
+
+        return .{
+            .set = .{
+                .allocator = allocator,
+                .dir = dir,
+                .file = file,
+                .manifestId = id,
+                .pendingRecords = records,
+                .counters = counters,
+            },
+            .state = state,
+        };
+    }
+
+    fn bootstrap(allocator: Allocator, dir: std.fs.Dir) !VersionSet {
+        var nameBuf: [64]u8 = undefined;
+        const name = try manifestFileName(&nameBuf, 1);
+        const file = try dir.createFile(name, .{ .read = true, .truncate = true });
+        errdefer file.close();
+        try writeCurrent(dir, name);
+        return .{
+            .allocator = allocator,
+            .dir = dir,
+            .file = file,
+            .manifestId = 1,
+            .pendingRecords = 0,
+            .counters = .{},
+        };
+    }
+
+    pub fn close(self: *VersionSet) void {
+        self.file.close();
+    }
+
+    /// Applies `edit` to `state` and durably appends it to the manifest
+    /// log. Rotates (compacts the log to a single snapshot record) once
+    /// the number of pending records grows past the live file count.
+    pub fn logAndApply(self: *VersionSet, edit: *const VersionEdit, state: *std.AutoHashMap(u64, usize)) !void {
+        if (edit.isEmpty()) return;
+        try applyEdit(state, edit.added.items, edit.deleted.items);
+        if (edit.nextFileId) |v| self.counters.nextFileId = v;
+        if (edit.nextSeq) |v| self.counters.nextSeq = v;
+        try self.appendRecord(edit);
+        self.pendingRecords += 1;
+
+        const liveCount = state.count();
+        if (self.pendingRecords > @max(liveCount, 4) * 2) {
+            try self.rotate(state);
+        }
+    }
+
+    fn appendRecord(self: *VersionSet, edit: *const VersionEdit) !void {
+        var body = std.ArrayList(u8).init(self.allocator);
+        defer body.deinit();
+        try edit.encode_(&body);
+
+        var frame = std.ArrayList(u8).init(self.allocator);
+        defer frame.deinit();
+        const frameWriter = encode.ByteWriter.init(&frame);
+        try frameWriter.putU32(encode.crc(body.items));
+        try frameWriter.slice(body.items);
+
+        try self.file.seekFromEnd(0);
+        try self.file.writeAll(frame.items);
+        try self.file.sync();
+    }
+
+    /// Replaces the whole log history with a single snapshot record that
+    /// reproduces the current live state, then switches CURRENT to it and
+    /// deletes the old log. Bounds manifest size to O(live files) instead
+    /// of O(edits ever applied).
+    fn rotate(self: *VersionSet, state: *const std.AutoHashMap(u64, usize)) !void {
+        var snapshot = std.ArrayList(FileEdit).init(self.allocator);
+        defer snapshot.deinit();
+        var it = state.iterator();
+        while (it.next()) |entry| {
+            try snapshot.append(.{ .fileId = entry.key_ptr.*, .level = @intCast(entry.value_ptr.*) });
+        }
+
+        const newId = self.manifestId + 1;
+        var nameBuf: [64]u8 = undefined;
+        const newName = try manifestFileName(&nameBuf, newId);
+
+        const newFile = try self.dir.createFile(newName, .{ .read = true, .truncate = true });
+        errdefer newFile.close();
+
+        {
+            var body = std.ArrayList(u8).init(self.allocator);
+            defer body.deinit();
+            const writer = encode.ByteWriter.init(&body);
+            try writer.putU32(@intCast(snapshot.items.len));
+            for (snapshot.items) |f| {
+                try writer.putU64(f.fileId);
+                try writer.putU32(f.level);
+            }
+            try writer.putU32(0);
+            // Carry the latest known counters forward into the snapshot so
+            // they survive rotation even though the edits that originally
+            // set them are being discarded along with the old log.
+            try writer.byte(if (self.counters.nextFileId != null) 1 else 0);
+            if (self.counters.nextFileId) |v| try writer.putU64(v);
+            try writer.byte(if (self.counters.nextSeq != null) 1 else 0);
+            if (self.counters.nextSeq) |v| try writer.putU64(v);
+
+            var frame = std.ArrayList(u8).init(self.allocator);
+            defer frame.deinit();
+            const frameWriter = encode.ByteWriter.init(&frame);
+            try frameWriter.putU32(encode.crc(body.items));
+            try frameWriter.slice(body.items);
+            try newFile.writeAll(frame.items);
+            try newFile.sync();
+        }
+
+        try writeCurrent(self.dir, newName);
+
+        var oldNameBuf: [64]u8 = undefined;
+        const oldName = try manifestFileName(&oldNameBuf, self.manifestId);
+        self.file.close();
+        self.dir.deleteFile(oldName) catch {};
+
+        self.file = newFile;
+        self.manifestId = newId;
+        self.pendingRecords = snapshot.items.len;
+    }
+};
+
+fn writeCurrent(dir: std.fs.Dir, manifestName: []const u8) !void {
+    const tmpName = "CURRENT.tmp";
+    {
+        const file = try dir.createFile(tmpName, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(manifestName);
+        try file.sync();
+    }
+    try dir.rename(tmpName, currentName);
+}
+
+fn parseManifestId(name: []const u8) ?u64 {
+    if (!std.mem.startsWith(u8, name, manifestPrefix)) return null;
+    return std.fmt.parseInt(u64, name[manifestPrefix.len..], 10) catch null;
+}
+
+fn recordBodyLen(data: []const u8, bodyStart: usize) ?usize {
+    if (bodyStart + 4 > data.len) return null;
+    const addedCount = encode.readU32(data, bodyStart);
+    var p = bodyStart + 4;
+    var i: u32 = 0;
+    while (i < addedCount) : (i += 1) {
+        if (p + 12 > data.len) return null;
+        p += 12;
+    }
+    if (p + 4 > data.len) return null;
+    const deletedCount = encode.readU32(data, p);
+    p += 4;
+    var j: u32 = 0;
+    while (j < deletedCount) : (j += 1) {
+        if (p + 8 > data.len) return null;
+        p += 8;
+    }
+    // Trailing counter watermarks: one presence flag byte plus an optional
+    // u64 each, for nextFileId then nextSeq.
+    var k: u32 = 0;
+    while (k < 2) : (k += 1) {
+        if (p + 1 > data.len) return null;
+        const present = data[p];
+        p += 1;
+        if (present != 0) {
+            if (p + 8 > data.len) return null;
+            p += 8;
+        }
+    }
+    return p - bodyStart;
+}
+
+fn replayRecord(state: *std.AutoHashMap(u64, usize), counters: *Counters, body: []const u8) !void {
+    const addedCount = encode.readU32(body, 0);
+    var p: usize = 4;
+    var i: u32 = 0;
+    while (i < addedCount) : (i += 1) {
+        const fileId = encode.readU64(body, p);
+        const level = encode.readU32(body, p + 8);
+        try state.put(fileId, level);
+        p += 12;
+    }
+    const deletedCount = encode.readU32(body, p);
+    p += 4;
+    var j: u32 = 0;
+    while (j < deletedCount) : (j += 1) {
+        const fileId = encode.readU64(body, p);
+        _ = state.remove(fileId);
+        p += 8;
+    }
+    if (p < body.len) {
+        const hasNextFileId = body[p];
+        p += 1;
+        if (hasNextFileId != 0) {
+            counters.nextFileId = encode.readU64(body, p);
+            p += 8;
+        }
+        const hasNextSeq = body[p];
+        p += 1;
+        if (hasNextSeq != 0) {
+            counters.nextSeq = encode.readU64(body, p);
+            p += 8;
+        }
+    }
+}
+
+test "fresh directory bootstraps an empty version set" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var opened = try VersionSet.open(allocator, tmp.dir);
+    defer opened.state.deinit();
+    defer opened.set.close();
+
+    try std.testing.expectEqual(@as(usize, 0), opened.state.count());
+    try std.testing.expectEqual(@as(u64, 1), opened.set.manifestId);
+    try std.testing.expect(tmp.dir.access(currentName, .{}) != error.FileNotFound);
+}
+
+test "logAndApply records adds and survives reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var opened = try VersionSet.open(allocator, tmp.dir);
+        defer opened.state.deinit();
+        defer opened.set.close();
+
+        var edit = VersionEdit.init(allocator);
+        defer edit.deinit();
+        try edit.addFile(1, 0);
+        try edit.addFile(2, 0);
+        try opened.set.logAndApply(&edit, &opened.state);
+
+        try std.testing.expectEqual(@as(usize, 2), opened.state.count());
+        try std.testing.expectEqual(@as(usize, 0), opened.state.get(1).?);
+    }
+
+    var reopened = try VersionSet.open(allocator, tmp.dir);
+    defer reopened.state.deinit();
+    defer reopened.set.close();
+    try std.testing.expectEqual(@as(usize, 2), reopened.state.count());
+    try std.testing.expectEqual(@as(usize, 0), reopened.state.get(2).?);
+}
+
+test "logAndApply replaces a deleted file with new outputs (compaction pattern)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var opened = try VersionSet.open(allocator, tmp.dir);
+    defer opened.state.deinit();
+    defer opened.set.close();
+
+    var e1 = VersionEdit.init(allocator);
+    defer e1.deinit();
+    try e1.addFile(1, 0);
+    try e1.addFile(2, 0);
+    try opened.set.logAndApply(&e1, &opened.state);
+
+    var e2 = VersionEdit.init(allocator);
+    defer e2.deinit();
+    try e2.deleteFile(1);
+    try e2.deleteFile(2);
+    try e2.addFile(3, 1);
+    try opened.set.logAndApply(&e2, &opened.state);
+
+    try std.testing.expectEqual(@as(usize, 1), opened.state.count());
+    try std.testing.expectEqual(@as(usize, 1), opened.state.get(3).?);
+    try std.testing.expectEqual(@as(?usize, null), opened.state.get(1));
+}
+
+test "manifest rotates once pending records outgrow live file count" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var opened = try VersionSet.open(allocator, tmp.dir);
+    defer opened.state.deinit();
+    defer opened.set.close();
+
+    // Simulate steady-state leveled compaction: the live file count stays
+    // fixed at 1 (each round replaces the previous output), but the edit
+    // log keeps growing until it is worth rotating to a fresh snapshot.
+    var fileId: u64 = 1;
+    {
+        var edit = VersionEdit.init(allocator);
+        defer edit.deinit();
+        try edit.addFile(fileId, 0);
+        try opened.set.logAndApply(&edit, &opened.state);
+    }
+
