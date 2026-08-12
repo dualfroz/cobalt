@@ -152,3 +152,342 @@ fn isFrameValue(kind: WindowKind) bool {
     return kind == .first_value or kind == .last_value or kind == .nth_value;
 }
 
+/// The row field name a `compute()` result column is exposed under (e.g.
+/// for CLI/protocol output) - bare `WindowKind` name for the ranking family
+/// and for `count`'s `COUNT(*)` form (`field.len == 0`), otherwise
+/// `"kind_field"`. Format-identical to `aggregate.zig`'s `specLabel`.
+pub fn specLabel(allocator: Allocator, spec: WindowSpec) Allocator.Error![]u8 {
+    if (spec.field.len == 0) return allocator.dupe(u8, @tagName(spec.kind));
+    return std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(spec.kind), spec.field });
+}
+
+/// Streaming per-row accumulator for the running-aggregate family
+/// (`sum`/`avg`/`count`/`min`/`max`). Mirrors `aggregate.zig`'s `AccState`
+/// (same int-exact/float-fallback dual for `sum`/`avg`, same
+/// compare-and-replace for `min`/`max`), minus `count_distinct` (out of
+/// scope here - a running "distinct count so far" is a real SQL feature but
+/// a separate piece of work). The key behavioral difference from
+/// `AccState.take()`: `snapshot()` does NOT transfer ownership of
+/// `minv`/`maxv` out of the accumulator, because a running window emits a
+/// result after EVERY row, not once at the very end - the accumulator must
+/// keep its own copy alive for the next row's snapshot too.
+const RunningAcc = struct {
+    kind: WindowKind,
+    field: []const u8,
+    n: u64 = 0,
+    sumInt: i64 = 0,
+    sumFloat: f64 = 0,
+    allInt: bool = true,
+    minv: ?Value = null,
+    maxv: ?Value = null,
+    /// `.count_distinct` only: encoded-`Value` bytes seen so far, one entry
+    /// per distinct value - same encode-as-hashmap-key trick
+    /// `aggregate.zig`'s `AccState.distinct` uses. Unlike that GROUP BY
+    /// counterpart, `snapshot()` below never drains this (a running window
+    /// needs the set to keep growing across the WHOLE partition walk, not
+    /// just until one final result) - only `deinit` ever frees it.
+    distinct: std.StringHashMapUnmanaged(void) = .{},
+
+    fn observe(self: *RunningAcc, allocator: Allocator, row: *const Row) WindowError!void {
+        switch (self.kind) {
+            .count => {
+                if (self.field.len == 0 or row.get(self.field) != null) self.n += 1;
+            },
+            .count_distinct => {
+                const v = row.get(self.field) orelse return;
+                const key = try rowmod.encodeValue(allocator, v);
+                const res = try self.distinct.getOrPut(allocator, key);
+                if (res.found_existing) allocator.free(key);
+            },
+            .sum, .avg => {
+                const v = row.get(self.field) orelse return;
+                switch (v) {
+                    .int => |i| {
+                        if (self.allInt) {
+                            self.sumInt = std.math.add(i64, self.sumInt, i) catch return error.Overflow;
+                        } else {
+                            self.sumFloat += @floatFromInt(i);
+                        }
+                    },
+                    .float => |f| {
+                        if (self.allInt) {
+                            // First float observed after an int-only run:
+                            // migrate the exact integer sum so far into the
+                            // float accumulator once, then continue in float.
+                            self.sumFloat = @floatFromInt(self.sumInt);
+                            self.allInt = false;
+                        }
+                        self.sumFloat += f;
+                    },
+                    else => return error.NonNumericField,
+                }
+                self.n += 1;
+            },
+            .min => {
+                const v = row.get(self.field) orelse return;
+                if (self.minv == null or rowmod.compare(v, self.minv.?) == .lt) {
+                    if (self.minv) |old| old.free(allocator);
+                    self.minv = try v.dupe(allocator);
+                }
+            },
+            .max => {
+                const v = row.get(self.field) orelse return;
+                if (self.maxv == null or rowmod.compare(v, self.maxv.?) == .gt) {
+                    if (self.maxv) |old| old.free(allocator);
+                    self.maxv = try v.dupe(allocator);
+                }
+            },
+            .row_number, .rank, .dense_rank, .lag, .lead, .first_value, .last_value, .nth_value => unreachable,
+        }
+    }
+
+    /// Returns the accumulator's CURRENT state as a freshly owned `Value`
+    /// (a dupe for `min`/`max`, since the accumulator keeps its own copy
+    /// alive for subsequent rows - see the type doc comment above).
+    /// `.count_distinct` is likewise non-draining - `self.distinct.count()`
+    /// is read, never emptied, so the NEXT row's snapshot still sees every
+    /// value observed so far (only `deinit` ever frees the set).
+    fn snapshot(self: *const RunningAcc, allocator: Allocator) Allocator.Error!Value {
+        return switch (self.kind) {
+            .count => .{ .int = @intCast(self.n) },
+            .count_distinct => .{ .int = @intCast(self.distinct.count()) },
+            .sum => if (self.allInt) .{ .int = self.sumInt } else .{ .float = self.sumFloat },
+            .avg => blk: {
+                if (self.n == 0) break :blk .{ .none = {} };
+                const total: f64 = if (self.allInt) @floatFromInt(self.sumInt) else self.sumFloat;
+                break :blk .{ .float = total / @as(f64, @floatFromInt(self.n)) };
+            },
+            .min => if (self.minv) |v| try v.dupe(allocator) else .{ .none = {} },
+            .max => if (self.maxv) |v| try v.dupe(allocator) else .{ .none = {} },
+            .row_number, .rank, .dense_rank, .lag, .lead, .first_value, .last_value, .nth_value => unreachable,
+        };
+    }
+
+    fn deinit(self: *RunningAcc, allocator: Allocator) void {
+        if (self.minv) |v| v.free(allocator);
+        if (self.maxv) |v| v.free(allocator);
+        var it = self.distinct.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        self.distinct.deinit(allocator);
+    }
+};
+
+/// Groups row indices `0..rows.len` by `partitionBy` (empty = a single
+/// partition covering every row), preserving first-seen partition order -
+/// the window-function analogue of `aggregate.zig`'s `GroupBy` grouping,
+/// except every member index is kept instead of collapsed into one result.
+/// Multi-column partition keys are built with `row.appendOrdered`
+/// (concatenation-safe and unambiguous by construction), the same
+/// primitive `index.zig` uses for composite index keys - a row missing one
+/// of the `partitionBy` fields contributes `.none` for that column rather
+/// than being excluded (unlike `aggregate.zig`'s GROUP BY, which drops rows
+/// missing the group field entirely: a window function must still annotate
+/// every input row with SOME result, so there is no row to drop it from).
+/// Caller owns the returned slice of slices AND each inner slice
+/// (`allocator.free` each inner slice, then the outer one).
+fn buildPartitions(allocator: Allocator, rows: []const Row, partitionBy: []const []const u8) Allocator.Error![][]usize {
+    var order: std.ArrayListUnmanaged([]const u8) = .{};
+    defer {
+        for (order.items) |k| allocator.free(k);
+        order.deinit(allocator);
+    }
+    var map: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .{};
+    defer {
+        var it = map.iterator();
+        while (it.next()) |e| e.value_ptr.deinit(allocator);
+        map.deinit(allocator);
+    }
+
+    for (rows, 0..) |*r, i| {
+        var keyBuf = std.ArrayList(u8).init(allocator);
+        defer keyBuf.deinit();
+        for (partitionBy) |f| {
+            const v = r.get(f) orelse Value{ .none = {} };
+            try rowmod.appendOrdered(&keyBuf, v);
+        }
+
+        if (map.getPtr(keyBuf.items)) |list| {
+            try list.append(allocator, i);
+            continue;
+        }
+        const key = try allocator.dupe(u8, keyBuf.items);
+        errdefer allocator.free(key);
+        var list: std.ArrayListUnmanaged(usize) = .{};
+        errdefer list.deinit(allocator);
+        try list.append(allocator, i);
+        // `map.putAssumeCapacity`/`order.appendAssumeCapacity` below are
+        // INFALLIBLE (capacity reserved just above) and back to back with
+        // no fallible statement between them - a bug caught by
+        // `computeMany`'s exhaustive OOM sweep test: with plain fallible
+        // `map.put` then `order.append`, a failure in `order.append` AFTER
+        // `map.put` already succeeded left `key`/`list` reachable from BOTH
+        // this iteration's still-armed `errdefer list.deinit(allocator)`
+        // AND the function-level `map` cleanup `defer` above (which iterates
+        // every entry, including the one just inserted) - both would then
+        // free the SAME `list` backing array. Reserving capacity for both
+        // `map` and `order` up front and using the assume-capacity variants
+        // means nothing fallible can happen between the two inserts, so
+        // there is no window for a failure to leave `key`/`list` owned by
+        // one structure while their local errdefers are still armed.
+        try map.ensureUnusedCapacity(allocator, 1);
+        try order.ensureUnusedCapacity(allocator, 1);
+        map.putAssumeCapacity(key, list);
+        order.appendAssumeCapacity(key);
+    }
+
+    const result = try allocator.alloc([]usize, order.items.len);
+    var filled: usize = 0;
+    errdefer {
+        for (result[0..filled]) |p| allocator.free(p);
+        allocator.free(result);
+    }
+    for (order.items, 0..) |key, idx| {
+        const list = map.getPtr(key).?;
+        result[idx] = try list.toOwnedSlice(allocator);
+        filled += 1;
+    }
+    return result;
+}
+
+/// Stable in-place sort of a partition's row INDICES by `orderBy` - the
+/// window-function analogue of `query.zig`'s `sortRowsBy`/`aggregate.zig`'s
+/// `sortGroupsBy`, but sorting `usize` indices into `rows` rather than the
+/// rows themselves (so the caller's row order and `results`' index
+/// alignment are never disturbed). `orderBy.len == 0` is a no-op, leaving
+/// `indices` in first-seen (input) order.
+fn sortPartitionByOrder(rows: []const Row, indices: []usize, orderBy: []const querymod.OrderBy) void {
+    if (orderBy.len == 0) return;
+    const Ctx = struct {
+        rows: []const Row,
+        orderBy: []const querymod.OrderBy,
+
+        fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+            for (ctx.orderBy) |ob| {
+                const av = ctx.rows[a].get(ob.field) orelse Value{ .none = {} };
+                const bv = ctx.rows[b].get(ob.field) orelse Value{ .none = {} };
+                const cmp = rowmod.compare(av, bv);
+                if (cmp == .eq) continue;
+                return if (ob.descending) cmp == .gt else cmp == .lt;
+            }
+            return false;
+        }
+    };
+    std.sort.block(usize, indices, Ctx{ .rows = rows, .orderBy = orderBy }, Ctx.lessThan);
+}
+
+/// Whether `rows[curIdx]` ties `rows[prevIdx]` on every `orderBy` column -
+/// the tie-group boundary `rank`/`dense_rank` need to decide whether to
+/// advance. Only meaningful once `indices` has already been sorted by the
+/// same `orderBy`.
+fn tiesWithPrev(rows: []const Row, orderBy: []const querymod.OrderBy, prevIdx: usize, curIdx: usize) bool {
+    for (orderBy) |ob| {
+        const av = rows[curIdx].get(ob.field) orelse Value{ .none = {} };
+        const bv = rows[prevIdx].get(ob.field) orelse Value{ .none = {} };
+        if (rowmod.compare(av, bv) != .eq) return false;
+    }
+    return true;
+}
+
+/// `buildPartitions` followed by sorting every partition in place by
+/// `orderBy` - the shared prep step `compute()` and `orderedIndices()` both
+/// need, factored out so the flattened display order `orderedIndices`
+/// exposes is GUARANTEED to match the partition walk `compute()` uses
+/// internally (computed once, not two independently-written sorts that
+/// could drift apart).
+fn partitionedAndSorted(allocator: Allocator, rows: []const Row, partitionBy: []const []const u8, orderBy: []const querymod.OrderBy) Allocator.Error![][]usize {
+    const partitions = try buildPartitions(allocator, rows, partitionBy);
+    for (partitions) |indices| sortPartitionByOrder(rows, indices, orderBy);
+    return partitions;
+}
+
+/// Returns the row-index walk order `compute()` uses internally, flattened:
+/// every partition's member indices (each sorted by `orderBy`), partitions
+/// concatenated in first-seen order. `compute()`'s own results stay aligned
+/// to `rows`' ORIGINAL order regardless of this - this exists for callers
+/// (namely `table window`'s CLI) that want to PAGE or DISPLAY results in
+/// the same order the window computation itself walked, rather than raw
+/// scan order, which is what plain `[start..end]` slicing of `rows` would
+/// give instead. Caller owns the returned slice.
+pub fn orderedIndices(allocator: Allocator, rows: []const Row, partitionBy: []const []const u8, orderBy: []const querymod.OrderBy) Allocator.Error![]usize {
+    const partitions = try partitionedAndSorted(allocator, rows, partitionBy, orderBy);
+    defer {
+        for (partitions) |p| allocator.free(p);
+        allocator.free(partitions);
+    }
+    const out = try allocator.alloc(usize, rows.len);
+    var pos: usize = 0;
+    for (partitions) |indices| {
+        @memcpy(out[pos..][0..indices.len], indices);
+        pos += indices.len;
+    }
+    return out;
+}
+
+/// Computes one window-function result `Value` per input row, returned in
+/// the SAME order as `rows` (never reorders the caller's data) - the window
+/// counterpart of `aggregate.zig`'s `run`, which collapses rows into one
+/// per group instead of annotating every one. `partitionBy` splits `rows`
+/// into independent groups exactly like GROUP BY (first-seen order, empty
+/// = a single partition covering every row); `orderBy` decides the
+/// ranking/running-total walk WITHIN each partition.
+///
+/// Frame semantics follow standard SQL defaults, decided entirely by
+/// whether `orderBy` is empty:
+///   - `orderBy.len == 0`: `rank`/`dense_rank` treat the whole partition as
+///     one tie (every row gets 1); `row_number` still assigns 1..n in
+///     first-seen order, since it needs no ordering key to number rows.
+///     The running-aggregate family uses the whole-partition frame
+///     (`UNBOUNDED PRECEDING .. UNBOUNDED FOLLOWING`) - every row in the
+///     partition sees the SAME final total, mirroring `SUM(x) OVER
+///     (PARTITION BY p)` with no `ORDER BY` inside the `OVER` clause.
+///   - `orderBy.len > 0`: `frame` picks the running-aggregate family's frame
+///     along the sorted sequence. `.rows` walks one physical row at a time
+///     (`ROWS UNBOUNDED PRECEDING .. CURRENT ROW`) - every row gets its own
+///     individual running value, even a row tied with its predecessor.
+///     `.range` (SQL's actual default, `RANGE UNBOUNDED PRECEDING ..
+///     CURRENT ROW`) instead advances the accumulator by a whole tie group
+///     at once and stamps every row in that group with the SAME value (the
+///     group's combined total, not each member's own position within it) -
+///     the same tie test `rank`/`dense_rank` already use
+///     (`tiesWithPrev`), just driving accumulation instead of a rank
+///     counter. `frame` is ignored (both variants agree) when `orderBy` is
+///     empty, and rejected outright (`error.RangeNotApplicable`) for the
+///     ranking family - see `WindowError.RangeNotApplicable`.
+///
+/// `lag`/`lead` (`spec.offset`/`spec.default`) ignore `frame` entirely (also
+/// `error.RangeNotApplicable` under `.range`, same as the ranking family -
+/// SQL does not accept a frame clause on either) and read a fixed physical
+/// position `spec.offset` rows before (`lag`) or after (`lead`) each row
+/// within the sorted partition sequence (first-seen order when `orderBy` is
+/// empty) - unlike the running-aggregate family, a tie on `orderBy` does NOT
+/// collapse two rows into one lookup target; each remains its own distinct
+/// position. A row whose target position falls outside the partition gets
+/// `spec.default` (SQL NULL, `.none`, unless the caller set one).
+///
+/// `first_value`/`last_value` DO respect `frame`, unlike `lag`/`lead`: the
+/// frame's start is always the partition's first row regardless of
+/// `FrameMode` (so `first_value` is constant across a whole partition), but
+/// the frame's END for `last_value` follows the running-aggregate family's
+/// same split - `.rows` ends the frame at the CURRENT row (so `last_value`
+/// degenerates to that row's own field, SQL's well-known gotcha), `.range`
+/// ends it at the current row's whole tie group, and no `orderBy` at all
+/// means the whole-partition frame (so `last_value` is the last row in
+/// first-seen order, same value for every row). Requires `field` like the
+/// running-aggregate family (`error.MissingField` if omitted).
+///
+/// `nth_value` shares that same frame (start/end identical to
+/// `first_value`/`last_value`) but reads the `spec.offset`-th row (1-based)
+/// counted from the frame's start rather than always the first or always the
+/// last; a position past the frame's current end gets `spec.default`.
+///
+/// Caller owns the returned slice; free each `Value` (`.free(allocator)`)
+/// and the slice itself, or call `freeResults`.
+pub fn compute(allocator: Allocator, rows: []const Row, partitionBy: []const []const u8, orderBy: []const querymod.OrderBy, spec: WindowSpec, frame: FrameMode) WindowError![]Value {
+    const partitions = try partitionedAndSorted(allocator, rows, partitionBy, orderBy);
+    defer {
+        for (partitions) |p| allocator.free(p);
+        allocator.free(partitions);
+    }
+    return computeOneSpec(allocator, rows, partitions, orderBy, spec, frame);
+}
+
