@@ -491,3 +491,175 @@ pub fn compute(allocator: Allocator, rows: []const Row, partitionBy: []const []c
     return computeOneSpec(allocator, rows, partitions, orderBy, spec, frame);
 }
 
+/// The single-`WindowSpec` body of `compute()`, factored out so
+/// `computeMany()` can run it once per spec against partitions it already
+/// built ONCE - the window-function counterpart of why `aggregate.zig`'s
+/// `GroupBy` groups rows once and folds every spec into the same pass,
+/// rather than re-grouping per spec. Takes already-partitioned-and-sorted
+/// row indices (`partitionedAndSorted`'s output) instead of building them
+/// itself.
+fn computeOneSpec(allocator: Allocator, rows: []const Row, partitions: []const []usize, orderBy: []const querymod.OrderBy, spec: WindowSpec, frame: FrameMode) WindowError![]Value {
+    if (!isRanking(spec.kind) and spec.kind != .count and spec.field.len == 0) return error.MissingField;
+    if (frame == .range and (isRanking(spec.kind) or isOffsetLookup(spec.kind))) return error.RangeNotApplicable;
+
+    const results = try allocator.alloc(Value, rows.len);
+    for (results) |*r| r.* = .{ .none = {} };
+    errdefer freeResults(allocator, results);
+
+    for (partitions) |indices| {
+        if (isRanking(spec.kind)) {
+            var rank: usize = 0;
+            var dense: usize = 0;
+            for (indices, 0..) |idx, pos| {
+                const tied = pos > 0 and (orderBy.len == 0 or tiesWithPrev(rows, orderBy, indices[pos - 1], idx));
+                switch (spec.kind) {
+                    .row_number => results[idx] = .{ .int = @intCast(pos + 1) },
+                    .rank => {
+                        if (pos == 0 or !tied) rank = pos + 1;
+                        results[idx] = .{ .int = @intCast(rank) };
+                    },
+                    .dense_rank => {
+                        if (pos == 0 or !tied) dense += 1;
+                        results[idx] = .{ .int = @intCast(dense) };
+                    },
+                    else => unreachable,
+                }
+            }
+            continue;
+        }
+
+        if (isOffsetLookup(spec.kind)) {
+            // Pure positional lookup along the sorted partition sequence -
+            // no accumulator, no tie handling (a row tied with its neighbor
+            // on `orderBy` is still a DISTINCT physical position for
+            // `lag`/`lead`, unlike the ranking family above).
+            const delta: i64 = @intCast(spec.offset);
+            for (indices, 0..) |idx, pos| {
+                const srcPos: i64 = @as(i64, @intCast(pos)) + (if (spec.kind == .lag) -delta else delta);
+                if (srcPos >= 0 and srcPos < @as(i64, @intCast(indices.len))) {
+                    const srcIdx = indices[@intCast(srcPos)];
+                    const v = rows[srcIdx].get(spec.field) orelse Value{ .none = {} };
+                    results[idx] = try v.dupe(allocator);
+                } else {
+                    results[idx] = try spec.default.dupe(allocator);
+                }
+            }
+            continue;
+        }
+
+        if (spec.kind == .nth_value) {
+            // Positional lookup within the CURRENT frame (start is always
+            // the partition's first row, end follows the same
+            // whole-partition/.rows/.range split `first_value`/`last_value`
+            // use below) - `n` counts from the frame's start, unlike
+            // `lag`/`lead`'s offset from the current row. `n < 1` never
+            // resolves (WindowSpec.offset defaults to 1, never 0, but a
+            // caller reaching this directly - e.g. over the wire - could
+            // still send 0).
+            if (indices.len == 0) continue;
+            const n = spec.offset;
+            if (orderBy.len == 0) {
+                const frameEnd: u64 = @intCast(indices.len - 1);
+                const v = if (n >= 1 and n - 1 <= frameEnd)
+                    rows[indices[@intCast(n - 1)]].get(spec.field) orelse Value{ .none = {} }
+                else
+                    spec.default;
+                for (indices) |idx| results[idx] = try v.dupe(allocator);
+            } else if (frame == .rows) {
+                for (indices, 0..) |idx, pos| {
+                    const frameEnd: u64 = @intCast(pos);
+                    const v = if (n >= 1 and n - 1 <= frameEnd)
+                        rows[indices[@intCast(n - 1)]].get(spec.field) orelse Value{ .none = {} }
+                    else
+                        spec.default;
+                    results[idx] = try v.dupe(allocator);
+                }
+            } else {
+                var pos: usize = 0;
+                while (pos < indices.len) {
+                    var end = pos + 1;
+                    while (end < indices.len and tiesWithPrev(rows, orderBy, indices[end - 1], indices[end])) : (end += 1) {}
+                    const frameEnd: u64 = @intCast(end - 1);
+                    const v = if (n >= 1 and n - 1 <= frameEnd)
+                        rows[indices[@intCast(n - 1)]].get(spec.field) orelse Value{ .none = {} }
+                    else
+                        spec.default;
+                    for (indices[pos..end]) |idx| results[idx] = try v.dupe(allocator);
+                    pos = end;
+                }
+            }
+            continue;
+        }
+
+        if (isFrameValue(spec.kind)) {
+            if (indices.len == 0) continue;
+            if (orderBy.len == 0) {
+                // Whole-partition frame: first/last row of the partition in
+                // first-seen order, same value stamped on every member.
+                const firstV = rows[indices[0]].get(spec.field) orelse Value{ .none = {} };
+                const lastV = rows[indices[indices.len - 1]].get(spec.field) orelse Value{ .none = {} };
+                const v = if (spec.kind == .first_value) firstV else lastV;
+                for (indices) |idx| results[idx] = try v.dupe(allocator);
+            } else if (frame == .rows) {
+                // ROWS frame: start is always the partition's first row;
+                // end is the CURRENT row (SQL's well-known LAST_VALUE
+                // surprise under the ROWS default).
+                const firstV = rows[indices[0]].get(spec.field) orelse Value{ .none = {} };
+                for (indices) |idx| {
+                    const v = if (spec.kind == .first_value) firstV else (rows[idx].get(spec.field) orelse Value{ .none = {} });
+                    results[idx] = try v.dupe(allocator);
+                }
+            } else {
+                // RANGE frame: end is the current row's whole tie group -
+                // every row in the group shares that group's LAST member's
+                // value, same tie-group walk the running-aggregate family's
+                // `.range` branch uses.
+                const firstV = rows[indices[0]].get(spec.field) orelse Value{ .none = {} };
+                var pos: usize = 0;
+                while (pos < indices.len) {
+                    var end = pos + 1;
+                    while (end < indices.len and tiesWithPrev(rows, orderBy, indices[end - 1], indices[end])) : (end += 1) {}
+                    const groupLastV = rows[indices[end - 1]].get(spec.field) orelse Value{ .none = {} };
+                    for (indices[pos..end]) |idx| {
+                        const v = if (spec.kind == .first_value) firstV else groupLastV;
+                        results[idx] = try v.dupe(allocator);
+                    }
+                    pos = end;
+                }
+            }
+            continue;
+        }
+
+        var acc = RunningAcc{ .kind = spec.kind, .field = spec.field };
+        defer acc.deinit(allocator);
+
+        if (orderBy.len == 0) {
+            // Whole-partition frame: accumulate everything first, THEN
+            // stamp the same final value onto every row in the partition.
+            for (indices) |idx| try acc.observe(allocator, &rows[idx]);
+            for (indices) |idx| results[idx] = try acc.snapshot(allocator);
+        } else if (frame == .rows) {
+            // ROWS frame: emit the accumulator's state after EACH row,
+            // walked in sorted order, even a row tied with its predecessor.
+            for (indices) |idx| {
+                try acc.observe(allocator, &rows[idx]);
+                results[idx] = try acc.snapshot(allocator);
+            }
+        } else {
+            // RANGE frame: advance the accumulator by a whole tie GROUP at
+            // once (same `tiesWithPrev` test the ranking family uses to
+            // find its own tie boundaries), then stamp every row in that
+            // group with the group's combined value - mirroring the
+            // whole-partition branch above, just re-run once per group
+            // instead of once for the whole partition.
+            var pos: usize = 0;
+            while (pos < indices.len) {
+                var end = pos + 1;
+                while (end < indices.len and tiesWithPrev(rows, orderBy, indices[end - 1], indices[end])) : (end += 1) {}
+                for (indices[pos..end]) |idx| try acc.observe(allocator, &rows[idx]);
+                for (indices[pos..end]) |idx| results[idx] = try acc.snapshot(allocator);
+                pos = end;
+            }
+        }
+    }
+
