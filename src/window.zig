@@ -819,3 +819,1404 @@ test "row_number restarts at 1 per partition" {
     const results = try compute(allocator, rows.items, &partition, &order, .{ .field = "", .kind = .row_number }, .rows);
     defer freeResults(allocator, results);
 
+    // warsaw: score 5 (idx0), score 1 (idx2) -> sorted asc: idx2=1st, idx0=2nd.
+    try std.testing.expectEqual(@as(i64, 2), results[0].int);
+    try std.testing.expectEqual(@as(i64, 1), results[2].int);
+    // krakow: score 9 (idx1), score 2 (idx3) -> sorted asc: idx3=1st, idx1=2nd.
+    try std.testing.expectEqual(@as(i64, 2), results[1].int);
+    try std.testing.expectEqual(@as(i64, 1), results[3].int);
+}
+
+test "rank skips over ties, dense_rank does not" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    // Scores: 10, 10, 20, 30, 30, 30 (already in ascending order so the
+    // sort is a no-op tie-preserving identity, keeping the expected
+    // positions easy to reason about).
+    const scores = [_]i64{ 10, 10, 20, 30, 30, 30 };
+    for (scores) |s| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "score", .value = .{ .int = s } },
+        }));
+    }
+
+    const order = [_]querymod.OrderBy{.{ .field = "score" }};
+
+    const ranks = try compute(allocator, rows.items, &.{}, &order, .{ .field = "", .kind = .rank }, .rows);
+    defer freeResults(allocator, ranks);
+    const expectedRank = [_]i64{ 1, 1, 3, 4, 4, 4 };
+    for (expectedRank, 0..) |want, i| try std.testing.expectEqual(want, ranks[i].int);
+
+    const dense = try compute(allocator, rows.items, &.{}, &order, .{ .field = "", .kind = .dense_rank }, .rows);
+    defer freeResults(allocator, dense);
+    const expectedDense = [_]i64{ 1, 1, 2, 3, 3, 3 };
+    for (expectedDense, 0..) |want, i| try std.testing.expectEqual(want, dense[i].int);
+}
+
+test "rank and dense_rank without ORDER BY: whole partition ties, every row is 1" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+
+    const ranks = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .rank }, .rows);
+    defer freeResults(allocator, ranks);
+    for (ranks) |r| try std.testing.expectEqual(@as(i64, 1), r.int);
+
+    const dense = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .dense_rank }, .rows);
+    defer freeResults(allocator, dense);
+    for (dense) |r| try std.testing.expectEqual(@as(i64, 1), r.int);
+
+    // row_number still needs no ORDER BY - just first-seen position.
+    const nums = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .row_number }, .rows);
+    defer freeResults(allocator, nums);
+    try std.testing.expectEqual(@as(i64, 1), nums[0].int);
+    try std.testing.expectEqual(@as(i64, 2), nums[1].int);
+    try std.testing.expectEqual(@as(i64, 3), nums[2].int);
+}
+
+test "running sum walks cumulatively in ORDER BY order, per partition" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    // warsaw, in input order: 100, 250 (already ascending by "day").
+    // krakow: 40.
+    const data = [_]struct { city: []const u8, day: i64, amount: i64 }{
+        .{ .city = "warsaw", .day = 1, .amount = 100 },
+        .{ .city = "krakow", .day = 1, .amount = 40 },
+        .{ .city = "warsaw", .day = 2, .amount = 250 },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "city", .value = .{ .text = d.city } },
+            .{ .name = "day", .value = .{ .int = d.day } },
+            .{ .name = "amount", .value = .{ .int = d.amount } },
+        }));
+    }
+
+    const partition = [_][]const u8{"city"};
+    const order = [_]querymod.OrderBy{.{ .field = "day" }};
+    const results = try compute(allocator, rows.items, &partition, &order, .{ .field = "amount", .kind = .sum }, .rows);
+    defer freeResults(allocator, results);
+
+    try std.testing.expectEqual(@as(i64, 100), results[0].int); // warsaw day1: running=100
+    try std.testing.expectEqual(@as(i64, 40), results[1].int); // krakow day1: running=40
+    try std.testing.expectEqual(@as(i64, 350), results[2].int); // warsaw day2: running=100+250
+}
+
+test "RANGE frame: rows tied on ORDER BY share the tie group's combined total, ROWS gives each its own" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    // One partition, ordered by "day": two rows tied at day=1 (10, 20),
+    // then one row at day=2 (5).
+    const data = [_]struct { day: i64, amount: i64 }{
+        .{ .day = 1, .amount = 10 },
+        .{ .day = 1, .amount = 20 },
+        .{ .day = 2, .amount = 5 },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "day", .value = .{ .int = d.day } },
+            .{ .name = "amount", .value = .{ .int = d.amount } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "day" }};
+
+    const rowsResult = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .sum }, .rows);
+    defer freeResults(allocator, rowsResult);
+    // ROWS: each physical row gets its own running total, even tied ones.
+    try std.testing.expectEqual(@as(i64, 10), rowsResult[0].int);
+    try std.testing.expectEqual(@as(i64, 30), rowsResult[1].int);
+    try std.testing.expectEqual(@as(i64, 35), rowsResult[2].int);
+
+    const rangeResult = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .sum }, .range);
+    defer freeResults(allocator, rangeResult);
+    // RANGE: both day=1 rows share the GROUP's combined total (10+20=30),
+    // not their own individual position within the tie; day=2 then adds 5.
+    try std.testing.expectEqual(@as(i64, 30), rangeResult[0].int);
+    try std.testing.expectEqual(@as(i64, 30), rangeResult[1].int);
+    try std.testing.expectEqual(@as(i64, 35), rangeResult[2].int);
+}
+
+test "RANGE frame on count/avg/min/max matches the same tie-group grouping as sum" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const data = [_]struct { day: i64, amount: i64 }{
+        .{ .day = 1, .amount = 30 },
+        .{ .day = 1, .amount = 10 },
+        .{ .day = 2, .amount = 20 },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "day", .value = .{ .int = d.day } },
+            .{ .name = "amount", .value = .{ .int = d.amount } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "day" }};
+
+    const counts = try compute(allocator, rows.items, &.{}, &order, .{ .field = "", .kind = .count }, .range);
+    defer freeResults(allocator, counts);
+    try std.testing.expectEqual(@as(i64, 2), counts[0].int);
+    try std.testing.expectEqual(@as(i64, 2), counts[1].int);
+    try std.testing.expectEqual(@as(i64, 3), counts[2].int);
+
+    const mins = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .min }, .range);
+    defer freeResults(allocator, mins);
+    try std.testing.expectEqual(@as(i64, 10), mins[0].int);
+    try std.testing.expectEqual(@as(i64, 10), mins[1].int);
+    try std.testing.expectEqual(@as(i64, 10), mins[2].int);
+
+    const maxs = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .max }, .range);
+    defer freeResults(allocator, maxs);
+    try std.testing.expectEqual(@as(i64, 30), maxs[0].int);
+    try std.testing.expectEqual(@as(i64, 30), maxs[1].int);
+    try std.testing.expectEqual(@as(i64, 30), maxs[2].int);
+
+    const avgs = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .avg }, .range);
+    defer freeResults(allocator, avgs);
+    try std.testing.expectApproxEqAbs(@as(f64, 20), avgs[0].float, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 20), avgs[1].float, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 20), avgs[2].float, 0.0001);
+}
+
+test "RANGE with no ties reduces to the same result as ROWS" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const data = [_]i64{ 3, 1, 4 };
+    for (data) |amount| {
+        try rows.append(try makeRow(allocator, &.{.{ .name = "amount", .value = .{ .int = amount } }}));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "amount" }};
+
+    const rowsResult = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .sum }, .rows);
+    defer freeResults(allocator, rowsResult);
+    const rangeResult = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .sum }, .range);
+    defer freeResults(allocator, rangeResult);
+    for (rowsResult, rangeResult) |r, g| try std.testing.expectEqual(r.int, g.int);
+}
+
+test "RANGE with every row tied gives everyone the whole-partition total, like no ORDER BY at all" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator); // scores 30, 10, 20, all same "team"
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "team" }}; // every row ties on "team"
+
+    const results = try compute(allocator, rows.items, &.{}, &order, .{ .field = "score", .kind = .sum }, .range);
+    defer freeResults(allocator, results);
+    for (results) |r| try std.testing.expectEqual(@as(i64, 60), r.int);
+}
+
+test "frame is rejected outright for the ranking family, never silently ignored" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "score" }};
+    try std.testing.expectError(error.RangeNotApplicable, compute(allocator, rows.items, &.{}, &order, .{ .field = "", .kind = .row_number }, .range));
+    try std.testing.expectError(error.RangeNotApplicable, compute(allocator, rows.items, &.{}, &order, .{ .field = "", .kind = .rank }, .range));
+    try std.testing.expectError(error.RangeNotApplicable, compute(allocator, rows.items, &.{}, &order, .{ .field = "", .kind = .dense_rank }, .range));
+}
+
+test "compute propagates OutOfMemory without leaking, mid-way through a RANGE tie group" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const names = [_][]const u8{ "mango", "mango", "apple" };
+    for (names) |n| {
+        try rows.append(try makeRow(allocator, &.{.{ .name = "name", .value = .{ .text = n } }}));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "name" }};
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 4 });
+    try std.testing.expectError(error.OutOfMemory, compute(failing.allocator(), rows.items, &.{}, &order, .{ .field = "name", .kind = .min }, .range));
+}
+
+test "sum without ORDER BY gives every row the whole-partition total" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    // scores 30, 10, 20 -> total 60, same value for every row.
+    const results = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "score", .kind = .sum }, .rows);
+    defer freeResults(allocator, results);
+    for (results) |r| try std.testing.expectEqual(@as(i64, 60), r.int);
+}
+
+test "avg running and count star running" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const scores = [_]i64{ 10, 20, 30 };
+    for (scores) |s| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "score", .value = .{ .int = s } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "score" }};
+
+    const avgs = try compute(allocator, rows.items, &.{}, &order, .{ .field = "score", .kind = .avg }, .rows);
+    defer freeResults(allocator, avgs);
+    try std.testing.expectApproxEqAbs(@as(f64, 10), avgs[0].float, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 15), avgs[1].float, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 20), avgs[2].float, 1e-9);
+
+    const counts = try compute(allocator, rows.items, &.{}, &order, .{ .field = "", .kind = .count }, .rows);
+    defer freeResults(allocator, counts);
+    try std.testing.expectEqual(@as(i64, 1), counts[0].int);
+    try std.testing.expectEqual(@as(i64, 2), counts[1].int);
+    try std.testing.expectEqual(@as(i64, 3), counts[2].int);
+}
+
+test "count_distinct runs cumulatively per partition, repeats do not grow it" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    // warsaw, in "day" order: tag a, tag b, tag a (repeat) -> distinct count
+    // grows 1, 2, 2 (the third row's "a" was already seen).
+    // krakow: tag c -> distinct count 1.
+    const data = [_]struct { city: []const u8, day: i64, tag: []const u8 }{
+        .{ .city = "warsaw", .day = 1, .tag = "a" },
+        .{ .city = "krakow", .day = 1, .tag = "c" },
+        .{ .city = "warsaw", .day = 2, .tag = "b" },
+        .{ .city = "warsaw", .day = 3, .tag = "a" },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "city", .value = .{ .text = d.city } },
+            .{ .name = "day", .value = .{ .int = d.day } },
+            .{ .name = "tag", .value = .{ .text = d.tag } },
+        }));
+    }
+
+    const partition = [_][]const u8{"city"};
+    const order = [_]querymod.OrderBy{.{ .field = "day" }};
+    const results = try compute(allocator, rows.items, &partition, &order, .{ .field = "tag", .kind = .count_distinct }, .rows);
+    defer freeResults(allocator, results);
+
+    try std.testing.expectEqual(@as(i64, 1), results[0].int); // warsaw day1: {a}
+    try std.testing.expectEqual(@as(i64, 1), results[1].int); // krakow day1: {c}
+    try std.testing.expectEqual(@as(i64, 2), results[2].int); // warsaw day2: {a,b}
+    try std.testing.expectEqual(@as(i64, 2), results[3].int); // warsaw day3: {a,b} again, "a" repeats
+}
+
+test "count_distinct without ORDER BY gives every row the whole-partition distinct total" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const tags = [_][]const u8{ "x", "y", "x", "z" };
+    for (tags) |t| {
+        try rows.append(try makeRow(allocator, &.{.{ .name = "tag", .value = .{ .text = t } }}));
+    }
+    const results = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "tag", .kind = .count_distinct }, .rows);
+    defer freeResults(allocator, results);
+    for (results) |r| try std.testing.expectEqual(@as(i64, 3), r.int); // {x,y,z}
+}
+
+test "count_distinct RANGE frame: a tied group's members share one snapshot after the WHOLE group is observed" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    // Tied at day=1: tags "a","b" (2 distinct together, not counted one at a
+    // time within the tie like ROWS would). Then day=2 adds "a" again (no
+    // growth) then "c" (grows to 3).
+    const data = [_]struct { day: i64, tag: []const u8 }{
+        .{ .day = 1, .tag = "a" },
+        .{ .day = 1, .tag = "b" },
+        .{ .day = 2, .tag = "a" },
+        .{ .day = 2, .tag = "c" },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "day", .value = .{ .int = d.day } },
+            .{ .name = "tag", .value = .{ .text = d.tag } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "day" }};
+
+    const rowsResult = try compute(allocator, rows.items, &.{}, &order, .{ .field = "tag", .kind = .count_distinct }, .rows);
+    defer freeResults(allocator, rowsResult);
+    // ROWS: each physical row gets its own running distinct count.
+    try std.testing.expectEqual(@as(i64, 1), rowsResult[0].int); // {a}
+    try std.testing.expectEqual(@as(i64, 2), rowsResult[1].int); // {a,b}
+    try std.testing.expectEqual(@as(i64, 2), rowsResult[2].int); // {a,b}, "a" repeats
+    try std.testing.expectEqual(@as(i64, 3), rowsResult[3].int); // {a,b,c}
+
+    const rangeResult = try compute(allocator, rows.items, &.{}, &order, .{ .field = "tag", .kind = .count_distinct }, .range);
+    defer freeResults(allocator, rangeResult);
+    // RANGE: both day=1 rows share the GROUP's combined distinct count (2),
+    // not their own individual position within the tie; day=2 group adds
+    // "c" (a repeats), landing on 3 for both its members.
+    try std.testing.expectEqual(@as(i64, 2), rangeResult[0].int);
+    try std.testing.expectEqual(@as(i64, 2), rangeResult[1].int);
+    try std.testing.expectEqual(@as(i64, 3), rangeResult[2].int);
+    try std.testing.expectEqual(@as(i64, 3), rangeResult[3].int);
+}
+
+test "count_distinct requires a field like sum/avg/min/max, unlike plain count" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    try std.testing.expectError(error.MissingField, compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .count_distinct }, .rows));
+}
+
+test "count_distinct ignores rows missing the field entirely, never counts none as a value" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    try rows.append(try makeRow(allocator, &.{.{ .name = "other", .value = .{ .int = 1 } }})); // missing "tag"
+    try rows.append(try makeRow(allocator, &.{.{ .name = "tag", .value = .{ .text = "a" } }}));
+    const results = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "tag", .kind = .count_distinct }, .rows);
+    defer freeResults(allocator, results);
+    for (results) |r| try std.testing.expectEqual(@as(i64, 1), r.int); // only "a" ever counted
+}
+
+test "count_distinct propagates OutOfMemory without leaking already-tracked distinct keys" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const tags = [_][]const u8{ "mango", "apple", "kiwi" };
+    for (tags) |t| {
+        try rows.append(try makeRow(allocator, &.{.{ .name = "tag", .value = .{ .text = t } }}));
+    }
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 6 });
+    try std.testing.expectError(error.OutOfMemory, compute(failing.allocator(), rows.items, &.{}, &.{}, .{ .field = "tag", .kind = .count_distinct }, .rows));
+}
+
+test "count_distinct alongside lag/lead/first_value/running sum/ranking in one computeMany call" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const data = [_]struct { day: i64, tag: []const u8, amount: i64 }{
+        .{ .day = 1, .tag = "a", .amount = 10 },
+        .{ .day = 2, .tag = "b", .amount = 20 },
+        .{ .day = 3, .tag = "a", .amount = 30 },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "day", .value = .{ .int = d.day } },
+            .{ .name = "tag", .value = .{ .text = d.tag } },
+            .{ .name = "amount", .value = .{ .int = d.amount } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "day" }};
+    const specs = [_]WindowSpec{
+        .{ .field = "tag", .kind = .count_distinct },
+        .{ .field = "amount", .kind = .lag },
+        .{ .field = "amount", .kind = .sum },
+        .{ .field = "", .kind = .row_number },
+    };
+    const results = try computeMany(allocator, rows.items, &.{}, &order, &specs, .rows);
+    defer freeManyResults(allocator, results);
+
+    try std.testing.expectEqual(@as(i64, 1), results[0][0].int); // count_distinct {a}
+    try std.testing.expectEqual(Value{ .none = {} }, results[0][1]); // lag: no predecessor
+    try std.testing.expectEqual(@as(i64, 10), results[0][2].int); // running sum
+    try std.testing.expectEqual(@as(i64, 1), results[0][3].int); // row_number
+
+    try std.testing.expectEqual(@as(i64, 2), results[1][0].int); // {a,b}
+    try std.testing.expectEqual(@as(i64, 10), results[1][1].int); // lag -> day1's amount
+    try std.testing.expectEqual(@as(i64, 30), results[1][2].int);
+    try std.testing.expectEqual(@as(i64, 2), results[1][3].int);
+
+    try std.testing.expectEqual(@as(i64, 2), results[2][0].int); // {a,b}, "a" repeats
+    try std.testing.expectEqual(@as(i64, 20), results[2][1].int); // lag -> day2's amount
+    try std.testing.expectEqual(@as(i64, 60), results[2][2].int);
+    try std.testing.expectEqual(@as(i64, 3), results[2][3].int);
+}
+
+test "running min and max over a text field, independently duped per row" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const names = [_][]const u8{ "mango", "apple", "kiwi" };
+    for (names, 0..) |n, i| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "seq", .value = .{ .int = @intCast(i) } },
+            .{ .name = "name", .value = .{ .text = n } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "seq" }};
+
+    const mins = try compute(allocator, rows.items, &.{}, &order, .{ .field = "name", .kind = .min }, .rows);
+    defer freeResults(allocator, mins);
+    try std.testing.expectEqualStrings("mango", mins[0].text);
+    try std.testing.expectEqualStrings("apple", mins[1].text);
+    try std.testing.expectEqualStrings("apple", mins[2].text);
+
+    const maxs = try compute(allocator, rows.items, &.{}, &order, .{ .field = "name", .kind = .max }, .rows);
+    defer freeResults(allocator, maxs);
+    try std.testing.expectEqualStrings("mango", maxs[0].text);
+    try std.testing.expectEqualStrings("mango", maxs[1].text);
+    try std.testing.expectEqualStrings("mango", maxs[2].text);
+}
+
+test "sum/avg/min/max require a field, ranking family and COUNT(*) do not" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+
+    try std.testing.expectError(error.MissingField, compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .sum }, .rows));
+    try std.testing.expectError(error.MissingField, compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .avg }, .rows));
+    try std.testing.expectError(error.MissingField, compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .min }, .rows));
+    try std.testing.expectError(error.MissingField, compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .max }, .rows));
+
+    const stars = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .count }, .rows);
+    defer freeResults(allocator, stars);
+    const nums = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .row_number }, .rows);
+    defer freeResults(allocator, nums);
+}
+
+test "sum on a non-numeric field is NonNumericField, integer overflow is Overflow" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    try rows.append(try makeRow(allocator, &.{.{ .name = "x", .value = .{ .text = "nope" } }}));
+    try std.testing.expectError(error.NonNumericField, compute(allocator, rows.items, &.{}, &.{}, .{ .field = "x", .kind = .sum }, .rows));
+
+    var overflowRows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (overflowRows.items) |*r| r.deinit();
+        overflowRows.deinit();
+    }
+    try overflowRows.append(try makeRow(allocator, &.{.{ .name = "x", .value = .{ .int = std.math.maxInt(i64) } }}));
+    try overflowRows.append(try makeRow(allocator, &.{.{ .name = "x", .value = .{ .int = 1 } }}));
+    try std.testing.expectError(error.Overflow, compute(allocator, overflowRows.items, &.{}, &.{}, .{ .field = "x", .kind = .sum }, .rows));
+}
+
+test "compute on zero rows returns an empty result, no crash" {
+    const allocator = std.testing.allocator;
+    const rows = [_]Row{};
+    const results = try compute(allocator, &rows, &.{}, &.{}, .{ .field = "", .kind = .row_number }, .rows);
+    defer freeResults(allocator, results);
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "specLabel matches aggregate.zig's kind_field / bare-kind convention" {
+    const allocator = std.testing.allocator;
+    const bare = try specLabel(allocator, .{ .field = "", .kind = .row_number });
+    defer allocator.free(bare);
+    try std.testing.expectEqualStrings("row_number", bare);
+
+    const withField = try specLabel(allocator, .{ .field = "score", .kind = .sum });
+    defer allocator.free(withField);
+    try std.testing.expectEqualStrings("sum_score", withField);
+}
+
+test "compute propagates OutOfMemory without leaking, at an early allocation" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, compute(failing.allocator(), rows.items, &.{}, &.{}, .{ .field = "score", .kind = .sum }, .rows));
+}
+
+test "compute propagates OutOfMemory without leaking, mid-way through partitioned min/max" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const names = [_][]const u8{ "mango", "apple", "kiwi", "banana", "fig" };
+    for (names) |n| {
+        try rows.append(try makeRow(allocator, &.{.{ .name = "name", .value = .{ .text = n } }}));
+    }
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 4 });
+    try std.testing.expectError(error.OutOfMemory, compute(failing.allocator(), rows.items, &.{}, &.{}, .{ .field = "name", .kind = .min }, .rows));
+}
+
+test "orderedIndices flattens partitions in first-seen order, each sorted by orderBy" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    // First-seen partition order: warsaw, krakow. Within each, sort by
+    // score ascending should reorder relative to input.
+    const data = [_]struct { city: []const u8, score: i64 }{
+        .{ .city = "warsaw", .score = 5 },
+        .{ .city = "krakow", .score = 9 },
+        .{ .city = "warsaw", .score = 1 },
+        .{ .city = "krakow", .score = 2 },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "city", .value = .{ .text = d.city } },
+            .{ .name = "score", .value = .{ .int = d.score } },
+        }));
+    }
+
+    const partition = [_][]const u8{"city"};
+    const order = [_]querymod.OrderBy{.{ .field = "score" }};
+    const idx = try orderedIndices(allocator, rows.items, &partition, &order);
+    defer allocator.free(idx);
+
+    // warsaw (first-seen) sorted asc: idx2 (score1), idx0 (score5) - then
+    // krakow sorted asc: idx3 (score2), idx1 (score9).
+    try std.testing.expectEqualSlices(usize, &.{ 2, 0, 3, 1 }, idx);
+}
+
+test "orderedIndices on zero rows returns an empty slice" {
+    const allocator = std.testing.allocator;
+    const rows = [_]Row{};
+    const idx = try orderedIndices(allocator, &rows, &.{}, &.{});
+    defer allocator.free(idx);
+    try std.testing.expectEqual(@as(usize, 0), idx.len);
+}
+
+test "orderedIndices propagates OutOfMemory without leaking" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, orderedIndices(failing.allocator(), rows.items, &.{}, &.{}));
+}
+
+test "computeMany matches calling compute() once per spec, sharing one partition/order/frame" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const data = [_]struct { city: []const u8, amount: i64 }{
+        .{ .city = "warsaw", .amount = 10 },
+        .{ .city = "krakow", .amount = 9 },
+        .{ .city = "warsaw", .amount = 20 },
+        .{ .city = "krakow", .amount = 2 },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "city", .value = .{ .text = d.city } },
+            .{ .name = "amount", .value = .{ .int = d.amount } },
+        }));
+    }
+
+    const partition = [_][]const u8{"city"};
+    const order = [_]querymod.OrderBy{.{ .field = "amount" }};
+    const specs = [_]WindowSpec{
+        .{ .field = "amount", .kind = .sum },
+        .{ .field = "amount", .kind = .avg },
+        .{ .field = "", .kind = .row_number },
+    };
+
+    const many = try computeMany(allocator, rows.items, &partition, &order, &specs, .rows);
+    defer freeManyResults(allocator, many);
+
+    for (specs, 0..) |spec, specIdx| {
+        const solo = try compute(allocator, rows.items, &partition, &order, spec, .rows);
+        defer freeResults(allocator, solo);
+        for (rows.items, 0..) |_, rowIdx| {
+            try std.testing.expect(rowmod.compare(many[rowIdx][specIdx], solo[rowIdx]) == .eq);
+        }
+    }
+}
+
+test "computeMany keeps min/max text results independently owned per row and per spec" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const names = [_][]const u8{ "mango", "apple", "kiwi" };
+    for (names) |n| {
+        try rows.append(try makeRow(allocator, &.{.{ .name = "name", .value = .{ .text = n } }}));
+    }
+
+    const specs = [_]WindowSpec{
+        .{ .field = "name", .kind = .min },
+        .{ .field = "name", .kind = .max },
+    };
+    const results = try computeMany(allocator, rows.items, &.{}, &.{}, &specs, .rows);
+    defer freeManyResults(allocator, results);
+
+    for (results) |row| {
+        try std.testing.expectEqualStrings("apple", row[0].text);
+        try std.testing.expectEqualStrings("mango", row[1].text);
+    }
+    // Every row's `min` slice is its own allocation, not a shared pointer -
+    // `freeManyResults` frees each independently, which the testing
+    // allocator would already reject as a double free if they aliased.
+    try std.testing.expect(results[0][0].text.ptr != results[1][0].text.ptr);
+}
+
+test "computeMany with zero specs returns one empty values slice per row, no crash" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const results = try computeMany(allocator, rows.items, &.{}, &.{}, &.{}, .rows);
+    defer freeManyResults(allocator, results);
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    for (results) |row| try std.testing.expectEqual(@as(usize, 0), row.len);
+}
+
+test "computeMany propagates OutOfMemory without leaking, at an early allocation" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const specs = [_]WindowSpec{
+        .{ .field = "score", .kind = .sum },
+        .{ .field = "", .kind = .row_number },
+    };
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, computeMany(failing.allocator(), rows.items, &.{}, &.{}, &specs, .rows));
+}
+
+test "computeMany propagates OutOfMemory without leaking, mid-way through the row-major transpose" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const specs = [_]WindowSpec{
+        .{ .field = "score", .kind = .sum },
+        .{ .field = "team", .kind = .min },
+    };
+    // Large enough to run past both columns' own computation (sum has no
+    // extra allocations per row; min dupes a `Value` per row observed) and
+    // into the per-row `rowValues`/`dupe` allocations the transpose loop
+    // itself makes - proven by the assertion below, not by counting by hand.
+    var failIndex: usize = 0;
+    while (failIndex < 40) : (failIndex += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = failIndex });
+        const result = computeMany(failing.allocator(), rows.items, &.{}, &.{}, &specs, .rows);
+        if (result) |ok| {
+            freeManyResults(allocator, ok);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+    } else return error.TestUnexpectedResult;
+}
+
+test "lag/lead default offset of 1: NULL (default) at the edge, adjacent value otherwise" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const data = [_]struct { day: i64, amount: i64 }{
+        .{ .day = 1, .amount = 10 },
+        .{ .day = 2, .amount = 20 },
+        .{ .day = 3, .amount = 30 },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "day", .value = .{ .int = d.day } },
+            .{ .name = "amount", .value = .{ .int = d.amount } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "day" }};
+
+    const lag = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .lag }, .rows);
+    defer freeResults(allocator, lag);
+    try std.testing.expectEqual(rowmod.ValueTag.none, @as(rowmod.ValueTag, lag[0]));
+    try std.testing.expectEqual(@as(i64, 10), lag[1].int);
+    try std.testing.expectEqual(@as(i64, 20), lag[2].int);
+
+    const lead = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .lead }, .rows);
+    defer freeResults(allocator, lead);
+    try std.testing.expectEqual(@as(i64, 20), lead[0].int);
+    try std.testing.expectEqual(@as(i64, 30), lead[1].int);
+    try std.testing.expectEqual(rowmod.ValueTag.none, @as(rowmod.ValueTag, lead[2]));
+}
+
+test "lag/lead with an explicit offset skips that many physical positions" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const amounts = [_]i64{ 10, 20, 30, 40 };
+    for (amounts, 0..) |a, i| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "seq", .value = .{ .int = @intCast(i) } },
+            .{ .name = "amount", .value = .{ .int = a } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "seq" }};
+
+    const lag2 = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .lag, .offset = 2 }, .rows);
+    defer freeResults(allocator, lag2);
+    try std.testing.expectEqual(rowmod.ValueTag.none, @as(rowmod.ValueTag, lag2[0]));
+    try std.testing.expectEqual(rowmod.ValueTag.none, @as(rowmod.ValueTag, lag2[1]));
+    try std.testing.expectEqual(@as(i64, 10), lag2[2].int);
+    try std.testing.expectEqual(@as(i64, 20), lag2[3].int);
+
+    // offset 0 reads the current row itself.
+    const lagZero = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .lag, .offset = 0 }, .rows);
+    defer freeResults(allocator, lagZero);
+    for (amounts, 0..) |a, i| try std.testing.expectEqual(a, lagZero[i].int);
+}
+
+test "lag/lead use a caller-supplied default instead of NULL at the edge" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    try rows.append(try makeRow(allocator, &.{
+        .{ .name = "seq", .value = .{ .int = 0 } },
+        .{ .name = "amount", .value = .{ .int = 5 } },
+    }));
+    try rows.append(try makeRow(allocator, &.{
+        .{ .name = "seq", .value = .{ .int = 1 } },
+        .{ .name = "amount", .value = .{ .int = 6 } },
+    }));
+    const order = [_]querymod.OrderBy{.{ .field = "seq" }};
+
+    const lag = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .lag, .default = .{ .int = -1 } }, .rows);
+    defer freeResults(allocator, lag);
+    try std.testing.expectEqual(@as(i64, -1), lag[0].int);
+    try std.testing.expectEqual(@as(i64, 5), lag[1].int);
+}
+
+test "lag/lead restart per partition and treat orderBy ties as distinct physical positions" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    // Two rows tied on "day" within "warsaw" - lag/lead must still treat
+    // them as two distinct positions (unlike the RANGE running-aggregate
+    // frame, which would collapse ties into one shared value).
+    const data = [_]struct { city: []const u8, day: i64, amount: i64 }{
+        .{ .city = "warsaw", .day = 1, .amount = 10 },
+        .{ .city = "warsaw", .day = 1, .amount = 20 },
+        .{ .city = "krakow", .day = 1, .amount = 99 },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "city", .value = .{ .text = d.city } },
+            .{ .name = "day", .value = .{ .int = d.day } },
+            .{ .name = "amount", .value = .{ .int = d.amount } },
+        }));
+    }
+    const partition = [_][]const u8{"city"};
+    const order = [_]querymod.OrderBy{.{ .field = "day" }};
+
+    const lead = try compute(allocator, rows.items, &partition, &order, .{ .field = "amount", .kind = .lead }, .rows);
+    defer freeResults(allocator, lead);
+    // Stable sort keeps warsaw's two tied rows in first-seen order (10 then
+    // 20), so warsaw/10's lead is warsaw/20 (not krakow, a different
+    // partition entirely), and warsaw/20 (the partition's last row) is NULL.
+    try std.testing.expectEqual(@as(i64, 20), lead[0].int);
+    try std.testing.expectEqual(rowmod.ValueTag.none, @as(rowmod.ValueTag, lead[1]));
+    // krakow is its own partition of one row - always NULL.
+    try std.testing.expectEqual(rowmod.ValueTag.none, @as(rowmod.ValueTag, lead[2]));
+}
+
+test "lag/lead without ORDER BY walk first-seen input order" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator); // scores 30, 10, 20, first-seen order
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const lag = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "score", .kind = .lag }, .rows);
+    defer freeResults(allocator, lag);
+    try std.testing.expectEqual(rowmod.ValueTag.none, @as(rowmod.ValueTag, lag[0]));
+    try std.testing.expectEqual(@as(i64, 30), lag[1].int);
+    try std.testing.expectEqual(@as(i64, 10), lag[2].int);
+}
+
+test "lag/lead on a text field dupes independently per row, no shared pointers" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const names = [_][]const u8{ "mango", "apple", "kiwi" };
+    for (names, 0..) |n, i| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "seq", .value = .{ .int = @intCast(i) } },
+            .{ .name = "name", .value = .{ .text = n } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "seq" }};
+    const lag = try compute(allocator, rows.items, &.{}, &order, .{ .field = "name", .kind = .lag }, .rows);
+    defer freeResults(allocator, lag);
+    try std.testing.expectEqualStrings("mango", lag[1].text);
+    try std.testing.expectEqualStrings("apple", lag[2].text);
+    try std.testing.expect(lag[1].text.ptr != names[0].ptr);
+}
+
+test "lag/lead require a field, like sum/avg/min/max" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    try std.testing.expectError(error.MissingField, compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .lag }, .rows));
+    try std.testing.expectError(error.MissingField, compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .lead }, .rows));
+}
+
+test "lag/lead reject a RANGE frame outright, like the ranking family" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "score" }};
+    try std.testing.expectError(error.RangeNotApplicable, compute(allocator, rows.items, &.{}, &order, .{ .field = "score", .kind = .lag }, .range));
+    try std.testing.expectError(error.RangeNotApplicable, compute(allocator, rows.items, &.{}, &order, .{ .field = "score", .kind = .lead }, .range));
+}
+
+test "lag/lead propagate OutOfMemory without leaking" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const names = [_][]const u8{ "mango", "apple", "kiwi", "banana" };
+    for (names, 0..) |n, i| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "seq", .value = .{ .int = @intCast(i) } },
+            .{ .name = "name", .value = .{ .text = n } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "seq" }};
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 4 });
+    try std.testing.expectError(error.OutOfMemory, compute(failing.allocator(), rows.items, &.{}, &order, .{ .field = "name", .kind = .lag }, .rows));
+}
+
+test "first_value/last_value without ORDER BY: whole-partition frame, constant per partition" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator); // scores 30, 10, 20, first-seen order
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const first = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "score", .kind = .first_value }, .rows);
+    defer freeResults(allocator, first);
+    for (first) |v| try std.testing.expectEqual(@as(i64, 30), v.int); // first-seen row's score
+
+    const last = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "score", .kind = .last_value }, .rows);
+    defer freeResults(allocator, last);
+    for (last) |v| try std.testing.expectEqual(@as(i64, 20), v.int); // last-seen row's score
+}
+
+test "first_value/last_value ROWS frame: first stays the partition's first row, last degenerates to the current row" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const scores = [_]i64{ 30, 10, 20 };
+    for (scores) |s| {
+        try rows.append(try makeRow(allocator, &.{.{ .name = "score", .value = .{ .int = s } }}));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "score" }};
+    // Sorted ascending walk order: 10 (idx1), 20 (idx2), 30 (idx0).
+
+    const first = try compute(allocator, rows.items, &.{}, &order, .{ .field = "score", .kind = .first_value }, .rows);
+    defer freeResults(allocator, first);
+    for (first) |v| try std.testing.expectEqual(@as(i64, 10), v.int); // ROWS frame start is always the sorted partition's first row
+
+    const last = try compute(allocator, rows.items, &.{}, &order, .{ .field = "score", .kind = .last_value }, .rows);
+    defer freeResults(allocator, last);
+    // ROWS frame end is CURRENT ROW - last_value degenerates to the row's own field.
+    try std.testing.expectEqual(@as(i64, 30), last[0].int);
+    try std.testing.expectEqual(@as(i64, 10), last[1].int);
+    try std.testing.expectEqual(@as(i64, 20), last[2].int);
+}
+
+test "first_value/last_value RANGE frame: last_value shares the current tie group's last member" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    // One partition, ordered by "day": two rows tied at day=1 (10, 20), then one row at day=2 (5).
+    const data = [_]struct { day: i64, amount: i64 }{
+        .{ .day = 1, .amount = 10 },
+        .{ .day = 1, .amount = 20 },
+        .{ .day = 2, .amount = 5 },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "day", .value = .{ .int = d.day } },
+            .{ .name = "amount", .value = .{ .int = d.amount } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "day" }};
+
+    const first = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .first_value }, .range);
+    defer freeResults(allocator, first);
+    for (first) |v| try std.testing.expectEqual(@as(i64, 10), v.int); // frame start unaffected by RANGE vs ROWS
+
+    const last = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .last_value }, .range);
+    defer freeResults(allocator, last);
+    // Both day=1 rows share their tie group's LAST member (20), day=2 is its own group (5).
+    try std.testing.expectEqual(@as(i64, 20), last[0].int);
+    try std.testing.expectEqual(@as(i64, 20), last[1].int);
+    try std.testing.expectEqual(@as(i64, 5), last[2].int);
+}
+
+test "first_value/last_value restart per partition, RANGE tie group stays within one city" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    // Both rows of EACH city tie on "day" - RANGE must group them separately
+    // per partition, never merging warsaw's tie group with krakow's.
+    const data = [_]struct { city: []const u8, day: i64, amount: i64 }{
+        .{ .city = "warsaw", .day = 1, .amount = 100 },
+        .{ .city = "warsaw", .day = 1, .amount = 250 },
+        .{ .city = "krakow", .day = 1, .amount = 40 },
+        .{ .city = "krakow", .day = 1, .amount = 90 },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "city", .value = .{ .text = d.city } },
+            .{ .name = "day", .value = .{ .int = d.day } },
+            .{ .name = "amount", .value = .{ .int = d.amount } },
+        }));
+    }
+    const partition = [_][]const u8{"city"};
+    const order = [_]querymod.OrderBy{.{ .field = "day" }};
+
+    const last = try compute(allocator, rows.items, &partition, &order, .{ .field = "amount", .kind = .last_value }, .range);
+    defer freeResults(allocator, last);
+    try std.testing.expectEqual(@as(i64, 250), last[0].int); // warsaw's tie group's last member (250)
+    try std.testing.expectEqual(@as(i64, 250), last[1].int);
+    try std.testing.expectEqual(@as(i64, 90), last[2].int); // krakow's OWN tie group's last member (90), not warsaw's
+    try std.testing.expectEqual(@as(i64, 90), last[3].int);
+}
+
+test "first_value/last_value on a text field dupes independently per row, no shared pointers" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const names = [_][]const u8{ "mango", "apple", "kiwi" };
+    for (names, 0..) |n, i| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "seq", .value = .{ .int = @intCast(i) } },
+            .{ .name = "name", .value = .{ .text = n } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "seq" }};
+    const first = try compute(allocator, rows.items, &.{}, &order, .{ .field = "name", .kind = .first_value }, .rows);
+    defer freeResults(allocator, first);
+    try std.testing.expectEqualStrings("mango", first[0].text);
+    try std.testing.expectEqualStrings("mango", first[2].text);
+    try std.testing.expect(first[2].text.ptr != names[0].ptr);
+}
+
+test "first_value/last_value require a field, like sum/avg/min/max" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    try std.testing.expectError(error.MissingField, compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .first_value }, .rows));
+    try std.testing.expectError(error.MissingField, compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .last_value }, .rows));
+}
+
+test "first_value/last_value accept a RANGE frame, unlike lag/lead" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "score" }};
+    const first = try compute(allocator, rows.items, &.{}, &order, .{ .field = "score", .kind = .first_value }, .range);
+    defer freeResults(allocator, first);
+    for (first) |v| try std.testing.expectEqual(@as(i64, 10), v.int);
+}
+
+test "first_value/last_value propagate OutOfMemory without leaking" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const names = [_][]const u8{ "mango", "apple", "kiwi", "banana" };
+    for (names, 0..) |n, i| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "seq", .value = .{ .int = @intCast(i) } },
+            .{ .name = "name", .value = .{ .text = n } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "seq" }};
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 4 });
+    try std.testing.expectError(error.OutOfMemory, compute(failing.allocator(), rows.items, &.{}, &order, .{ .field = "name", .kind = .last_value }, .rows));
+}
+
+test "first_value/last_value on zero rows in a partition does not crash (empty indices guard)" {
+    const allocator = std.testing.allocator;
+    const rows = [_]Row{};
+    const results = try compute(allocator, &rows, &.{}, &.{}, .{ .field = "x", .kind = .first_value }, .rows);
+    defer freeResults(allocator, results);
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "nth_value without ORDER BY: whole-partition frame, n counts from the first-seen row" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator); // scores 30, 10, 20, first-seen order
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const n1 = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "score", .kind = .nth_value, .offset = 1 }, .rows);
+    defer freeResults(allocator, n1);
+    for (n1) |v| try std.testing.expectEqual(@as(i64, 30), v.int); // same as first_value
+
+    const n3 = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "score", .kind = .nth_value, .offset = 3 }, .rows);
+    defer freeResults(allocator, n3);
+    for (n3) |v| try std.testing.expectEqual(@as(i64, 20), v.int); // same as last_value (partition has 3 rows)
+
+    // Past the whole-partition frame's end -> spec.default (SQL NULL unless set).
+    const n4 = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "score", .kind = .nth_value, .offset = 4 }, .rows);
+    defer freeResults(allocator, n4);
+    for (n4) |v| try std.testing.expectEqual(Value{ .none = {} }, v);
+}
+
+test "nth_value ROWS frame: position visible only once the frame has grown to include it" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const scores = [_]i64{ 30, 10, 20 };
+    for (scores) |s| {
+        try rows.append(try makeRow(allocator, &.{.{ .name = "score", .value = .{ .int = s } }}));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "score" }};
+    // Sorted ascending walk order: 10 (idx1, pos0), 20 (idx2, pos1), 30 (idx0, pos2).
+    // `results` stays aligned with the ORIGINAL insertion order [30, 10, 20], not
+    // the sorted walk order - same convention `first_value`/`last_value`'s ROWS
+    // test above uses.
+    const results = try compute(allocator, rows.items, &.{}, &order, .{ .field = "score", .kind = .nth_value, .offset = 2 }, .rows);
+    defer freeResults(allocator, results);
+    // idx1 (score 10, pos0): frame is just itself (size 1) - position 2 does not
+    // exist yet -> default.
+    try std.testing.expectEqual(Value{ .none = {} }, results[1]);
+    // idx2 (score 20, pos1): frame now covers pos0-1 (size 2) - position 2 is
+    // this row's own value, 20.
+    try std.testing.expectEqual(@as(i64, 20), results[2].int);
+    // idx0 (score 30, pos2): frame covers pos0-2 (size 3) - position 2 is still
+    // idx2's value, 20 (the frame grew, but the row AT position 2 did not change).
+    try std.testing.expectEqual(@as(i64, 20), results[0].int);
+}
+
+test "nth_value RANGE frame: position resolved against the current tie group's growing frame" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const data = [_]struct { day: i64, amount: i64 }{
+        .{ .day = 1, .amount = 10 },
+        .{ .day = 1, .amount = 20 },
+        .{ .day = 2, .amount = 5 },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "day", .value = .{ .int = d.day } },
+            .{ .name = "amount", .value = .{ .int = d.amount } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "day" }};
+    // RANGE's frame is CUMULATIVE (UNBOUNDED PRECEDING through the current tie
+    // group, same as the running-aggregate family), not limited to the current
+    // group alone - position 3 only becomes reachable once the frame has grown
+    // to include the day=2 group too.
+    const results = try compute(allocator, rows.items, &.{}, &order, .{ .field = "amount", .kind = .nth_value, .offset = 3 }, .range);
+    defer freeResults(allocator, results);
+    // day=1's tie group (2 members): frame size is still only 2 - position 3
+    // does not exist yet -> default for BOTH members.
+    try std.testing.expectEqual(Value{ .none = {} }, results[0]);
+    try std.testing.expectEqual(Value{ .none = {} }, results[1]);
+    // day=2's tie group: frame now covers all 3 rows - position 3 is this row's
+    // own value, 5.
+    try std.testing.expectEqual(@as(i64, 5), results[2].int);
+}
+
+test "nth_value uses a custom default instead of NULL when set" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const results = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "score", .kind = .nth_value, .offset = 10, .default = .{ .int = -1 } }, .rows);
+    defer freeResults(allocator, results);
+    for (results) |v| try std.testing.expectEqual(@as(i64, -1), v.int);
+}
+
+test "nth_value with offset 0 never resolves (positions are 1-based)" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const results = try compute(allocator, rows.items, &.{}, &.{}, .{ .field = "score", .kind = .nth_value, .offset = 0 }, .rows);
+    defer freeResults(allocator, results);
+    for (results) |v| try std.testing.expectEqual(Value{ .none = {} }, v);
+}
+
+test "nth_value restart per partition, RANGE tie group stays within one city" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const data = [_]struct { city: []const u8, day: i64, amount: i64 }{
+        .{ .city = "warsaw", .day = 1, .amount = 100 },
+        .{ .city = "warsaw", .day = 1, .amount = 250 },
+        .{ .city = "krakow", .day = 1, .amount = 40 },
+        .{ .city = "krakow", .day = 1, .amount = 90 },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "city", .value = .{ .text = d.city } },
+            .{ .name = "day", .value = .{ .int = d.day } },
+            .{ .name = "amount", .value = .{ .int = d.amount } },
+        }));
+    }
+    const partition = [_][]const u8{"city"};
+    const order = [_]querymod.OrderBy{.{ .field = "day" }};
+    const results = try compute(allocator, rows.items, &partition, &order, .{ .field = "amount", .kind = .nth_value, .offset = 2 }, .range);
+    defer freeResults(allocator, results);
+    try std.testing.expectEqual(@as(i64, 250), results[0].int); // warsaw's 2nd member
+    try std.testing.expectEqual(@as(i64, 250), results[1].int);
+    try std.testing.expectEqual(@as(i64, 90), results[2].int); // krakow's OWN 2nd member, not warsaw's
+    try std.testing.expectEqual(@as(i64, 90), results[3].int);
+}
+
+test "nth_value on a text field dupes independently per row, no shared pointers" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const names = [_][]const u8{ "mango", "apple", "kiwi" };
+    for (names, 0..) |n, i| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "seq", .value = .{ .int = @intCast(i) } },
+            .{ .name = "name", .value = .{ .text = n } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "seq" }};
+    const results = try compute(allocator, rows.items, &.{}, &order, .{ .field = "name", .kind = .nth_value, .offset = 1 }, .rows);
+    defer freeResults(allocator, results);
+    try std.testing.expectEqualStrings("mango", results[0].text);
+    try std.testing.expectEqualStrings("mango", results[2].text);
+    try std.testing.expect(results[2].text.ptr != names[0].ptr);
+}
+
+test "nth_value requires a field, like first_value/last_value" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    try std.testing.expectError(error.MissingField, compute(allocator, rows.items, &.{}, &.{}, .{ .field = "", .kind = .nth_value, .offset = 1 }, .rows));
+}
+
+test "nth_value accepts a RANGE frame, unlike lag/lead" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "score" }};
+    const results = try compute(allocator, rows.items, &.{}, &order, .{ .field = "score", .kind = .nth_value, .offset = 1 }, .range);
+    defer freeResults(allocator, results);
+    for (results) |v| try std.testing.expectEqual(@as(i64, 10), v.int);
+}
+
+test "nth_value propagates OutOfMemory without leaking" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const names = [_][]const u8{ "mango", "apple", "kiwi", "banana" };
+    for (names, 0..) |n, i| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "seq", .value = .{ .int = @intCast(i) } },
+            .{ .name = "name", .value = .{ .text = n } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "seq" }};
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 4 });
+    try std.testing.expectError(error.OutOfMemory, compute(failing.allocator(), rows.items, &.{}, &order, .{ .field = "name", .kind = .nth_value, .offset = 2 }, .rows));
+}
+
+test "nth_value on zero rows in a partition does not crash (empty indices guard)" {
+    const allocator = std.testing.allocator;
+    const rows = [_]Row{};
+    const results = try compute(allocator, &rows, &.{}, &.{}, .{ .field = "x", .kind = .nth_value, .offset = 1 }, .rows);
+    defer freeResults(allocator, results);
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "computeMany mixes nth_value with lag/lead/running aggregates/ranking under one shared window" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const amounts = [_]i64{ 10, 20, 30 };
+    for (amounts, 0..) |a, i| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "seq", .value = .{ .int = @intCast(i) } },
+            .{ .name = "amount", .value = .{ .int = a } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "seq" }};
+    const specs = [_]WindowSpec{
+        .{ .field = "amount", .kind = .nth_value, .offset = 2 },
+        .{ .field = "amount", .kind = .lag },
+        .{ .field = "amount", .kind = .row_number },
+    };
+    const results = try computeMany(allocator, rows.items, &.{}, &order, &specs, .rows);
+    defer freeManyResults(allocator, results);
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    // nth_value(amount, 2): row 1's frame is too small (default None), rows 2-3 both see 20.
+    try std.testing.expectEqual(Value{ .none = {} }, results[0][0]);
+    try std.testing.expectEqual(@as(i64, 20), results[1][0].int);
+    try std.testing.expectEqual(@as(i64, 20), results[2][0].int);
+}
+
+test "computeMany mixes lag/lead with running aggregates and ranking under one shared window" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const amounts = [_]i64{ 10, 20, 30 };
+    for (amounts, 0..) |a, i| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "seq", .value = .{ .int = @intCast(i) } },
+            .{ .name = "amount", .value = .{ .int = a } },
+        }));
+    }
+    const order = [_]querymod.OrderBy{.{ .field = "seq" }};
+    const specs = [_]WindowSpec{
+        .{ .field = "amount", .kind = .lag },
+        .{ .field = "amount", .kind = .lead },
+        .{ .field = "amount", .kind = .sum },
+        .{ .field = "", .kind = .row_number },
+    };
+    const many = try computeMany(allocator, rows.items, &.{}, &order, &specs, .rows);
+    defer freeManyResults(allocator, many);
+
+    try std.testing.expectEqual(rowmod.ValueTag.none, @as(rowmod.ValueTag, many[0][0]));
+    try std.testing.expectEqual(@as(i64, 10), many[1][0].int); // lag
+    try std.testing.expectEqual(@as(i64, 20), many[0][1].int); // lead
+    try std.testing.expectEqual(rowmod.ValueTag.none, @as(rowmod.ValueTag, many[2][1]));
+    try std.testing.expectEqual(@as(i64, 60), many[2][2].int); // running sum, final row
+    try std.testing.expectEqual(@as(i64, 3), many[2][3].int); // row_number
+}
