@@ -663,3 +663,159 @@ fn computeOneSpec(allocator: Allocator, rows: []const Row, partitions: []const [
         }
     }
 
+    return results;
+}
+
+/// Computes MULTIPLE window-function columns over the SAME shared
+/// `PARTITION BY`/`ORDER BY`/`frame` in one pass - SQL's `SELECT sum(x)
+/// OVER w, avg(y) OVER w, rank() OVER w FROM t WINDOW w AS (...)` (every
+/// column sharing one window definition), the window-function counterpart
+/// of `aggregate.zig`'s multi-`AggSpec` GROUP BY. `partitionedAndSorted` is
+/// built exactly ONCE and reused for every spec - unlike calling `compute()`
+/// in a loop, which would redo that O(n log n) sort per spec for no reason.
+///
+/// Returns one entry PER ROW (aligned 1:1 with `rows`, like `compute()`'s
+/// result), each entry an independently-owned `[]Value` of length
+/// `specs.len` in the SAME order as `specs` - row-major, not the
+/// column-major shape the per-spec computation happens in internally,
+/// because that is the shape every caller (CLI printing, wire encoding)
+/// actually wants: all of one row's annotations together. Caller owns the
+/// returned slice; free each inner slice (`.free(allocator)` on every
+/// `Value`, then `allocator.free` the slice), or call `freeManyResults`.
+pub fn computeMany(allocator: Allocator, rows: []const Row, partitionBy: []const []const u8, orderBy: []const querymod.OrderBy, specs: []const WindowSpec, frame: FrameMode) WindowError![][]Value {
+    const partitions = try partitionedAndSorted(allocator, rows, partitionBy, orderBy);
+    defer {
+        for (partitions) |p| allocator.free(p);
+        allocator.free(partitions);
+    }
+
+    var columns = try allocator.alloc([]Value, specs.len);
+    var filledCols: usize = 0;
+    errdefer {
+        for (columns[0..filledCols]) |c| freeResults(allocator, c);
+        allocator.free(columns);
+    }
+    for (specs) |spec| {
+        columns[filledCols] = try computeOneSpec(allocator, rows, partitions, orderBy, spec, frame);
+        filledCols += 1;
+    }
+
+    const results = try allocator.alloc([]Value, rows.len);
+    var filledRows: usize = 0;
+    errdefer {
+        for (results[0..filledRows]) |r| freeResults(allocator, r);
+        allocator.free(results);
+    }
+    for (0..rows.len) |rowIdx| {
+        const rowValues = try allocator.alloc(Value, specs.len);
+        var filledVals: usize = 0;
+        errdefer {
+            for (rowValues[0..filledVals]) |v| v.free(allocator);
+            allocator.free(rowValues);
+        }
+        for (columns, 0..) |col, specIdx| {
+            rowValues[specIdx] = try col[rowIdx].dupe(allocator);
+            filledVals += 1;
+        }
+        results[rowIdx] = rowValues;
+        filledRows += 1;
+    }
+
+    // Every column stays independently owned by `columns` up to this
+    // point - `results` above holds its OWN dupe of every `Value` (min/max
+    // may hold heap-owned text/bytes), never a shared pointer - so it is
+    // always safe to free `columns` in full here, on the success path only:
+    // the `errdefer` right after `columns` was allocated already covers
+    // EVERY error path (early, mid-build, or during the transpose loop
+    // above) using the same `filledCols`, which by now equals `specs.len` -
+    // a second, unconditional `defer` registered after that `errdefer`
+    // would double-free `columns` on any error occurring after it, since an
+    // `errdefer` stays armed for the rest of the enclosing scope regardless
+    // of what runs after it, not just the statements immediately following.
+    for (columns) |c| freeResults(allocator, c);
+    allocator.free(columns);
+
+    return results;
+}
+
+pub fn freeManyResults(allocator: Allocator, results: [][]Value) void {
+    for (results) |r| freeResults(allocator, r);
+    allocator.free(results);
+}
+
+pub fn freeResults(allocator: Allocator, results: []Value) void {
+    for (results) |v| v.free(allocator);
+    allocator.free(results);
+}
+
+fn makeRow(allocator: Allocator, fields: []const rowmod.Field) !Row {
+    var r = Row.init(allocator);
+    for (fields) |f| try r.set(f.name, f.value);
+    return r;
+}
+
+fn threeRowsOnePartition(allocator: Allocator) !std.ArrayList(Row) {
+    var rows = std.ArrayList(Row).init(allocator);
+    errdefer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const data = [_]struct { team: []const u8, score: i64 }{
+        .{ .team = "a", .score = 30 },
+        .{ .team = "a", .score = 10 },
+        .{ .team = "a", .score = 20 },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "team", .value = .{ .text = d.team } },
+            .{ .name = "score", .value = .{ .int = d.score } },
+        }));
+    }
+    return rows;
+}
+
+test "row_number assigns 1..n within a single implicit partition, ordered" {
+    const allocator = std.testing.allocator;
+    var rows = try threeRowsOnePartition(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+
+    const order = [_]querymod.OrderBy{.{ .field = "score" }};
+    const results = try compute(allocator, rows.items, &.{}, &order, .{ .field = "", .kind = .row_number }, .rows);
+    defer freeResults(allocator, results);
+
+    // Input order: score 30, 10, 20 -> ascending rank order is row1=10
+    // (input index 1), row2=20 (index 2), row3=30 (index 0). Results stay
+    // aligned to INPUT row order, not the sorted walk order.
+    try std.testing.expectEqual(@as(i64, 3), results[0].int); // score 30 -> 3rd
+    try std.testing.expectEqual(@as(i64, 1), results[1].int); // score 10 -> 1st
+    try std.testing.expectEqual(@as(i64, 2), results[2].int); // score 20 -> 2nd
+}
+
+test "row_number restarts at 1 per partition" {
+    const allocator = std.testing.allocator;
+    var rows = std.ArrayList(Row).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+    const data = [_]struct { city: []const u8, score: i64 }{
+        .{ .city = "warsaw", .score = 5 },
+        .{ .city = "krakow", .score = 9 },
+        .{ .city = "warsaw", .score = 1 },
+        .{ .city = "krakow", .score = 2 },
+    };
+    for (data) |d| {
+        try rows.append(try makeRow(allocator, &.{
+            .{ .name = "city", .value = .{ .text = d.city } },
+            .{ .name = "score", .value = .{ .int = d.score } },
+        }));
+    }
+
+    const partition = [_][]const u8{"city"};
+    const order = [_]querymod.OrderBy{.{ .field = "score" }};
+    const results = try compute(allocator, rows.items, &partition, &order, .{ .field = "", .kind = .row_number }, .rows);
+    defer freeResults(allocator, results);
+
