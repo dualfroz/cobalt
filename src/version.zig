@@ -3,14 +3,6 @@ const encode = @import("encode.zig");
 
 const Allocator = std.mem.Allocator;
 
-// VersionSet/VersionEdit: append-only log of incremental changes to the
-// live sstable set (fileId -> level), replacing a full-state rewrite on
-// every flush/compact. Modeled on LevelDB's VersionSet: a CURRENT file
-// names the active manifest log, the log holds a sequence of edit
-// records, and recovery replays them into a map. The log is periodically
-// rotated (a single snapshot record replaces the whole history) so it
-// never grows without bound.
-
 pub const VersionError = error{
     Corrupt,
     Truncated,
@@ -25,17 +17,6 @@ pub const VersionEdit = struct {
     allocator: Allocator,
     added: std.ArrayList(FileEdit),
     deleted: std.ArrayList(u64),
-    /// Optional counter watermarks, stamped by the caller alongside a file
-    /// add/delete: the exact `Db.nextFileId`/`Db.nextSeq` value in effect
-    /// right after this edit was built. Recorded so recovery can recover
-    /// these counters from the manifest instead of relying solely on
-    /// scanning which sstable files currently happen to be on disk - a scan
-    /// alone regresses whenever a compaction fully garbage-collects a run of
-    /// tombstones into zero output files (see runMerge: no output file means
-    /// no fresh fileId is minted, and if the GC'd inputs held the highest
-    /// seq/fileId ever used, a post-restart scan would compute a lower
-    /// floor than what was really already consumed, risking seq reuse
-    /// across a restart).
     nextFileId: ?u64 = null,
     nextSeq: ?u64 = null,
 
@@ -88,16 +69,11 @@ pub const VersionEdit = struct {
     }
 };
 
-/// Applies an edit's added/deleted entries onto a live fileId->level map.
 pub fn applyEdit(state: *std.AutoHashMap(u64, usize), added: []const FileEdit, deleted: []const u64) !void {
     for (deleted) |id| _ = state.remove(id);
     for (added) |f| try state.put(f.fileId, f.level);
 }
 
-/// Recovered counter watermarks, threaded out of `VersionSet.open`'s replay
-/// so `Db.open` can fold them into its own directory-scan-based recovery
-/// (taking the max of both sources - see `VersionEdit.nextFileId`/`nextSeq`
-/// doc comment for why the scan alone is not always sufficient).
 pub const Counters = struct {
     nextFileId: ?u64 = null,
     nextSeq: ?u64 = null,
@@ -115,17 +91,9 @@ pub const VersionSet = struct {
     dir: std.fs.Dir,
     file: std.fs.File,
     manifestId: u64,
-    /// Number of edit records appended to the current log since the last
-    /// rotation (used as the rotation heuristic).
     pendingRecords: usize,
-    /// Latest counter watermarks seen across every replayed (or since
-    /// applied) edit - see `VersionEdit.nextFileId`/`nextSeq`. Carried
-    /// forward into `rotate`'s snapshot record so they survive log rotation
-    /// even though the individual edits that set them get discarded.
     counters: Counters,
 
-    /// Opens (or bootstraps) the version set, replaying the active
-    /// manifest log into a fresh fileId->level map that the caller owns.
     pub fn open(allocator: Allocator, dir: std.fs.Dir) !struct { set: VersionSet, state: std.AutoHashMap(u64, usize) } {
         var state = std.AutoHashMap(u64, usize).init(allocator);
         errdefer state.deinit();
@@ -211,9 +179,6 @@ pub const VersionSet = struct {
         self.file.close();
     }
 
-    /// Applies `edit` to `state` and durably appends it to the manifest
-    /// log. Rotates (compacts the log to a single snapshot record) once
-    /// the number of pending records grows past the live file count.
     pub fn logAndApply(self: *VersionSet, edit: *const VersionEdit, state: *std.AutoHashMap(u64, usize)) !void {
         if (edit.isEmpty()) return;
         try applyEdit(state, edit.added.items, edit.deleted.items);
@@ -244,10 +209,6 @@ pub const VersionSet = struct {
         try self.file.sync();
     }
 
-    /// Replaces the whole log history with a single snapshot record that
-    /// reproduces the current live state, then switches CURRENT to it and
-    /// deletes the old log. Bounds manifest size to O(live files) instead
-    /// of O(edits ever applied).
     fn rotate(self: *VersionSet, state: *const std.AutoHashMap(u64, usize)) !void {
         var snapshot = std.ArrayList(FileEdit).init(self.allocator);
         defer snapshot.deinit();
@@ -273,9 +234,6 @@ pub const VersionSet = struct {
                 try writer.putU32(f.level);
             }
             try writer.putU32(0);
-            // Carry the latest known counters forward into the snapshot so
-            // they survive rotation even though the edits that originally
-            // set them are being discarded along with the old log.
             try writer.byte(if (self.counters.nextFileId != null) 1 else 0);
             if (self.counters.nextFileId) |v| try writer.putU64(v);
             try writer.byte(if (self.counters.nextSeq != null) 1 else 0);
@@ -336,8 +294,6 @@ fn recordBodyLen(data: []const u8, bodyStart: usize) ?usize {
         if (p + 8 > data.len) return null;
         p += 8;
     }
-    // Trailing counter watermarks: one presence flag byte plus an optional
-    // u64 each, for nextFileId then nextSeq.
     var k: u32 = 0;
     while (k < 2) : (k += 1) {
         if (p + 1 > data.len) return null;
@@ -462,9 +418,6 @@ test "manifest rotates once pending records outgrow live file count" {
     defer opened.state.deinit();
     defer opened.set.close();
 
-    // Simulate steady-state leveled compaction: the live file count stays
-    // fixed at 1 (each round replaces the previous output), but the edit
-    // log keeps growing until it is worth rotating to a fresh snapshot.
     var fileId: u64 = 1;
     {
         var edit = VersionEdit.init(allocator);
@@ -608,9 +561,6 @@ test "counters survive manifest rotation" {
             edit.setNextSeq(10);
             try opened.set.logAndApply(&edit, &opened.state);
         }
-        // Force rotation the same way the existing rotation test does, each
-        // round bumping the seq counter so the final persisted value is
-        // distinguishable from an earlier one if rotation dropped it.
         var n: usize = 0;
         while (n < 20) : (n += 1) {
             var edit = VersionEdit.init(allocator);

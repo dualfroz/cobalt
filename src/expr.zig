@@ -8,9 +8,6 @@ const Allocator = std.mem.Allocator;
 const Predicate = querymod.Predicate;
 const Condition = querymod.Condition;
 
-/// Errors a caller can act on when a `table select` expression is rejected.
-/// Parsing never panics on malformed input - every failure mode a user can
-/// trigger from the CLI maps to one of these.
 pub const ParseError = error{
     UnexpectedToken,
     UnexpectedEnd,
@@ -19,9 +16,6 @@ pub const ParseError = error{
     InvalidValue,
 } || Allocator.Error;
 
-/// Owns every allocation a parsed Predicate tree depends on (field-name and
-/// text-value copies, and_/or_ slices, not_ boxes) in one arena, so freeing
-/// is a single `deinit()` regardless of how deep the tree is.
 pub const Parsed = struct {
     arena: std.heap.ArenaAllocator,
     predicate: Predicate,
@@ -70,17 +64,6 @@ fn isKeyword(tok: Token, kw: []const u8) bool {
     return tok.kind == .word and std.mem.eql(u8, tok.text, kw);
 }
 
-/// Recursive-descent parser for the `table select` predicate language:
-///
-///   expr    := and ("or" and)*
-///   and     := unary ("and" unary)*
-///   unary   := "not" unary | primary
-///   primary := "(" expr ")" | field op value | field ("is_null" | "is_not_null")
-///   op      := eq | ne | lt | lte | gt | gte | like
-///
-/// Precedence (loosest to tightest) is or < and < not, matching every other
-/// C-family boolean expression language, so `a eq 1 or b eq 2 and not c eq 3`
-/// parses as `a eq 1 or (b eq 2 and (not (c eq 3)))`.
 const Parser = struct {
     lexer: Lexer,
     allocator: Allocator,
@@ -169,17 +152,6 @@ const Parser = struct {
         return error.UnknownOperator;
     }
 
-    /// `field in (v1 v2 ...)`: desugars to an `or_` of per-value `eq`
-    /// leaves against the same field, sharing the one field-name copy the
-    /// caller already made (Condition never owns `field`, so aliasing it
-    /// across every leaf is safe). A single value collapses to a bare `eq`
-    /// leaf, the same collapse `parseAnd`/`parseOr` already do for a
-    /// one-element and/or chain - lets a one-value `in` use an index like
-    /// `eq` does, since `findIndexableLeaf`/`findCompositeMatch` never look
-    /// inside `or_`. An empty list, `field in ()`, is not a syntax error:
-    /// it desugars to an `or_` over zero leaves, which `Predicate.evaluate`
-    /// already folds to `false` for an empty `preds` slice - matching SQL's
-    /// "IN () is always false" without a special case here.
     fn parseIn(self: *Parser, field: []const u8) ParseError!Predicate {
         if (self.cur.kind != .lparen) return if (self.cur.kind == .eof) error.UnexpectedEnd else error.UnexpectedToken;
         self.advance();
@@ -198,13 +170,6 @@ const Parser = struct {
         return .{ .or_ = try list.toOwnedSlice() };
     }
 
-    /// `field between lo and hi`: desugars to `field gte lo and field lte
-    /// hi` (inclusive both ends, matching SQL BETWEEN). The `and` here is
-    /// consumed as part of this leaf's own grammar, not the outer
-    /// `parseAnd` binary connective, so it never nests a further `and_`
-    /// level - by the time control returns to the caller, `self.cur` is
-    /// whatever token follows `hi` (rparen/eof/"and"/"or"), decided purely
-    /// by having advanced past every token this leaf owns.
     fn parseBetween(self: *Parser, field: []const u8) ParseError!Predicate {
         if (self.cur.kind != .word) return error.UnexpectedEnd;
         const rawLow = rowmod.Value.parseCli(self.cur.text) catch return error.InvalidValue;
@@ -226,10 +191,6 @@ const Parser = struct {
     }
 };
 
-/// Parses a full `table select` predicate expression, e.g.
-/// `city eq s:warsaw and (age gte i:30 or not age lt i:10)`. The returned
-/// Parsed owns every slice/pointer the Predicate tree references - `text`
-/// itself does not need to outlive the call.
 pub fn parse(backing: Allocator, text: []const u8) ParseError!Parsed {
     var arena = std.heap.ArenaAllocator.init(backing);
     errdefer arena.deinit();
@@ -268,9 +229,6 @@ test "and binds tighter than or" {
     try row.set("b", .{ .int = 2 });
     try row.set("c", .{ .int = 99 });
 
-    // a eq 1 or b eq 2 and c eq 3  ==  (a eq 1) or ((b eq 2) and (c eq 3))
-    // b eq 2 is true but c eq 3 is false, so the and-branch is false; the
-    // overall result must still be true because of the leading `a eq 1`.
     try std.testing.expect(try evalStr(allocator, "a eq i:1 or b eq i:2 and c eq i:3", &row));
 
     var row2 = rowmod.Row.init(allocator);
@@ -289,7 +247,6 @@ test "parentheses override default precedence" {
     try row.set("b", .{ .int = 2 });
     try row.set("c", .{ .int = 5 });
 
-    // (a eq 1 or b eq 2) and c eq 5 - forces the or to evaluate before and.
     try std.testing.expect(try evalStr(allocator, "(a eq i:1 or b eq i:2) and c eq i:5", &row));
     try std.testing.expect(!try evalStr(allocator, "(a eq i:1 or b eq i:2) and c eq i:6", &row));
 }
@@ -339,9 +296,7 @@ test "like matches SQL-style wildcards and rejects non-text patterns" {
     try std.testing.expect(try evalStr(allocator, "name like s:%Lovelace", &row));
     try std.testing.expect(try evalStr(allocator, "name like s:%Love%", &row));
     try std.testing.expect(!try evalStr(allocator, "name like s:Boris%", &row));
-    // like against a non-text row field never matches, it does not error.
     try std.testing.expect(!try evalStr(allocator, "age like s:3%", &row));
-    // like combines with and/or/not/parens exactly like every other operator.
     try std.testing.expect(try evalStr(allocator, "name like s:Ada% and age eq i:36", &row));
     try std.testing.expect(!try evalStr(allocator, "not name like s:Ada%", &row));
 
@@ -399,9 +354,6 @@ test "field name copy and value copy outlive the source text" {
     var buf: [64]u8 = undefined;
     const src = try std.fmt.bufPrint(&buf, "name eq s:ada", .{});
     var parsed = try parse(allocator, src);
-    // Overwrite the source buffer entirely: if the parser had kept slices
-    // into `src` instead of arena-owned copies, this would corrupt the
-    // predicate's field name/value in place.
     @memset(&buf, 'X');
     try std.testing.expect(parsed.predicate.evaluate(&row));
     parsed.deinit();
@@ -427,9 +379,7 @@ test "in matches any value in the list" {
 
     try std.testing.expect(try evalStr(allocator, "city in (s:warsaw s:krakow s:gdansk)", &row));
     try std.testing.expect(!try evalStr(allocator, "city in (s:warsaw s:gdansk)", &row));
-    // Empty list is always false, mirroring SQL's `IN ()`.
     try std.testing.expect(!try evalStr(allocator, "city in ()", &row));
-    // Combines with and/or/not/parens like every other operator.
     try std.testing.expect(try evalStr(allocator, "city in (s:krakow) and not city eq s:warsaw", &row));
     try std.testing.expect(!try evalStr(allocator, "not city in (s:warsaw s:krakow)", &row));
 }
@@ -452,8 +402,6 @@ test "between is inclusive on both ends" {
     try std.testing.expect(try evalStr(allocator, "age between i:20 and i:30", &row));
     try std.testing.expect(!try evalStr(allocator, "age between i:31 and i:40", &row));
     try std.testing.expect(!try evalStr(allocator, "age between i:10 and i:29", &row));
-    // Combines with and/or/not/parens, and the leaf's own "and" does not
-    // leak into the outer and/or grammar as a second top-level conjunct.
     try std.testing.expect(try evalStr(allocator, "age between i:25 and i:35 and age ne i:0", &row));
     try std.testing.expect(!try evalStr(allocator, "not age between i:25 and i:35", &row));
 }
@@ -562,6 +510,5 @@ test "between reaches Table.select through an index range like gte/lte does" {
 
     const results = try table.select(parsed.predicate);
     defer querymod.freeRows(allocator, results);
-    // ages 20, 30, 40, 50 - inclusive both ends.
     try std.testing.expectEqual(@as(usize, 4), results.len);
 }

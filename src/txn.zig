@@ -81,8 +81,6 @@ pub const Transaction = struct {
         try self.reads.put(keyCopy, {});
     }
 
-    /// One key/value pair from `scanPrefix`, owned by the caller (free with
-    /// `freeEntries`).
     pub const Entry = struct {
         key: []u8,
         value: []u8,
@@ -98,20 +96,6 @@ pub const Transaction = struct {
         allocator.free(entries);
     }
 
-    /// Prefix scan that reflects this transaction's own uncommitted writes,
-    /// the same read-your-writes promise `get` makes for a single key
-    /// extended to a whole key range: a row staged here shadows whatever the
-    /// committed snapshot has under that exact key (a staged tombstone hides
-    /// it entirely, a staged value replaces it), and a brand-new key staged
-    /// here that falls under `prefix` shows up even though the underlying
-    /// `Db` has never durably seen it. Every entry the underlying snapshot
-    /// contributes is also recorded as a read for OCC purposes, same as
-    /// `get` - a concurrent external write to one of those existing keys
-    /// between now and `commit()` is still caught as `error.Conflict`. A
-    /// concurrent external INSERT of a brand-new key under `prefix` is not
-    /// caught (there is no key to register a read against before it
-    /// exists) - the same phantom-read gap every OCC scheme without
-    /// range-locks has, not something specific to this method.
     pub fn scanPrefix(self: *Transaction, allocator: Allocator, prefix: []const u8) ![]Entry {
         var results = std.ArrayList(Entry).init(allocator);
         errdefer {

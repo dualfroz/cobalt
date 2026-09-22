@@ -7,22 +7,6 @@ const Db = db_mod.Db;
 const Snapshot = db_mod.Snapshot;
 const WriteBatch = db_mod.WriteBatch;
 
-// Portable logical backup format for cobalt. Dumps a consistent, point-in-time
-// view of the live keyspace (as returned by Snapshot.scan - tombstones already
-// resolved) into a self-describing file that can be replayed into any Db.
-//
-// Layout:
-//   header: magic("CBLB" 4B) | version(u32) | seq(u64)
-//   entry*: keyLen(u32) | valueLen(u32) | key | value | entryCrc(u32)
-//           entryCrc = crc32(keyLen le bytes || valueLen le bytes || key || value)
-//   footer: magic("CBLE" 4B) | entryCount(u64) | fileCrc(u32)
-//           fileCrc = crc32 of every byte written before the footer magic
-//           (header + all entries), rolling-accumulated while writing.
-//
-// Restore validates the whole file (magics, per-entry crc, trailing count,
-// whole-file crc) before touching the target Db, so a corrupt or truncated
-// backup never applies a partial write.
-
 const headerMagic = "CBLB";
 const footerMagic = "CBLE";
 const formatVersion: u32 = 1;
@@ -74,8 +58,6 @@ fn putU64Crc(writer: anytype, roll: *RollingCrc, v: u64) !void {
     try writeAllCrc(writer, roll, &b);
 }
 
-/// Writes a full, consistent backup of `snapshot` to `path` (created/truncated).
-/// Returns the number of entries written.
 pub fn dumpToFile(allocator: Allocator, snapshot: Snapshot, path: []const u8) !u64 {
     const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
     defer file.close();
@@ -129,10 +111,6 @@ const ParsedEntry = struct {
     value: []const u8,
 };
 
-/// One pass over a fully-loaded backup buffer: validates structure end to end
-/// (magics, per-entry crc, declared count, whole-file crc) without allocating
-/// per-entry copies. Returns the entries slice (positions into `data`) plus
-/// backup metadata, or a BackupError describing the first problem found.
 const ParsedBackup = struct {
     seq: u64,
     entries: []ParsedEntry,
@@ -183,9 +161,6 @@ fn parse(allocator: Allocator, data: []const u8) !ParsedBackup {
     return .{ .seq = seq, .entries = try entries.toOwnedSlice() };
 }
 
-/// Reads and structurally validates a backup file without applying it,
-/// returning its metadata (seq, entry count). Useful to verify a backup
-/// before trusting it for disaster recovery.
 pub fn inspectFile(allocator: Allocator, path: []const u8) !BackupInfo {
     const data = try std.fs.cwd().readFileAlloc(allocator, path, 1 << 34);
     defer allocator.free(data);
@@ -194,12 +169,6 @@ pub fn inspectFile(allocator: Allocator, path: []const u8) !BackupInfo {
     return .{ .seq = parsed.seq, .entryCount = parsed.entries.len };
 }
 
-/// Restores every entry from the backup at `path` into `db`, in chunks of
-/// `chunkSize` applied atomically via WriteBatch. The whole file is validated
-/// (magics, per-entry and whole-file crc, declared count) before any chunk is
-/// applied, so a corrupt backup fails without mutating the target database.
-/// Existing keys in `db` outside the backup are left untouched; keys present
-/// in both are overwritten with the backup's value.
 pub fn restoreFromFile(allocator: Allocator, db: *Db, path: []const u8, chunkSize: usize) !BackupInfo {
     const data = try std.fs.cwd().readFileAlloc(allocator, path, 1 << 34);
     defer allocator.free(data);
@@ -244,7 +213,6 @@ test "backup round trip: dump then restore into a fresh db reproduces every key"
         const value = try std.fmt.bufPrint(&valBuf, "v{d:0>6}", .{i});
         try src.put(key, value);
     }
-    // overwrite one, delete another: backup must reflect resolved state.
     try src.put("k000005", "updated");
     try src.delete("k000010");
 
@@ -409,7 +377,6 @@ test "corrupted entry payload is rejected before any restore write happens" {
     {
         const file = try std.fs.cwd().openFile(backupPath, .{ .mode = .read_write });
         defer file.close();
-        // flip a byte squarely inside the entry region (well past the 16 byte header).
         try file.seekTo(24);
         var byte: [1]u8 = undefined;
         _ = try file.read(&byte);
@@ -422,8 +389,6 @@ test "corrupted entry payload is rejected before any restore write happens" {
     const result = restoreFromFile(allocator, &dst, backupPath, 32);
     try std.testing.expectError(BackupError.Corrupt, result);
 
-    // nothing from the corrupt backup should have been applied: validation
-    // happens over the whole in-memory buffer before the first WriteBatch.
     var iter = try dst.scan(allocator, null, null);
     defer iter.deinit();
     try std.testing.expect((try iter.next()) == null);
@@ -511,8 +476,6 @@ test "declared entry count mismatch is caught even if per-entry crcs are valid" 
     {
         const data = try std.fs.cwd().readFileAlloc(allocator, backupPath, 1 << 20);
         defer allocator.free(data);
-        // footer is the last 4(magic)+8(count)+4(crc)=16 bytes; corrupt count only,
-        // which necessarily also breaks the whole-file crc, but count is checked first.
         const countPos = data.len - 12;
         var mutated = try allocator.dupe(u8, data);
         defer allocator.free(mutated);

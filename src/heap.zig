@@ -1,9 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// Binary heap ordered by `lessThan(context, a, b)`: parent never compares
-/// greater than either child under that relation. Pass a comparator that
-/// returns `a > b` to get a max-heap out of the same implementation.
 pub fn MinHeap(comptime T: type, comptime Context: type, comptime lessThan: fn (context: Context, a: T, b: T) bool) type {
     return struct {
         items: std.ArrayList(T),
@@ -44,9 +41,6 @@ pub fn MinHeap(comptime T: type, comptime Context: type, comptime lessThan: fn (
             return top;
         }
 
-        /// Swap the root for `item` and restore the heap property in one
-        /// siftDown, instead of a pop() (siftDown) followed by a push()
-        /// (siftUp). Caller must ensure the heap is non-empty.
         pub fn replaceTop(self: *Self, item: T) T {
             const old = self.items.items[0];
             self.items.items[0] = item;
@@ -79,7 +73,6 @@ pub fn MinHeap(comptime T: type, comptime Context: type, comptime lessThan: fn (
             }
         }
 
-        /// Debug helper: verifies the heap invariant holds at every node.
         pub fn isValid(self: *const Self) bool {
             const n = self.items.items.len;
             var idx: usize = 0;

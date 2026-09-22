@@ -17,28 +17,8 @@ const UniqueSet = idx.UniqueSet;
 const ForeignKeySet = idx.ForeignKeySet;
 const CheckConstraintSet = idx.CheckConstraintSet;
 
-/// Same reserved primary-key field name query.zig's Table uses, so rows
-/// written through a TableTxn and rows written through a plain Table are
-/// wire-compatible: both land in the same "R\x00table\x00pk" keyspace and
-/// decode identically.
 pub const pkField = querymod.pkField;
 
-/// A Table view bound to one in-flight Transaction. Where query.zig's Table
-/// writes each row and its index entries directly to the Db (each `put`/
-/// `delete` call is independently durable the moment it returns), TableTxn
-/// stages every row write and every index-entry write into the Transaction's
-/// write set instead. Nothing is visible to other readers, and nothing can
-/// conflict with a concurrent writer, until the caller calls `Transaction.
-/// commit()` - at which point every staged row and index mutation across
-/// every TableTxn.put/delete call made against this Transaction becomes
-/// visible atomically in a single WriteBatch, or none of it does (OCC
-/// conflict -> error.Conflict, no partial application).
-///
-/// Index membership itself (which fields are indexed) is read directly from
-/// the Db when a TableTxn is opened, not through the Transaction - creating
-/// or dropping an index is a schema change made through query.zig's Table,
-/// not through TableTxn. A TableTxn only keeps *existing* indexes in sync
-/// for the rows it writes.
 pub const TableTxn = struct {
     txn: *Transaction,
     allocator: Allocator,
@@ -85,15 +65,6 @@ pub const TableTxn = struct {
         return self.checks.has(name);
     }
 
-    /// Whether `value` names an existing row of `spec.refTable` under
-    /// `spec.refField`, mirroring `query.zig`'s `Table.foreignKeyTargetExists`
-    /// with one difference: both branches go through the bound `Transaction`
-    /// instead of a plain `Db` call, so a parent row (or a unique-field FK
-    /// target) staged earlier in the SAME uncommitted transaction already
-    /// satisfies a child's FK check before either is durable -
-    /// read-your-writes across tables, not just within one, via
-    /// `Transaction.get` for the `pkField` case and `Transaction.scanPrefix`
-    /// (see its doc comment) for the non-pk case.
     fn foreignKeyTargetExists(self: *TableTxn, refTableName: []const u8, refField: []const u8, value: Value) !bool {
         if (std.mem.eql(u8, refField, pkField)) {
             const key = try idx.rowKey(self.allocator, refTableName, value);
@@ -109,9 +80,6 @@ pub const TableTxn = struct {
         return entries.len > 0;
     }
 
-    /// Reads through the bound Transaction, so this sees the Transaction's
-    /// own uncommitted writes (read-your-writes) and registers the row key
-    /// as read for OCC conflict detection at commit time.
     pub fn get(self: *TableTxn, pk: Value) !?Row {
         const key = try idx.rowKey(self.allocator, self.name, pk);
         defer self.allocator.free(key);
@@ -120,10 +88,6 @@ pub const TableTxn = struct {
         return try Row.decode(self.allocator, raw);
     }
 
-    /// Stages a full-row replace of `pk` plus every index-entry add/remove
-    /// needed to keep currently-registered indexes consistent with the new
-    /// row, all as buffered Transaction writes. None of it is visible or
-    /// durable until commit.
     pub fn put(self: *TableTxn, pk: Value, fields: []const Field) !void {
         var old = try self.get(pk);
         defer if (old) |*o| o.deinit();
@@ -138,26 +102,12 @@ pub const TableTxn = struct {
         const key = try idx.rowKey(self.allocator, self.name, pk);
         defer self.allocator.free(key);
 
-        // CHECK constraints run first, ahead of UNIQUE/FOREIGN KEY - same
-        // ordering and same "reparse on every put" cost as `query.zig`'s
-        // `Table.put`. Purely local to `newRow`, so unlike UNIQUE/FOREIGN
-        // KEY below this needs no `Transaction.scanPrefix` read-your-writes
-        // handling at all.
         for (self.checks.specs.items) |spec| {
             var parsed = exprmod.parse(self.allocator, spec.source) catch return error.InvalidCheckExpression;
             defer parsed.deinit();
             if (!parsed.predicate.evaluate(&newRow)) return error.CheckViolation;
         }
 
-        // UNIQUE and FOREIGN KEY checks run before any staged mutation
-        // below, same all-or-nothing placement as `query.zig`'s `Table.put`:
-        // a violation leaves the transaction's write set exactly as it was
-        // before this call, not staged with a partial row. Both checks go
-        // through `Transaction.scanPrefix`, so a UNIQUE value or FK target
-        // staged by an EARLIER `put` call in this same still-open
-        // transaction (a different row, possibly a different `TableTxn`
-        // bound to the same `Transaction`) is caught here already, not left
-        // to surface as `error.Conflict` at `commit()`.
         for (self.unique.fields.items) |field| {
             const newValue = newRow.get(field) orelse continue;
             const oldValue = if (old) |*o| o.get(field) else null;
@@ -179,9 +129,6 @@ pub const TableTxn = struct {
             if (!try self.foreignKeyTargetExists(spec.refTable, spec.refField, newValue)) return error.ForeignKeyViolation;
         }
 
-        // ON DELETE RESTRICT's update-side counterpart, see
-        // `updateRestrictedByForeignKey`'s doc comment - same all-or-nothing
-        // placement as every other constraint check above.
         if (try self.updateRestrictedByForeignKey(pk, if (old) |*o| o else null, &newRow)) return error.ForeignKeyInUse;
 
         for (self.indexes.fields.items) |indexedField| {
@@ -200,20 +147,6 @@ pub const TableTxn = struct {
         try self.txn.put(key, encoded);
     }
 
-    /// Mirrors `query.zig`'s `Table.deletionRestrictedByForeignKey` (SQL's
-    /// `ON DELETE RESTRICT`), reading through `self.txn.scanPrefix` instead
-    /// of a plain `Db` scan - the one thing this version can do that the
-    /// plain `Table` path cannot: a child row staged earlier in this SAME
-    /// uncommitted transaction (via a sibling `TableTxn` on the child
-    /// table, sharing this `Transaction`) already counts as a live
-    /// reference, not just whatever is durably committed. `referencedBy`
-    /// itself is still loaded fresh from `self.txn.db` rather than cached
-    /// (schema metadata - like `indexes`/`unique`/`foreignKeys` above - is
-    /// only ever mutated through `query.zig`'s `Table`, never through a
-    /// `TableTxn`, but unlike those, `ReferencedBySet` is written by some
-    /// OTHER table's `createForeignKey` call, so a `TableTxn` opened before
-    /// that ran cannot rely on whatever it loaded at `open()` time either -
-    /// see `Table.createForeignKey`'s doc comment for the same reasoning).
     fn deletionRestrictedByForeignKey(self: *TableTxn, pk: Value, old: *const Row) !bool {
         var referencedBy = try idx.ReferencedBySet.load(self.allocator, self.txn.db, self.name);
         defer referencedBy.deinit();
@@ -244,15 +177,6 @@ pub const TableTxn = struct {
         return false;
     }
 
-    /// `TableTxn.put`'s counterpart to `deletionRestrictedByForeignKey`,
-    /// mirroring `query.zig`'s `Table.updateRestrictedByForeignKey` (see its
-    /// doc comment for why an update needs the same RESTRICT as a delete)
-    /// but reading through `self.txn.scanPrefix` like the delete-restrict
-    /// version above it, so a child row staged earlier in this same
-    /// uncommitted transaction already counts as a live reference. `old` may
-    /// be null (a fresh insert has nothing to pull out from under anyone),
-    /// and a `refField` whose new value equals its old value is exempt, the
-    /// same exemption `put`'s own UNIQUE check above makes.
     fn updateRestrictedByForeignKey(self: *TableTxn, pk: Value, old: ?*const Row, newRow: *const Row) !bool {
         var referencedBy = try idx.ReferencedBySet.load(self.allocator, self.txn.db, self.name);
         defer referencedBy.deinit();
@@ -339,7 +263,6 @@ test "TableTxn commits multiple rows atomically" {
     try t.put(.{ .int = 1 }, &.{.{ .name = "balance", .value = .{ .int = 100 } }});
     try t.put(.{ .int = 2 }, &.{.{ .name = "balance", .value = .{ .int = 50 } }});
 
-    // Nothing visible outside the transaction yet.
     const probeKey = try idx.rowKey(allocator, "accounts", .{ .int = 1 });
     defer allocator.free(probeKey);
     try std.testing.expect((try db.get(allocator, probeKey)) == null);
@@ -375,7 +298,6 @@ test "TableTxn transfer is all-or-nothing on conflict" {
     var t = try TableTxn.open(&txn, allocator, "accounts");
     defer t.deinit();
 
-    // Move 30 from account 1 to account 2, staged but not yet committed.
     var from = (try t.get(.{ .int = 1 })).?;
     defer from.deinit();
     var to = (try t.get(.{ .int = 2 })).?;
@@ -383,7 +305,6 @@ test "TableTxn transfer is all-or-nothing on conflict" {
     try t.put(.{ .int = 1 }, &.{.{ .name = "balance", .value = .{ .int = from.get("balance").?.int - 30 } }});
     try t.put(.{ .int = 2 }, &.{.{ .name = "balance", .value = .{ .int = to.get("balance").?.int + 30 } }});
 
-    // An external writer touches account 1 before the transfer commits.
     {
         var external = try querymod.Table.open(&db, allocator, "accounts");
         defer external.deinit();
@@ -392,9 +313,6 @@ test "TableTxn transfer is all-or-nothing on conflict" {
 
     try std.testing.expectError(error.Conflict, txn.commit());
 
-    // Neither leg of the transfer applied: account 2 must be untouched,
-    // and account 1 must show the external writer's value, not the stale
-    // transfer's.
     var verify = try querymod.Table.open(&db, allocator, "accounts");
     defer verify.deinit();
     var row1 = (try verify.get(.{ .int = 1 })).?;
@@ -462,7 +380,6 @@ test "TableTxn delete removes row and index entries only on commit" {
     defer t.deinit();
     try t.delete(.{ .int = 1 });
 
-    // Not yet committed: still visible outside the transaction.
     {
         var outside = try querymod.Table.open(&db, allocator, "users");
         defer outside.deinit();
@@ -537,7 +454,6 @@ test "TableTxn put enforces UNIQUE constraint against committed data" {
         .{ .name = "email", .value = .{ .text = "a@example.com" } },
     }));
 
-    // The rejected put staged nothing: committing now applies zero rows.
     try txn.commit();
     var plain = try querymod.Table.open(&db, allocator, "users");
     defer plain.deinit();
@@ -563,8 +479,6 @@ test "TableTxn put UNIQUE check exempts a row keeping its own previous value" {
     var t = try TableTxn.open(&txn, allocator, "users");
     defer t.deinit();
 
-    // Updating an unrelated field on row 1 keeps its own email unchanged -
-    // must not spuriously conflict with itself.
     try t.put(.{ .int = 1 }, &.{
         .{ .name = "email", .value = .{ .text = "a@example.com" } },
         .{ .name = "name", .value = .{ .text = "ada" } },
@@ -601,9 +515,7 @@ test "TableTxn put enforces FOREIGN KEY against committed data and rejects a dan
     defer t.deinit();
     try std.testing.expect(t.hasForeignKey("customer_id"));
 
-    // customer 1 exists (committed) -> allowed.
     try t.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
-    // customer 999 does not exist anywhere -> rejected.
     try std.testing.expectError(error.ForeignKeyViolation, t.put(.{ .int = 101 }, &.{
         .{ .name = "customer_id", .value = .{ .int = 999 } },
     }));
@@ -625,8 +537,6 @@ test "TableTxn put FOREIGN KEY on pkField sees a parent staged earlier in the sa
     defer db.close();
 
     {
-        // Self-referencing table (an org chart: manager_id -> employees.pk),
-        // installed while empty so no existing-row check gets in the way.
         var employees = try querymod.Table.open(&db, allocator, "employees");
         defer employees.deinit();
         try employees.createForeignKey("manager_id", "employees", pkField, .restrict);
@@ -637,10 +547,6 @@ test "TableTxn put FOREIGN KEY on pkField sees a parent staged earlier in the sa
     var t = try TableTxn.open(&txn, allocator, "employees");
     defer t.deinit();
 
-    // Neither row is committed yet. The manager (pk=1) is only staged in
-    // this same transaction's write set, but the FK check on the report
-    // (pk=2) must see it via `Transaction.get`'s read-your-writes, not
-    // just via the underlying Db.
     try t.put(.{ .int = 1 }, &.{});
     try t.put(.{ .int = 2 }, &.{.{ .name = "manager_id", .value = .{ .int = 1 } }});
 
@@ -673,11 +579,6 @@ test "TableTxn put FOREIGN KEY on a non-pk unique field sees a target staged ear
     var txn = Transaction.begin(&db);
     defer txn.deinit();
 
-    // Stage a brand-new product in the same transaction as the line item
-    // that references it. `foreignKeyTargetExists`'s non-pk branch now
-    // goes through `Transaction.scanPrefix`, which sees the product's
-    // staged index-entry write even though neither row is committed yet -
-    // same read-your-writes guarantee the pkField branch above already had.
     var products = try TableTxn.open(&txn, allocator, "products");
     defer products.deinit();
     try products.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "WIDGET-1" } }});
@@ -688,7 +589,6 @@ test "TableTxn put FOREIGN KEY on a non-pk unique field sees a target staged ear
         .{ .name = "product_sku", .value = .{ .text = "WIDGET-1" } },
     });
 
-    // A dangling reference in the same transaction is still rejected.
     try std.testing.expectError(error.ForeignKeyViolation, lineItems.put(.{ .int = 2 }, &.{
         .{ .name = "product_sku", .value = .{ .text = "NO-SUCH-SKU" } },
     }));
@@ -720,15 +620,8 @@ test "TableTxn put UNIQUE constraint catches a conflict staged earlier in the sa
     var t = try TableTxn.open(&txn, allocator, "users");
     defer t.deinit();
 
-    // First row claims the email; nothing committed yet.
     try t.put(.{ .int = 1 }, &.{.{ .name = "email", .value = .{ .text = "a@example.com" } }});
 
-    // A second, different row in the SAME still-open transaction tries to
-    // claim the same email. Before `Transaction.scanPrefix`, the UNIQUE
-    // check ran `idx.scanEq` straight against `Db` and never saw the first
-    // row's staged index entry, so this put would have wrongly succeeded
-    // and only failed later as a generic OCC conflict at commit (or not at
-    // all, since the two rows touch disjoint keys and would not conflict).
     try std.testing.expectError(error.UniqueViolation, t.put(.{ .int = 2 }, &.{
         .{ .name = "email", .value = .{ .text = "a@example.com" } },
     }));
@@ -799,11 +692,6 @@ test "TableTxn `txn <script>` shape: a CHECK violation on the second put leaves 
         .{ .name = "qty", .value = .{ .int = -5 } },
     }));
 
-    // A real `txn <script>` dispatch (main.zig's `runTxn`/server.zig's
-    // `handleTxnOp`) aborts the whole script on the first line that fails
-    // instead of continuing - `t.deinit()`/`txn.deinit()` above discard the
-    // transaction without ever calling `commit()`, so even row 1 (which was
-    // individually valid) must never become visible.
     var plain = try querymod.Table.open(&db, allocator, "orders");
     defer plain.deinit();
     try std.testing.expect((try plain.get(.{ .int = 1 })) == null);
@@ -861,11 +749,6 @@ test "TableTxn delete RESTRICT sees a child row staged earlier in the same uncom
     var txn = Transaction.begin(&db);
     defer txn.deinit();
 
-    // The order referencing customer 1 is only staged in this SAME
-    // transaction's write set (via a sibling TableTxn on "orders"), never
-    // committed - `Transaction.scanPrefix` (not a plain Db scan, which
-    // would see nothing under the orders row prefix yet) is what makes
-    // this count as a live reference before the transaction ever commits.
     var ordersTxn = try TableTxn.open(&txn, allocator, "orders");
     defer ordersTxn.deinit();
     try ordersTxn.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
@@ -931,10 +814,7 @@ test "TableTxn delete RESTRICT excludes the row being deleted from its own self-
     var t = try TableTxn.open(&txn, allocator, "employees");
     defer t.deinit();
 
-    // The manager (pk 1) has a report (pk 2) -> restricted.
     try std.testing.expectError(error.ForeignKeyInUse, t.delete(.{ .int = 1 }));
-    // The report itself has no reports of its own -> deletes cleanly,
-    // scanning the same table it belongs to without restricting itself.
     try t.delete(.{ .int = 2 });
     try txn.commit();
 
@@ -970,7 +850,6 @@ test "TableTxn put is restricted from changing a UNIQUE foreign key target a com
     try std.testing.expectError(error.ForeignKeyInUse, t.put(.{ .int = 1 }, &.{
         .{ .name = "sku", .value = .{ .text = "WIDGET-2" } },
     }));
-    // Unchanged is always exempt.
     try t.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "WIDGET-1" } }});
     try txn.commit();
 
@@ -1002,9 +881,6 @@ test "TableTxn put update-restrict sees a child row staged earlier in the same u
     var txn = Transaction.begin(&db);
     defer txn.deinit();
 
-    // The line item referencing "WIDGET-1" is only staged in this SAME
-    // transaction's write set, never committed - `Transaction.scanPrefix`
-    // is what makes this count as a live reference before commit.
     var lineItemsTxn = try TableTxn.open(&txn, allocator, "line_items");
     defer lineItemsTxn.deinit();
     try lineItemsTxn.put(.{ .int = 1 }, &.{.{ .name = "product_sku", .value = .{ .text = "WIDGET-1" } }});
@@ -1015,8 +891,6 @@ test "TableTxn put update-restrict sees a child row staged earlier in the same u
         .{ .name = "sku", .value = .{ .text = "WIDGET-2" } },
     }));
 
-    // Once the referencing line item is removed in the same transaction,
-    // the rename goes through.
     try lineItemsTxn.delete(.{ .int = 1 });
     try productsTxn.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "WIDGET-2" } }});
     try txn.commit();

@@ -3,15 +3,6 @@ const authmod = @import("auth.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Random session tokens with expiration, independent of any one TCP
-/// connection - the layer that replaces "authenticated for as long as this
-/// socket stays open" (server.zig's `connRole`) with "authenticated until
-/// this token expires or is revoked". A client that authenticates once,
-/// gets a token back, and disconnects can reconnect later and resume the
-/// same role by presenting the token (`auth_token` opcode in protocol.zig)
-/// instead of the password again - and the token stops working on its own
-/// after its TTL elapses even if the same connection stays open the whole
-/// time, unlike plain password auth which never expires mid-connection.
 pub const tokenBytes = 24;
 pub const tokenHexLen = tokenBytes * 2;
 
@@ -26,10 +17,6 @@ pub const Session = struct {
     expiresAtNanos: i128,
 };
 
-/// In-memory only (never persisted to Db - a session is a login artifact,
-/// not application data): thread-safe via its own mutex since `server.zig`
-/// dispatches requests from one worker thread per connection and any of
-/// them may issue, validate, or revoke a token concurrently.
 pub const SessionStore = struct {
     allocator: Allocator,
     mutex: std.Thread.Mutex = .{},
@@ -45,8 +32,6 @@ pub const SessionStore = struct {
         self.sessions.deinit(self.allocator);
     }
 
-    /// Issues a fresh random token bound to `role`, valid until
-    /// `nowNanos + ttlNanos`. Caller owns the returned slice.
     pub fn issue(self: *SessionStore, role: authmod.Role, ttlNanos: i128, nowNanos: i128) ![]u8 {
         const hex = generateTokenHex();
         const keyOwned = try self.allocator.dupe(u8, &hex);
@@ -60,14 +45,6 @@ pub const SessionStore = struct {
         return returned;
     }
 
-    /// Returns the session bound to `token` (role and expiry) if it exists
-    /// and has not expired as of `nowNanos`. An expired session is deleted
-    /// right here (lazy cleanup) rather than left around for
-    /// `sweepExpired` to eventually find - a token that has expired must
-    /// never again validate as live, so the deletion happens on the same
-    /// lookup that discovers it. Returning the expiry (not just the role)
-    /// lets a caller such as `server.zig` re-check the same session later
-    /// against a fresh clock without a second store lookup.
     pub fn validate(self: *SessionStore, token: []const u8, nowNanos: i128) ?Session {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -81,8 +58,6 @@ pub const SessionStore = struct {
         return entry.value_ptr.*;
     }
 
-    /// Explicit logout: removes a token before it would naturally expire.
-    /// Returns whether a session was actually present.
     pub fn revoke(self: *SessionStore, token: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -91,11 +66,6 @@ pub const SessionStore = struct {
         return true;
     }
 
-    /// Removes every session expired as of `nowNanos`, returning how many
-    /// were dropped. `validate` already deletes an expired session the
-    /// moment someone tries to use it, but a token nobody ever presents
-    /// again would otherwise sit in memory forever - this is the
-    /// housekeeping sweep a long-lived server can run periodically.
     pub fn sweepExpired(self: *SessionStore, nowNanos: i128) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -143,7 +113,6 @@ test "validate returns null once past expiry and removes the session" {
 
     try std.testing.expect(store.validate(token, 1_000) == null);
     try std.testing.expectEqual(@as(usize, 0), store.count());
-    // A second lookup of the same (already-removed) token still misses cleanly.
     try std.testing.expect(store.validate(token, 1_000) == null);
 }
 
@@ -162,7 +131,6 @@ test "revoke removes a session before its natural expiry" {
 
     try std.testing.expect(store.revoke(token));
     try std.testing.expect(store.validate(token, 0) == null);
-    // Revoking an already-gone token is a clean no-op, not an error.
     try std.testing.expect(!store.revoke(token));
 }
 
@@ -181,7 +149,6 @@ test "two tokens for different roles are independent" {
 
     try std.testing.expect(store.revoke(a));
     try std.testing.expect(store.validate(a, 0) == null);
-    // Revoking `a` must never touch `b`'s still-live session.
     try std.testing.expectEqual(authmod.Role.admin, store.validate(b, 0).?.role);
 }
 
@@ -201,7 +168,6 @@ test "sweepExpired drops only expired sessions and reports the count" {
     try std.testing.expectEqual(@as(usize, 1), store.count());
     try std.testing.expectEqual(authmod.Role.admin, store.validate(fresh, 200).?.role);
 
-    // A second sweep at the same time has nothing left to remove.
     try std.testing.expectEqual(@as(usize, 0), store.sweepExpired(200));
 }
 

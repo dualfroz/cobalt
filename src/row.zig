@@ -2,9 +2,6 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-/// Dynamically typed value stored inside a row field, an index key, or a
-/// primary key. Kept small and copyable by tag; owned byte payloads (text,
-/// bytes) are heap-allocated and must be freed by whoever owns the Row/Value.
 pub const ValueTag = enum(u8) {
     none = 0,
     boolean = 1,
@@ -42,11 +39,6 @@ pub const Value = union(ValueTag) {
         return compare(a, b) == .eq;
     }
 
-    /// Parses a single CLI/query-language token into a typed Value, using the
-    /// same `i:`/`f:`/`b:`/`s:` type-prefix convention throughout the CLI
-    /// (unprefixed tokens default to text). The returned `.text`/`.bytes`
-    /// payload (when present) is a slice into `text` - callers that need it
-    /// to outlive `text` must `dupe` the result.
     pub fn parseCli(text: []const u8) error{InvalidValue}!Value {
         if (std.mem.startsWith(u8, text, "i:")) {
             const n = std.fmt.parseInt(i64, text[2..], 10) catch return error.InvalidValue;
@@ -66,9 +58,6 @@ pub const Value = union(ValueTag) {
     }
 };
 
-/// Total order across all values: first by type tag, then by payload. This
-/// keeps a well-defined ordering even when a field holds mixed types across
-/// rows, which the ordered byte encoding below must mirror exactly.
 pub fn compare(a: Value, b: Value) std.math.Order {
     const ta = @intFromEnum(@as(ValueTag, a));
     const tb = @intFromEnum(@as(ValueTag, b));
@@ -88,9 +77,6 @@ pub const Field = struct {
     value: Value,
 };
 
-/// Self-describing, schema-less row: an ordered list of named fields. Rows
-/// are the unit stored under a table's primary-key row keys and are what
-/// query.zig hands back from scans and index lookups.
 pub const Row = struct {
     allocator: Allocator,
     fields: std.ArrayList(Field),
@@ -107,8 +93,6 @@ pub const Row = struct {
         self.fields.deinit();
     }
 
-    /// Sets a field, replacing any existing field with the same name. Copies
-    /// both the name and any owned payload of `value` into the row.
     pub fn set(self: *Row, name: []const u8, value: Value) !void {
         const owned = try value.dupe(self.allocator);
         errdefer owned.free(self.allocator);
@@ -134,8 +118,6 @@ pub const Row = struct {
         return self.fields.items.len;
     }
 
-    /// Serializes the row to a self-contained byte blob suitable as a Db
-    /// value: [u32 fieldCount] { [u16 nameLen][name][u8 tag][payload] }*.
     pub fn encode(self: *const Row, allocator: Allocator) ![]u8 {
         var out = std.ArrayList(u8).init(allocator);
         errdefer out.deinit();
@@ -243,15 +225,6 @@ fn readU64(data: []const u8, pos: *usize) !u64 {
     return v;
 }
 
-/// Appends an order-preserving byte encoding of `value` to `out`, such that
-/// lexicographic byte comparison of two encodings matches `compare()` of the
-/// original values. Used to build index keys and primary-key suffixes that
-/// must sort correctly inside the LSM tree's byte-ordered keyspace.
-///
-/// Text/bytes payloads are escaped (0x00 -> 0x00 0xFF) and terminated with
-/// 0x00 0x00 so that concatenating several encoded values back to back stays
-/// unambiguous and order-preserving (no payload can be a byte-for-byte prefix
-/// of another once escaped and terminated).
 pub fn appendOrdered(out: *std.ArrayList(u8), value: Value) !void {
     try out.append(@intFromEnum(@as(ValueTag, value)));
     switch (value) {
@@ -294,10 +267,6 @@ pub fn encodeOrdered(allocator: Allocator, value: Value) ![]u8 {
     return out.toOwnedSlice();
 }
 
-/// Encodes a single standalone Value using the same (non order-preserving)
-/// tag+payload format as a Row field, minus the field name. Used to store
-/// primary keys as index-entry values, where later exact reconstruction
-/// matters more than byte ordering.
 pub fn encodeValue(allocator: Allocator, value: Value) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
@@ -434,8 +403,6 @@ test "appendOrdered escapes embedded zero bytes unambiguously" {
     defer allocator.free(b);
     const c = try encodeOrdered(allocator, .{ .text = "ab" ++ "c"[0..0] });
     defer allocator.free(c);
-    // "ab" must sort before "ab\x00c" (shorter, unescaped terminator wins),
-    // and the escaped embedded zero must not corrupt ordering.
     try std.testing.expect(std.mem.order(u8, a, b) == .lt);
     try std.testing.expect(std.mem.eql(u8, a, c));
 }

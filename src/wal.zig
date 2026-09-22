@@ -172,10 +172,6 @@ const genRecordLen = 4 + 8 + 4;
 
 pub const GenerationError = error{ BadMagic, Truncated, Corrupt };
 
-/// Reads the WAL's current generation counter from a db directory, next to
-/// wal.log itself. Returns 0 (not an error) if the generation file has never
-/// been written - a db that has never truncated its WAL is, by definition,
-/// still on generation 0, the same value any tailer starts at.
 pub fn currentGeneration(dir: std.fs.Dir) !u64 {
     var buf: [genRecordLen]u8 = undefined;
     const file = dir.openFile(genFileName, .{}) catch |err| switch (err) {
@@ -192,13 +188,6 @@ pub fn currentGeneration(dir: std.fs.Dir) !u64 {
     return gen;
 }
 
-/// Bumps and atomically persists the WAL generation counter. Called once per
-/// truncation (see reset(), invoked from Db.flush()) so a tailer that reads
-/// this stamp can tell "same WAL contents since I last looked" from "primary
-/// truncated, and may have already regrown past whatever byte offset I had"
-/// from an explicit marker instead of a byte-size heuristic - a pure
-/// endPos-vs-offset comparison is fooled exactly when the post-truncation
-/// file reaches or exceeds the old offset before the next poll.
 pub fn bumpGeneration(dir: std.fs.Dir) !u64 {
     const gen = (try currentGeneration(dir)) + 1;
     var buf: [genRecordLen]u8 = undefined;
@@ -254,10 +243,6 @@ test "Wal.reset does not itself touch the generation counter" {
     try wal.append(.value, 1, "k", "v");
     try wal.reset();
 
-    // reset() only truncates the WAL file itself - generation bumping is a
-    // separate, explicit call made by Db.flush() at the same call site, kept
-    // out of Wal so tests exercising reset() in isolation (elsewhere in this
-    // file) do not need a directory-wide side effect they never asked for.
     try std.testing.expectEqual(@as(u64, 0), try currentGeneration(tmp.dir));
 }
 

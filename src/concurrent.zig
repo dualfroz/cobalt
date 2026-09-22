@@ -11,20 +11,6 @@ const Transaction = txnmod.Transaction;
 const TableTxn = txntable.TableTxn;
 const WriteBatch = batchmod.WriteBatch;
 
-/// A thread-safe facade over `*Db`. `Db` itself keeps no internal locking -
-/// a fact documented (and worked around ad hoc) at every call site that
-/// already needs concurrent access from more than one OS thread:
-/// server.zig takes its own `mutex` before touching `db` on every request,
-/// and every session note about txn_table.zig/query.zig/collections.zig
-/// repeats the same known gap for the same reason. `GuardedDb` is that
-/// exact pattern promoted to one reusable, independently tested primitive
-/// instead of being reimplemented by hand wherever it is next needed.
-///
-/// This does not make `Db` itself thread-safe: it makes "every access to
-/// this particular `Db` goes through this particular lock" enforceable,
-/// which is the same guarantee `Server` already relies on. Two independent
-/// `GuardedDb` wrapping the same underlying `*Db` would NOT be safe - the
-/// mutex only serializes callers that agree to go through it.
 pub const GuardedDb = struct {
     db: *Db,
     mutex: std.Thread.Mutex = .{},
@@ -33,14 +19,6 @@ pub const GuardedDb = struct {
         return .{ .db = db };
     }
 
-    /// Exclusive handle returned by `acquire()`. Holds the lock until
-    /// `release()` runs, so a caller that needs several `Db` calls to
-    /// happen as one atomic unit (a read-modify-write, or several puts
-    /// that must never be observed half-applied by another guarded
-    /// reader) can acquire once and issue every call through `.db`
-    /// without releasing in between - the same shape as
-    /// `Server.dispatch` locking `self.mutex` once per request no matter
-    /// how many `Db` calls that request needs.
     pub const Guard = struct {
         db: *Db,
         mutex: *std.Thread.Mutex,
@@ -91,15 +69,6 @@ pub const GuardedDb = struct {
         try g.db.compact();
     }
 
-    /// Atomic read-modify-write counter: decodes the current value at
-    /// `key` as a little-endian i64 (0 if absent or the wrong width),
-    /// adds `delta`, writes the new value back - the whole read, decide,
-    /// write sequence runs under one lock acquisition, so no other
-    /// guarded caller can observe or clobber the value partway through.
-    /// A bare `db.get` followed later by a separate `db.put` cannot make
-    /// that guarantee, which is exactly the lost-update hazard this
-    /// exists to close (see the test below that proves it with real
-    /// concurrent OS threads, not a simulated interleaving).
     pub fn incrBy(self: *GuardedDb, allocator: Allocator, key: []const u8, delta: i64) !i64 {
         const g = self.acquire();
         defer g.release();
@@ -194,12 +163,6 @@ test "incrBy survives real concurrent OS threads with zero lost updates" {
     const raw = try guarded.get(allocator, "shared-counter");
     defer allocator.free(raw.?);
     const total = std.mem.readInt(i64, raw.?[0..8], .little);
-    // A bare unsynchronized `db.get` + `db.put` read-modify-write would
-    // routinely lose updates here (two threads read the same stale value,
-    // both write back the same next value, one increment vanishes). The
-    // mutex inside GuardedDb makes every incrBy fully serialized, so the
-    // total below must land exactly on threadCount*perThread every single
-    // run - not "usually", not "close to" - or the guard has a real bug.
     try std.testing.expectEqual(@as(i64, threadCount * perThread), total);
 }
 
@@ -280,12 +243,6 @@ test "acquire lets a writer move value between two keys atomically under a concu
     writerThread.join();
     readerThread.join();
 
-    // Every single reader observation is required to see the invariant
-    // balanceA + balanceB == 1000 hold, because each transfer's two puts
-    // happen inside one `acquire()`/`release()` pair the reader's own
-    // acquire() must wait out entirely - a real race would show up here
-    // as a nonzero violation count, not as a crash, which is why this
-    // asserts the counter is exactly zero instead of merely "did not hang".
     try std.testing.expectEqual(@as(usize, 0), violations.load(.monotonic));
 
     const finalARaw = try guarded.get(allocator, "balanceA");
@@ -349,17 +306,6 @@ const TableTransferWorker = struct {
     guarded: *GuardedDb,
     rounds: usize,
 
-    /// Runs a full `Transaction` + `TableTxn` transfer lifecycle (begin,
-    /// read both rows, stage both writes, commit) under a single
-    /// `acquire()`/`release()` pair, closing the specific gap every prior
-    /// session on this project flagged and deferred: "brak testu
-    /// wspolbieznosci wielowatkowej (dwa watki komituja TableTxn na tym
-    /// samym Db jednoczesnie)". `Db.get`/`Transaction.commit` touch shared
-    /// mutable state (the memtable, the OCC read-set bookkeeping) with no
-    /// locking of their own, so without the guard two real OS threads
-    /// racing through `TableTxn.open`/`get`/`put`/`commit` at once would
-    /// be exactly the kind of unguarded concurrent access every other
-    /// module in this project takes its own mutex to avoid.
     fn run(self: TableTransferWorker) void {
         const allocator = std.heap.page_allocator;
         var i: usize = 0;
@@ -381,10 +327,6 @@ const TableTransferWorker = struct {
             t.put(.{ .int = 1 }, &.{.{ .name = "balance", .value = .{ .int = from.get("balance").?.int - 1 } }}) catch @panic("put 1 failed");
             t.put(.{ .int = 2 }, &.{.{ .name = "balance", .value = .{ .int = to.get("balance").?.int + 1 } }}) catch @panic("put 2 failed");
 
-            // The whole sequence runs under one lock, so no external writer
-            // can ever appear mid-transfer here: commit() must never see a
-            // real error.Conflict in this test, unlike the deliberately
-            // racy scenario in txn_table.zig's own "all-or-nothing" test.
             txn.commit() catch |err| std.debug.panic("unexpected commit failure under serialized access: {s}", .{@errorName(err)});
         }
     }
@@ -426,11 +368,6 @@ test "TableTxn commits from many real OS threads never lose or duplicate a unit 
     const balance1 = row1.get("balance").?.int;
     const balance2 = row2.get("balance").?.int;
 
-    // Every transfer moves exactly 1 unit and every transfer's two writes
-    // commit together or not at all, so the total must be exactly
-    // preserved and account 2 must have gained exactly what account 1
-    // lost - no interleaving of `get`+`put`+`commit` across threads can
-    // produce any other pair of numbers.
     try std.testing.expectEqual(startBalance, balance1 + balance2);
     try std.testing.expectEqual(@as(i64, threadCount * roundsPerThread), balance2);
     try std.testing.expectEqual(startBalance - threadCount * roundsPerThread, balance1);
