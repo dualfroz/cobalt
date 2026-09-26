@@ -11,8 +11,6 @@ const querymod = @import("query.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Guard against a corrupt or hostile length prefix causing an unbounded
-/// allocation before a single byte of the frame body has been validated.
 pub const maxFrameBytes: u32 = 64 * 1024 * 1024;
 
 pub const Op = enum(u8) {
@@ -75,10 +73,6 @@ pub const ProtoError = error{
     Malformed,
 };
 
-/// A frame is the unit exchanged over the wire in both directions: a
-/// single tag byte (an `Op` on the request side, a `Status` on the
-/// response side) followed by a little-endian u32 payload length and the
-/// payload itself.
 pub const Frame = struct {
     tag: u8,
     payload: []u8,
@@ -111,9 +105,6 @@ pub fn readFrame(allocator: Allocator, reader: anytype) !Frame {
     return .{ .tag = tag, .payload = payload, .allocator = allocator };
 }
 
-/// Bounds-checked cursor over a decoded payload. Every read returns
-/// `error.Malformed` instead of panicking when the peer sent a short or
-/// truncated buffer, since payload bytes come from an untrusted socket.
 pub const Cursor = struct {
     data: []const u8,
     pos: usize = 0,
@@ -161,8 +152,6 @@ fn putLenPrefixed(writer: encode.ByteWriter, v: []const u8) !void {
     try writer.slice(v);
 }
 
-// --- set ---
-
 pub fn encodeSet(allocator: Allocator, key: []const u8, value: []const u8) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -180,8 +169,6 @@ pub fn decodeSet(payload: []const u8) !SetArgs {
     const value = c.data[c.pos..];
     return .{ .key = key, .value = value };
 }
-
-// --- auth ---
 
 pub fn encodeAuth(allocator: Allocator, username: []const u8, password: []const u8) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
@@ -201,22 +188,10 @@ pub fn decodeAuth(payload: []const u8) !AuthArgs {
     return .{ .username = username, .password = password };
 }
 
-/// A successful `auth` response's payload: empty when the server has no
-/// session store wired up (see server.zig's `enableSessions`), or the raw
-/// session token bytes when it does. There is no separate decode function
-/// on the client side - `frame.payload` itself IS the token (or empty),
-/// no framing needed for a single opaque blob.
 pub fn encodeAuthOk(allocator: Allocator, token: ?[]const u8) ![]u8 {
     return allocator.dupe(u8, token orelse "");
 }
 
-// --- auth_token ---
-
-/// Reconnects a fresh connection to a role without presenting the
-/// password again, by presenting a token previously handed out in an
-/// `auth` response (see `session.zig`'s `SessionStore.issue`). The
-/// payload is nothing but the opaque token bytes - no framing needed for
-/// a single blob, exactly like `encodeAuthOk`.
 pub fn encodeAuthToken(allocator: Allocator, token: []const u8) ![]u8 {
     return allocator.dupe(u8, token);
 }
@@ -225,14 +200,6 @@ pub fn decodeAuthToken(payload: []const u8) []const u8 {
     return payload;
 }
 
-// --- user_admin ---
-
-/// Remote counterpart of the CLI's local `user add|passwd|role|del|list`,
-/// carried as one opcode so `server.zig`'s `requiredRole` can gate all five
-/// actions behind a single `admin`-only check instead of five separate
-/// opcodes. `role`/`rounds` are only meaningful for the actions that use
-/// them (`create` reads both, `set_role` reads only `role`, `set_password`
-/// reads only `rounds`); callers send 0 for the fields an action ignores.
 pub const UserAdminAction = enum(u8) {
     create = 0,
     set_password = 1,
@@ -275,10 +242,6 @@ pub fn decodeUserAdmin(payload: []const u8) !UserAdminArgs {
     return .{ .action = action, .roleByte = roleByte, .rounds = rounds, .username = username, .password = password };
 }
 
-/// Encodes the response of a `list` user_admin request: every username
-/// paired with its role byte. Reuses `authmod.UserInfo`/`freeUserList`
-/// rather than inventing a parallel type, the same way `encodeStats` reuses
-/// `dbmod.Stats` and `encodeRows` reuses `rowmod.Row`.
 pub fn encodeUserList(allocator: Allocator, users: []const authmod.UserInfo) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -291,8 +254,6 @@ pub fn encodeUserList(allocator: Allocator, users: []const authmod.UserInfo) ![]
     return buf.toOwnedSlice();
 }
 
-/// Decodes a user list response into independently owned entries - free
-/// with `authmod.freeUserList`.
 pub fn decodeUserList(allocator: Allocator, payload: []const u8) ![]authmod.UserInfo {
     var c = Cursor{ .data = payload };
     const count = try c.takeU32();
@@ -311,16 +272,6 @@ pub fn decodeUserList(allocator: Allocator, payload: []const u8) ![]authmod.User
     return list.toOwnedSlice();
 }
 
-// --- ttl_op ---
-
-/// Remote counterpart of the CLI's local `expire`/`persist`/`ttl`/
-/// `expire-sweep` (main.zig, backed by `ttl.zig`), carried as one opcode the
-/// same way `user_admin` bundles five user-management actions under one
-/// opcode - see server.zig's `requiredRole`, which (unlike `user_admin`'s
-/// blanket `admin` gate) inspects this action byte: `query` is read-only
-/// and needs only `readonly`; `expire`/`persist`/`sweep` all mutate (sweep
-/// deletes every due key) and need `readwrite`, matching every other write
-/// opcode.
 pub const TtlAction = enum(u8) {
     expire = 0,
     persist = 1,
@@ -332,10 +283,6 @@ pub const TtlAction = enum(u8) {
     }
 };
 
-/// `seconds` is only meaningful for `expire` - callers send 0 for the other
-/// three actions, same "unused fields carry a zero" convention as
-/// `encodeUserAdmin`'s `role`/`rounds`. `key` is empty for `sweep`, which
-/// operates on every due key in the store rather than one specific key.
 pub fn encodeTtlOp(allocator: Allocator, action: TtlAction, key: []const u8, seconds: u64) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -356,9 +303,6 @@ pub fn decodeTtlOp(payload: []const u8) !TtlOpArgs {
     return .{ .action = action, .seconds = seconds, .key = key };
 }
 
-/// Encodes the response to a `query` ttl_op: reuses `ttlmod.TtlResult`
-/// rather than inventing a parallel type, the same way `encodeStats` reuses
-/// `dbmod.Stats` and `encodeUserList` reuses `authmod.UserInfo`.
 pub fn encodeTtlResult(allocator: Allocator, result: ttlmod.TtlResult) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -385,7 +329,6 @@ pub fn decodeTtlResult(payload: []const u8) !ttlmod.TtlResult {
     };
 }
 
-/// Encodes the response to a `sweep` ttl_op: how many due keys were reaped.
 pub fn encodeTtlSweepCount(allocator: Allocator, count: u64) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -399,28 +342,11 @@ pub fn decodeTtlSweepCount(payload: []const u8) !u64 {
     return c.takeU64();
 }
 
-// --- coll_ttl_op ---
-
-/// Remote counterpart of the CLI's local `coll <kind> expire|ttl|persist
-/// <name>`/`coll expire-sweep` (main.zig, backed by `collttl.zig`), same
-/// bundling shape as `ttl_op` above but for a whole typed collection
-/// (Counter/Hash/Set/List/ZSet) instead of one flat key - so the payload
-/// carries an extra `Kind` tag byte the flat version does not need.
-/// Reuses `TtlAction` directly rather than a parallel enum: the four
-/// actions (expire/persist/query/sweep) mean exactly the same thing here,
-/// just against `collttl.zig` instead of `ttl.zig`.
 pub fn encodeCollTtlOp(allocator: Allocator, action: TtlAction, kind: collmod.Kind, name: []const u8, seconds: u64) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
     const w = encode.ByteWriter.init(&buf);
     try w.byte(@intFromEnum(action));
-    // `sweep` operates across every kind at once (collttl.sweepExpired
-    // scans the whole marker namespace, not one kind's slice of it), so
-    // the kind byte is meaningless for that action - callers pass any
-    // valid `Kind` and `decodeCollTtlOp` still decodes it, but
-    // `handleCollTtlOp` never reads it for `.sweep`. Same "unused field
-    // still round-trips" convention as `encodeTtlOp`'s zeroed `seconds`
-    // on non-`expire` actions.
     try w.byte(kind.tagByte());
     try w.putU64(seconds);
     try w.slice(name);
@@ -438,22 +364,6 @@ pub fn decodeCollTtlOp(payload: []const u8) !CollTtlOpArgs {
     return .{ .action = action, .kind = kind, .seconds = seconds, .name = name };
 }
 
-// --- coll_op ---
-
-/// Remote counterpart of the CLI's local `coll <kind> <op> ...` (main.zig's
-/// `runColl`, backed by `collections.zig`) - until now the Redis-like
-/// collections (Counter/Hash/Set/List/ZSet) were reachable only from a
-/// process that had the `Db` open directly, the same gap `ttl_op`/
-/// `coll_ttl_op` already closed for TTL management. One opcode bundles
-/// every collection operation (the same "one opcode, many actions" shape
-/// as `user_admin` and `ttl_op`) rather than one opcode per op, since the
-/// five kinds share almost nothing about their argument count or type.
-/// The payload carries only the action tag, the collection name, and a
-/// variable list of string arguments in the exact CLI text form `runColl`
-/// already parses locally (values/members/indices/scores) - so
-/// `handleCollOp` (server.zig) can reuse the very same
-/// `std.fmt.parseInt`/`parseFloat` calls instead of inventing a second
-/// binary number encoding just for this opcode.
 pub const CollAction = enum(u8) {
     counter_get = 0,
     counter_set = 1,
@@ -468,9 +378,6 @@ pub const CollAction = enum(u8) {
     set_ismember = 10,
     set_card = 11,
     set_members = 12,
-    // `set_inter`/`set_union`/`set_diff`: `name` is the first set, `args`
-    // are every remaining set name - the same split `runColl` already uses
-    // (`args[0]` vs `args[1..]`) for these three multi-set operations.
     set_inter = 13,
     set_union = 14,
     set_diff = 15,
@@ -493,11 +400,6 @@ pub const CollAction = enum(u8) {
         return std.meta.intToEnum(CollAction, b) catch error.Malformed;
     }
 
-    /// Which `collections.Kind` namespace this action's lazy TTL check
-    /// (`collttl.expireIfDue`, called on `name` before every dispatch in
-    /// `handleCollOp`) and `requiredRole` gating both need - grouped by the
-    /// action's numeric range rather than a second explicit table, since
-    /// the enum above is itself laid out kind-by-kind.
     pub fn kind(self: CollAction) collmod.Kind {
         return switch (self) {
             .counter_get, .counter_set, .counter_incrby => .counter,
@@ -508,10 +410,6 @@ pub const CollAction = enum(u8) {
         };
     }
 
-    /// True for actions that only read - see `server.zig`'s `requiredRole`,
-    /// which needs this to decide `readonly` vs `readwrite` from the action
-    /// byte alone, the same action-byte peek `ttl_op`/`coll_ttl_op` already
-    /// use for their own bundled actions.
     pub fn isReadOnly(self: CollAction) bool {
         return switch (self) {
             .counter_get, .hash_get, .hash_len, .hash_getall, .set_ismember, .set_card, .set_members, .set_inter, .set_union, .set_diff, .list_len, .list_range, .zset_score, .zset_card, .zset_rangebyrank, .zset_rangebyscore, .zset_rank => true,
@@ -537,11 +435,6 @@ pub const CollOpArgs = struct {
     args: [][]const u8,
 };
 
-/// `name` and every entry of `args` are borrowed slices into `payload`,
-/// valid only as long as the frame that carried them is alive - the same
-/// convention `decodeBatch`/`decodeTableSelect` use. Only the `args`
-/// pointer array itself is owned by the caller (free with
-/// `allocator.free`); never its contents.
 pub fn decodeCollOp(allocator: Allocator, payload: []const u8) !CollOpArgs {
     var c = Cursor{ .data = payload };
     const action = try CollAction.fromByte(try c.takeByte());
@@ -556,12 +449,6 @@ pub fn decodeCollOp(allocator: Allocator, payload: []const u8) !CollOpArgs {
     return .{ .action = action, .name = name, .args = try list.toOwnedSlice() };
 }
 
-/// One reply shape covers every `coll_op` action, tagged by the first byte -
-/// the response-side counterpart of the request-side `CollAction`. `.nil`
-/// is the wire form of the CLI's `(nil)` (a hash field/list pop/zset score
-/// that does not exist); `.ok` is a bare acknowledgement (counter set,
-/// hash set/del as a flag would double up with `.int`, so those still use
-/// `.int` with 0/1 - see `encodeCollReply`).
 pub const CollReplyTag = enum(u8) {
     nil = 0,
     ok = 1,
@@ -634,11 +521,6 @@ pub fn encodeCollReply(allocator: Allocator, reply: CollReply) ![]u8 {
 pub const OwnedCollPair = struct { field: []u8, value: []u8 };
 pub const OwnedCollScorePair = struct { member: []u8, score: f64 };
 
-/// Decoded, independently owned counterpart of `CollReply` - every byte
-/// slice is a fresh allocation the caller must free via `deinit`, unlike
-/// `CollOpArgs` above which stays borrowed (that side is consumed
-/// immediately inside `dispatch` before the frame is freed; this side
-/// crosses back out to a `Client` caller that keeps it around).
 pub const OwnedCollReply = union(enum) {
     nil,
     ok,
@@ -732,16 +614,6 @@ pub fn decodeCollReply(allocator: Allocator, payload: []const u8) !OwnedCollRepl
     };
 }
 
-// --- txn_op ---
-
-/// Remote counterpart of the CLI's local `txn <script-file>` (main.zig's
-/// `runTxn`, backed by `txn.zig`/`txn_table.zig`): a batch of put/delete row
-/// operations, possibly spanning several tables, applied as one atomic
-/// `Transaction` commit - the same "every op succeeds together or none of
-/// them do" guarantee the local CLI gives, now reachable from a process that
-/// only has a `Client`, not a `*Db`. Unlike `coll_op`/`ttl_op` (one action
-/// against one key/collection per request) this opcode carries a LIST of
-/// entries, since a transaction script is inherently a batch.
 pub const TxnVerb = enum(u8) {
     put = 0,
     del = 1,
@@ -751,10 +623,6 @@ pub const TxnVerb = enum(u8) {
     }
 };
 
-/// One staged operation as the caller supplies it. `fields` is ignored for
-/// `.del` (callers pass `&.{}`) - same "unused argument still there, just
-/// empty" convention as `encodeUserAdmin`'s zeroed `role`/`rounds` on
-/// actions that do not need them.
 pub const TxnOpEntry = struct {
     verb: TxnVerb,
     table: []const u8,
@@ -775,9 +643,6 @@ pub fn encodeTxnOp(allocator: Allocator, entries: []const TxnOpEntry) ![]u8 {
         defer allocator.free(pkBytes);
         try putLenPrefixed(w, pkBytes);
 
-        // Reuses `Row.encode` for the field list exactly the way
-        // `encodeRows` does for a whole result set, instead of inventing a
-        // second name+value framing just for this opcode.
         var fieldsRow = rowmod.Row.init(allocator);
         defer fieldsRow.deinit();
         for (e.fields) |f| try fieldsRow.set(f.name, f.value);
@@ -788,12 +653,6 @@ pub fn encodeTxnOp(allocator: Allocator, entries: []const TxnOpEntry) ![]u8 {
     return buf.toOwnedSlice();
 }
 
-/// Decoded entry with every slice borrowed from the frame `payload` that
-/// carried it - same convention as `decodeCollOp`/`decodeTableSelect`, valid
-/// only as long as that payload is alive. `pkBytes`/`fieldsBytes` still need
-/// `rowmod.decodeValue`/`rowmod.Row.decode` to become a real `Value`/field
-/// list; kept undecoded here so a malformed table name or verb byte fails
-/// fast without touching row-decoding at all.
 pub const DecodedTxnOpEntry = struct {
     verb: TxnVerb,
     table: []const u8,
@@ -817,11 +676,6 @@ pub fn decodeTxnOp(allocator: Allocator, payload: []const u8) ![]DecodedTxnOpEnt
     return list.toOwnedSlice();
 }
 
-/// Encodes the response to a successful `txn_op`: how many operations were
-/// committed - always every entry in the request, since a partial commit is
-/// impossible (`error.Conflict` aborts the whole transaction instead, and
-/// surfaces as `Status.conflict` with no payload, the same shape as
-/// `user_admin`'s `UserExists` conflict).
 pub fn encodeTxnResult(allocator: Allocator, applied: u32) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -834,8 +688,6 @@ pub fn decodeTxnResult(payload: []const u8) !u32 {
     var c = Cursor{ .data = payload };
     return c.takeU32();
 }
-
-// --- scan / prefix ---
 
 pub const ScanArgs = struct {
     start: ?[]const u8 = null,
@@ -892,8 +744,6 @@ pub fn decodePrefix(payload: []const u8) !PrefixArgs {
     return .{ .prefix = prefix, .limit = limit };
 }
 
-// --- entry lists (scan / prefix responses) ---
-
 pub fn encodeEntries(allocator: Allocator, entries: []const dbmod.Entry) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -916,8 +766,6 @@ pub const OwnedEntry = struct {
     }
 };
 
-/// Copies every key and value out of `payload` so the caller can free
-/// the frame that carried them and keep the entries alive independently.
 pub fn decodeEntries(allocator: Allocator, payload: []const u8) ![]OwnedEntry {
     var c = Cursor{ .data = payload };
     const count = try c.takeU32();
@@ -942,8 +790,6 @@ pub fn freeOwnedEntries(allocator: Allocator, entries: []OwnedEntry) void {
     for (entries) |*e| e.deinit(allocator);
     allocator.free(entries);
 }
-
-// --- batch ---
 
 pub const BatchOp = union(enum) {
     put: struct { key: []const u8, value: []const u8 },
@@ -1003,21 +849,6 @@ pub fn decodeBatch(allocator: Allocator, payload: []const u8) ![]DecodedBatchOp 
     return list.toOwnedSlice();
 }
 
-// --- table select ---
-
-/// Wire request for a remote `table select`: a table name, the raw text of
-/// an `expr.zig` predicate expression (empty text selects every row, the
-/// same convention `query.Table.select(null)` uses locally), an
-/// offset/limit page window using the same "0 = unlimited" convention as
-/// `ScanArgs.limit` above - so a large remote result can be paged instead
-/// of always coming back in one frame bounded only by `maxFrameBytes` - and
-/// a `query.OrderBy` sort key list (possibly empty) applied server-side via
-/// `Table.selectPageOrdered` before that page window. The order-by count
-/// byte (and each field name/direction pair behind it) sit BEFORE
-/// `exprText` rather than after it, because `exprText` is decoded as
-/// "everything left in the payload" - anything meant to survive decoding
-/// has to come first. A single byte bounds the count to 255 columns, far
-/// more than any real query needs.
 pub fn encodeTableSelect(allocator: Allocator, table: []const u8, exprText: []const u8, offset: u32, limit: u32, orderBy: []const querymod.OrderBy) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -1042,10 +873,6 @@ pub const TableSelectArgs = struct {
     orderBy: []const querymod.OrderBy = &.{},
 };
 
-/// `table`, `exprText`, and every `orderBy[i].field` are borrowed slices
-/// into `payload` - the same convention `decodeCollOp` uses. Only the
-/// `orderBy` array itself is owned by the caller (free with
-/// `allocator.free`); never its contents.
 pub fn decodeTableSelect(allocator: Allocator, payload: []const u8) !TableSelectArgs {
     var c = Cursor{ .data = payload };
     const table = try c.takeLenPrefixed();
@@ -1064,9 +891,6 @@ pub fn decodeTableSelect(allocator: Allocator, payload: []const u8) !TableSelect
     return .{ .table = table, .exprText = exprText, .offset = offset, .limit = limit, .orderBy = try list.toOwnedSlice() };
 }
 
-/// Encodes a `table select` result set as a length-prefixed list of rows,
-/// each row itself encoded with `Row.encode` (the same self-describing
-/// field format a Table stores on disk).
 pub fn encodeRows(allocator: Allocator, rows: []const rowmod.Row) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -1080,8 +904,6 @@ pub fn encodeRows(allocator: Allocator, rows: []const rowmod.Row) ![]u8 {
     return buf.toOwnedSlice();
 }
 
-/// Decodes a `table select` result set into independently owned Rows -
-/// callers must free each with `Row.deinit` (see `freeRows` below).
 pub fn decodeRows(allocator: Allocator, payload: []const u8) ![]rowmod.Row {
     var c = Cursor{ .data = payload };
     const count = try c.takeU32();
@@ -1104,11 +926,6 @@ pub fn freeRows(allocator: Allocator, rows: []rowmod.Row) void {
     allocator.free(rows);
 }
 
-// --- table join ---
-
-/// Which of `join.zig`'s four equi-join variants a `table_join` request
-/// wants - the wire counterpart of the CLI's `table join`
-/// `[--left|--right|--full]` flags (no flag means `.inner`).
 pub const JoinMode = enum(u8) {
     inner = 0,
     left = 1,
@@ -1120,11 +937,6 @@ pub const JoinMode = enum(u8) {
     }
 };
 
-/// Wire request for a remote `table join`: which variant (`mode`), the two
-/// tables and the fields they are joined on, and an optional `expr.zig`
-/// predicate text for each side - the same `leftPred`/`rightPred` filter
-/// `join.innerJoin` and its outer variants already take, evaluated exactly
-/// like `table_select`'s `exprText` (empty selects every row on that side).
 pub fn encodeTableJoin(
     allocator: Allocator,
     mode: JoinMode,
@@ -1188,14 +1000,6 @@ pub fn decodeTableJoin(payload: []const u8) !TableJoinArgs {
     };
 }
 
-/// One row pair from any of `join.zig`'s four variants, flattened to a
-/// single wire shape: `innerJoin` never leaves either side null,
-/// `leftOuterJoin`/`rightOuterJoin` leave exactly one side nullable, and
-/// `fullOuterJoin` allows either - rather than four near-identical wire
-/// encodings, every variant's result is converted to this one shape before
-/// `encodeJoinedRows`, and the CLI decides what "(nil)" means from which
-/// `--left`/`--right`/`--full` flag it sent, exactly like the local `table
-/// join` printer already does per `JoinMode`.
 pub const JoinPair = struct { left: ?rowmod.Row, right: ?rowmod.Row };
 
 fn putOptionalRow(allocator: Allocator, w: encode.ByteWriter, row: ?rowmod.Row) !void {
@@ -1228,9 +1032,6 @@ fn takeOptionalRow(allocator: Allocator, c: *Cursor) !?rowmod.Row {
     return rowmod.Row.decode(allocator, raw) catch return error.Malformed;
 }
 
-/// Decodes a `table_join` result set into independently owned `JoinPair`s -
-/// callers must free each present side with `Row.deinit` (see
-/// `freeJoinPairs` below).
 pub fn decodeJoinedRows(allocator: Allocator, payload: []const u8) ![]JoinPair {
     var c = Cursor{ .data = payload };
     const count = try c.takeU32();
@@ -1259,37 +1060,6 @@ pub fn freeJoinPairs(allocator: Allocator, pairs: []JoinPair) void {
     allocator.free(pairs);
 }
 
-// --- table aggregate ---
-
-/// Wire request for a remote `table aggregate`: a table name, an optional
-/// GROUP BY field (empty means no grouping - the network counterpart of the
-/// CLI's `*` sentinel for `table aggregate <table> *`, chosen client-side so
-/// the wire itself needs no separate mode byte), the list of
-/// `aggregate.zig` specs to compute, and an `expr.zig` predicate text
-/// filtering rows BEFORE aggregation runs - the same empty-means-every-row
-/// convention `table_select`'s `exprText` already uses.
-/// `offset`/`limit` window the result GROUPS (not the input rows) when
-/// `groupField` is non-empty, the same `join.applyPage`/`Table.selectPage`
-/// convention as `table_join`'s wire format - 0/0 means unlimited. Ignored
-/// server-side when `groupField` is empty (`runGlobal` always produces
-/// exactly one result row, nothing to page).
-/// `orderBy` is a `query.OrderBy` sort key list (possibly empty) applied
-/// server-side to the result GROUPS via `aggregate.sortGroupsBy`, after
-/// HAVING narrows them and before `offset`/`limit` window them - same
-/// convention and wire shape (count byte + descending byte + length-prefixed
-/// field name, per column) as `encodeTableSelect`'s `orderBy`. Each
-/// `orderBy[i].field` must name either `groupField` or one of `specs`'
-/// `specLabel`s (validated server-side by `sortGroupsBy`, not here).
-/// Meaningless (and ignored server-side) for the ungrouped `groupField.len
-/// == 0` path, same as `offset`/`limit` already are - `runGlobal` always
-/// produces exactly one result row, nothing to order.
-///
-/// `havingText` is a second, independent `expr.zig` predicate text
-/// (empty means no HAVING) filtering the result GROUPS AFTER aggregation,
-/// evaluated server-side before `offset`/`limit` window them - the wire
-/// counterpart of the CLI's `having <expr>` suffix. Encoded length-prefixed
-/// (not "rest of payload" like `exprText`) precisely because `exprText`
-/// still needs to occupy that final slot.
 pub fn encodeTableAggregate(allocator: Allocator, table: []const u8, groupField: []const u8, specs: []const aggregatemod.AggSpec, offset: u32, limit: u32, orderBy: []const querymod.OrderBy, havingText: []const u8, exprText: []const u8) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -1316,17 +1086,10 @@ pub fn encodeTableAggregate(allocator: Allocator, table: []const u8, groupField:
 pub const TableAggregateArgs = struct {
     table: []const u8,
     groupField: []const u8,
-    /// Borrows `field` slices from the decoded payload but owns the slice
-    /// itself - caller frees with `allocator.free(args.specs)`, same shape
-    /// as `decodeBatch`'s returned list.
     specs: []aggregatemod.AggSpec,
     offset: u32 = 0,
     limit: u32 = 0,
-    /// Empty means no ORDER BY - see `encodeTableAggregate`'s doc. Borrows
-    /// `field` slices from the decoded payload but owns the slice itself,
-    /// same convention as `specs`/`TableSelectArgs.orderBy`.
     orderBy: []const querymod.OrderBy = &.{},
-    /// Empty means no HAVING clause - see `encodeTableAggregate`'s doc.
     havingText: []const u8,
     exprText: []const u8,
 };
@@ -1372,8 +1135,6 @@ fn takeDecodedValue(allocator: Allocator, c: *Cursor) !rowmod.Value {
     return rowmod.decodeValue(allocator, raw) catch return error.Malformed;
 }
 
-/// Encodes a `runGlobal` (no `GROUP BY`) result: exactly `specs.len` values,
-/// same order as the request's specs.
 pub fn encodeAggGlobalResult(allocator: Allocator, values: []const rowmod.Value) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -1383,8 +1144,6 @@ pub fn encodeAggGlobalResult(allocator: Allocator, values: []const rowmod.Value)
     return buf.toOwnedSlice();
 }
 
-/// Decodes a `runGlobal` result into independently owned `Value`s - callers
-/// must free with `freeAggValues`.
 pub fn decodeAggGlobalResult(allocator: Allocator, payload: []const u8) ![]rowmod.Value {
     var c = Cursor{ .data = payload };
     const count = try c.takeU32();
@@ -1403,9 +1162,6 @@ pub fn freeAggValues(allocator: Allocator, values: []rowmod.Value) void {
     allocator.free(values);
 }
 
-/// Encodes a grouped `run` result: one entry per `GroupRow` (the group-key
-/// value, then exactly `specs.len` result values), in the same first-seen
-/// order `GroupBy.finish()` produced them.
 pub fn encodeAggGroupRows(allocator: Allocator, groups: []const aggregatemod.GroupRow) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -1419,9 +1175,6 @@ pub fn encodeAggGroupRows(allocator: Allocator, groups: []const aggregatemod.Gro
     return buf.toOwnedSlice();
 }
 
-/// Decodes a grouped `run` result into independently owned `GroupRow`s -
-/// callers must free each with `GroupRow.deinit`, then the slice itself
-/// (see `freeAggGroupRows`).
 pub fn decodeAggGroupRows(allocator: Allocator, payload: []const u8) ![]aggregatemod.GroupRow {
     var c = Cursor{ .data = payload };
     const count = try c.takeU32();
@@ -1433,12 +1186,6 @@ pub fn decodeAggGroupRows(allocator: Allocator, payload: []const u8) ![]aggregat
     var i: u32 = 0;
     while (i < count) : (i += 1) {
         const group = try takeDecodedValue(allocator, &c);
-        // Armed for the rest of THIS iteration's block only - Zig disarms an
-        // errdefer once the block it was declared in exits normally, and
-        // `appendAssumeCapacity` below is that block's last statement, so a
-        // later iteration's failure can never reach back and double-free an
-        // already-appended `group` (the exact class of bug `aggregate.zig`'s
-        // `GroupBy.observe` hit and fixed - see its comment for the details).
         errdefer group.free(allocator);
         const valueCount = try c.takeU32();
         var values = try allocator.alloc(rowmod.Value, valueCount);
@@ -1460,39 +1207,6 @@ pub fn freeAggGroupRows(allocator: Allocator, groups: []aggregatemod.GroupRow) v
     allocator.free(groups);
 }
 
-// --- table window ---
-
-/// Wire request for a remote `table window`: a table name, the LIST of
-/// `window.zig` `WindowSpec`s to compute (one or more columns sharing the
-/// same `PARTITION BY`/`ORDER BY`/`frame` - `window.computeMany`'s shape,
-/// mirroring `table_aggregate`'s `specs` list), the `PARTITION BY`/`ORDER
-/// BY` field lists (either possibly empty, same "no partition"/"no order"
-/// meaning as local `table window`'s `partitionBy`/`orderBy`), `offset`/
-/// `limit` windowing the PRINTED rows in the same partition-then-order walk
-/// `window.orderedIndices` produces (not raw scan order, not `computeMany`'s
-/// per-row results, which stay aligned 1:1 with every matching row
-/// regardless of paging - see `handleTableWindow`'s doc), and an `expr.zig`
-/// predicate text filtering rows BEFORE annotation (same
-/// empty-means-every-row convention every other `table_*` opcode's
-/// `exprText` already uses). `orderBy` reuses `querymod.OrderBy`'s wire
-/// shape (descending byte + length-prefixed field name) exactly like
-/// `encodeTableAggregate`'s. `specs` is a byte count followed by
-/// `(kind byte, length-prefixed field)` pairs, same shape `partitionBy`
-/// already uses for its own count-prefixed field list. `frame` is a single
-/// byte (`@intFromEnum(windowmod.FrameMode)`) written right before
-/// `exprText` - after every other fixed-size field but before the
-/// unbounded, unprefixed trailing text, same placement
-/// `encodeTableAggregate`'s `havingText` uses relative to ITS trailing
-/// `exprText`.
-/// Writes a `WindowSpec`'s `offset`/`default` fields, shared by `lag`/`lead`
-/// (offset = rows back/forward from the current row) and `nth_value`
-/// (offset = 1-based position within the frame) - both pairs share the same
-/// wire shape, so one writer covers all three `WindowKind`s. `default` uses
-/// the tag+payload shape `row.zig`'s `encodeValue` does, but written
-/// directly (not through `putEncodedValue`, which allocates a throwaway
-/// buffer via `rowmod.encodeValue` only to copy it right back out) since a
-/// `WindowSpec.default` is always a small scalar or short borrowed string,
-/// never worth a heap round trip.
 fn putLagLeadExtra(w: encode.ByteWriter, offset: u64, default: rowmod.Value) !void {
     try w.putU64(offset);
     try w.byte(@intFromEnum(@as(rowmod.ValueTag, default)));
@@ -1505,10 +1219,6 @@ fn putLagLeadExtra(w: encode.ByteWriter, offset: u64, default: rowmod.Value) !vo
     }
 }
 
-/// Reads back what `putLagLeadExtra` wrote. `.text`/`.bytes` are returned as
-/// slices BORROWED from `c`'s backing payload (never allocated) - the same
-/// convention `WindowSpec.field`/`TableWindowArgs.partitionBy` already use,
-/// safe because the payload buffer outlives the whole request handler.
 fn takeLagLeadExtra(c: *Cursor) !struct { offset: u64, default: rowmod.Value } {
     const offset = try c.takeU64();
     const tagByte = try c.takeByte();
@@ -1551,17 +1261,7 @@ pub fn encodeTableWindow(allocator: Allocator, table: []const u8, specs: []const
 
 pub const TableWindowArgs = struct {
     table: []const u8,
-    /// Borrows field-name slices from the decoded payload but owns the
-    /// slice itself, same convention as `partitionBy`/`orderBy` below.
-    /// Always non-empty for a well-formed request (`decodeTableWindow`
-    /// itself does not enforce this - `handleTableWindow` rejects an empty
-    /// list as `bad_request`, same as `table_aggregate`'s empty-specs
-    /// check).
     specs: []const windowmod.WindowSpec = &.{},
-    /// Borrows field-name slices from the decoded payload but owns the
-    /// slice itself, same convention as `TableAggregateArgs.orderBy`. Empty
-    /// means "one implicit partition" (the whole result set), same as local
-    /// `table window`'s default.
     partitionBy: []const []const u8 = &.{},
     orderBy: []const querymod.OrderBy = &.{},
     offset: u32 = 0,
@@ -1619,14 +1319,6 @@ pub fn decodeTableWindow(allocator: Allocator, payload: []const u8) !TableWindow
     };
 }
 
-/// One annotated row from a `table_window` result: the original row
-/// (unmodified, same fields the request matched) paired with one computed
-/// window value PER requested spec, in the same order as the request's
-/// `specs` list - the network shape of what local `table window` prints per
-/// row (`printRow` fields, then `<label>=<value>` per spec). Already in the
-/// server-paginated partition-then-order display order (see
-/// `handleTableWindow`), so the client prints these in order with no
-/// further sorting.
 pub const WindowRow = struct { row: rowmod.Row, values: []rowmod.Value };
 
 pub fn encodeWindowRows(allocator: Allocator, rows: []const WindowRow) ![]u8 {
@@ -1644,10 +1336,6 @@ pub fn encodeWindowRows(allocator: Allocator, rows: []const WindowRow) ![]u8 {
     return buf.toOwnedSlice();
 }
 
-/// Decodes a `table_window` result into independently owned `WindowRow`s -
-/// callers must free each (`.row.deinit()`, each `.values[i].free(allocator)`
-/// then `allocator.free(.values)`), then the slice itself (see
-/// `freeWindowRows`).
 pub fn decodeWindowRows(allocator: Allocator, payload: []const u8) ![]WindowRow {
     var c = Cursor{ .data = payload };
     const count = try c.takeU32();
@@ -1689,16 +1377,6 @@ pub fn freeWindowRows(allocator: Allocator, rows: []WindowRow) void {
     allocator.free(rows);
 }
 
-// --- pubsub ---
-
-/// Wire request for `subscribe`: the list of channel names to listen on (at
-/// least one - `server.zig`'s `handleSubscribe` rejects an empty list as
-/// malformed rather than opening a subscription that can never receive
-/// anything). Unlike every other opcode in this file, a `subscribe` request
-/// does not get a single reply frame back: after the initial acknowledgment
-/// (see `encodeSubscribeAck`), the connection becomes a one-way stream of
-/// `encodePubSubMessage` frames until it closes - see `pubsub.zig`'s doc
-/// comment on `Hub` and `server.zig`'s `handleSubscribe`.
 pub fn encodeSubscribe(allocator: Allocator, channels: []const []const u8) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -1717,13 +1395,6 @@ pub const SubscribeArgs = struct {
     }
 };
 
-/// Decodes a `subscribe` request into independently owned channel-name
-/// copies - free with `SubscribeArgs.deinit`. Owned (rather than borrowed
-/// slices into `payload`, as most other decoders here return) because
-/// `handleSubscribe` hands these straight to `pubsub.Hub.subscribe`, which
-/// keeps its own copies anyway - decoding once into memory that outlives
-/// the request frame avoids a second, redundant copy inside the hub for
-/// every subscribe call.
 pub fn decodeSubscribe(allocator: Allocator, payload: []const u8) !SubscribeArgs {
     var c = Cursor{ .data = payload };
     const count = try c.takeU32();
@@ -1741,15 +1412,6 @@ pub fn decodeSubscribe(allocator: Allocator, payload: []const u8) !SubscribeArgs
     return .{ .channels = try list.toOwnedSlice() };
 }
 
-/// A `subscribe` request's one and only reply frame (status `.ok`, this as
-/// its payload) - sent once the connection is actually registered in the
-/// `pubsub.Hub`, so a client that has received this ack is guaranteed not
-/// to miss a message published right after it returns. Carries the
-/// (deduplicated) channel count purely as a sanity-checkable echo, the same
-/// spirit as `encodeAuthOk` echoing a token back - plus the `pubsub.Hub`-
-/// assigned subscriber id, the only way a later `unsubscribe` request (on a
-/// SEPARATE connection - this one is receive-only from here on, see
-/// `server.zig`'s `handleSubscribe`) can ever name this subscription again.
 pub fn encodeSubscribeAck(allocator: Allocator, subscriberId: u64, channelCount: u32) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -1768,12 +1430,6 @@ pub fn decodeSubscribeAck(payload: []const u8) !SubscribeAck {
     return .{ .subscriberId = subscriberId, .channelCount = channelCount };
 }
 
-/// Wire request for `publish`: a channel name and the message bytes (binary
-/// safe, "rest of the payload" like `encodeSet`'s value). Any connection
-/// may publish regardless of whether it has ever subscribed to anything -
-/// publishing and subscribing are independent roles on the same opcode
-/// family, exactly like a `Db` writer and a `Db` reader are independent
-/// roles over the same store.
 pub fn encodePublish(allocator: Allocator, channel: []const u8, message: []const u8) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -1792,9 +1448,6 @@ pub fn decodePublish(payload: []const u8) !PublishArgs {
     return .{ .channel = channel, .message = message };
 }
 
-/// A `publish` request's reply payload: how many subscribers `pubsub.Hub`
-/// handed the message to (see `Hub.publish`'s doc comment - 0 is a normal,
-/// non-error outcome for a channel nobody is listening to).
 pub fn encodePublishResult(allocator: Allocator, subscriberCount: u64) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -1808,14 +1461,6 @@ pub fn decodePublishResult(payload: []const u8) !u64 {
     return c.takeU64();
 }
 
-/// Wire request for `unsubscribe`: the `pubsub.Hub`-assigned subscriber id
-/// (from `encodeSubscribeAck`) plus the list of channel names to drop from
-/// that subscription - the same channel-list shape `encodeSubscribe` uses,
-/// with the id prefixed. Unlike `subscribe`, this is an ordinary
-/// request/response opcode (see `server.zig`'s `handleUnsubscribe`): it is
-/// always sent on a DIFFERENT connection than the one that subscribed,
-/// since that connection became receive-only the moment its subscribe ack
-/// arrived and can never send another request on itself again.
 pub fn encodeUnsubscribe(allocator: Allocator, subscriberId: u64, channels: []const []const u8) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -1836,11 +1481,6 @@ pub const UnsubscribeArgs = struct {
     }
 };
 
-/// Decodes an `unsubscribe` request - same owned-copy rationale as
-/// `decodeSubscribe`: `handleUnsubscribe` hands the channel names straight
-/// to `pubsub.Hub.unsubscribe`, which only ever borrows them for the
-/// duration of that call, so decoding into memory this function's caller
-/// frees (via `UnsubscribeArgs.deinit`) avoids a redundant second copy.
 pub fn decodeUnsubscribe(allocator: Allocator, payload: []const u8) !UnsubscribeArgs {
     var c = Cursor{ .data = payload };
     const subscriberId = try c.takeU64();
@@ -1859,11 +1499,6 @@ pub fn decodeUnsubscribe(allocator: Allocator, payload: []const u8) !Unsubscribe
     return .{ .subscriberId = subscriberId, .channels = try list.toOwnedSlice() };
 }
 
-/// An `unsubscribe` request's reply payload: how many of the requested
-/// channel names were actually removed from the named subscriber's set (see
-/// `pubsub.Hub.unsubscribe`'s doc comment on why naming a channel it was
-/// never on is a harmless no-op that simply does not count here, not an
-/// error).
 pub fn encodeUnsubscribeResult(allocator: Allocator, removedCount: u32) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -1877,14 +1512,6 @@ pub fn decodeUnsubscribeResult(payload: []const u8) !u32 {
     return c.takeU32();
 }
 
-/// One pushed message on an already-open `subscribe` connection: which
-/// channel it arrived on (a client can subscribe to several at once, so the
-/// tag travels with every message) plus the payload bytes. Every frame a
-/// subscribed connection receives after its initial ack uses this shape,
-/// always with status `.ok` - there is no separate framing marker, because
-/// once a client has sent `subscribe` it never sends another request on
-/// that connection and so never has to disambiguate a push from a reply to
-/// something else it asked (see `server.zig`'s `handleSubscribe`).
 pub const PubSubMessage = struct {
     channel: []u8,
     payload: []u8,
@@ -1904,9 +1531,6 @@ pub fn encodePubSubMessage(allocator: Allocator, channel: []const u8, payload: [
     return buf.toOwnedSlice();
 }
 
-/// Decodes a pushed message into independently owned copies (the frame
-/// they arrived in is freed right after decoding, in `Client.nextMessage` -
-/// see its doc comment) - free with `PubSubMessage.deinit`.
 pub fn decodePubSubMessage(allocator: Allocator, payload: []const u8) !PubSubMessage {
     var c = Cursor{ .data = payload };
     const channel = try c.takeLenPrefixed();
@@ -1917,13 +1541,6 @@ pub fn decodePubSubMessage(allocator: Allocator, payload: []const u8) !PubSubMes
     return .{ .channel = channelCopy, .payload = payloadCopy };
 }
 
-// --- table explain ---
-
-/// Wire request for a remote `table explain`: a table name and the raw text
-/// of an `expr.zig` predicate expression (empty text means "no predicate",
-/// the same convention `encodeTableSelect`'s `exprText` uses). No
-/// offset/limit - explain reports a plan, not rows, so there is nothing to
-/// page.
 pub fn encodeTableExplain(allocator: Allocator, table: []const u8, exprText: []const u8) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -1942,11 +1559,6 @@ pub fn decodeTableExplain(payload: []const u8) !TableExplainArgs {
     return .{ .table = table, .exprText = exprText };
 }
 
-/// Encodes a `query.Plan`. `indexName` uses the empty string as its "null"
-/// sentinel (an index or field name can never itself be empty - `query.zig`
-/// rejects that at `createIndex`/`createCompositeIndex` time) instead of a
-/// separate presence byte, the same economy `exprText`'s "empty means no
-/// predicate" convention already relies on elsewhere in this file.
 pub fn encodePlan(allocator: Allocator, plan: querymod.Plan) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -1958,9 +1570,6 @@ pub fn encodePlan(allocator: Allocator, plan: querymod.Plan) ![]u8 {
     return buf.toOwnedSlice();
 }
 
-/// Decodes a `query.Plan` - `indexName`, when present, is an owned copy the
-/// caller must free with `Plan.deinit` (see `encodePlan`'s doc comment for
-/// why an empty string decodes back to `null` instead of `""`).
 pub fn decodePlan(allocator: Allocator, payload: []const u8) !querymod.Plan {
     var c = Cursor{ .data = payload };
     const kindByte = try c.takeByte();
@@ -1973,17 +1582,6 @@ pub fn decodePlan(allocator: Allocator, payload: []const u8) !querymod.Plan {
     return .{ .kind = kind, .indexName = indexName, .matchedFields = matchedFields, .totalFields = totalFields };
 }
 
-// --- table update ---
-
-/// Wire request for a remote `table update`: a table name, the `SET`
-/// clause's field list, and the raw text of an `expr.zig` predicate
-/// expression (empty text updates every row, the same convention
-/// `encodeTableSelect`'s `exprText` uses). The field list reuses
-/// `Row.encode` exactly like `encodeTxnOp`'s per-entry `fields` does,
-/// instead of inventing a second name+value framing just for this opcode -
-/// and, like `encodeTableSelect`'s `orderBy`, sits BEFORE `exprText`
-/// because `exprText` is decoded as "everything left in the payload",
-/// so anything meant to survive decoding has to come first.
 pub fn encodeTableUpdate(allocator: Allocator, table: []const u8, sets: []const rowmod.Field, exprText: []const u8) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -2003,12 +1601,6 @@ pub fn encodeTableUpdate(allocator: Allocator, table: []const u8, sets: []const 
 
 pub const TableUpdateArgs = struct { table: []const u8, setsBytes: []const u8, exprText: []const u8 };
 
-/// `table` and `exprText` are borrowed slices into `payload`, the same
-/// convention `decodeTableExplain` uses. `setsBytes` is also borrowed and
-/// still needs `rowmod.Row.decode` to become a real field list - kept
-/// undecoded here so a malformed table name fails fast without touching
-/// row-decoding at all, the same ownership split `DecodedTxnOpEntry` uses
-/// for its own `fieldsBytes`.
 pub fn decodeTableUpdate(payload: []const u8) !TableUpdateArgs {
     var c = Cursor{ .data = payload };
     const table = try c.takeLenPrefixed();
@@ -2017,16 +1609,6 @@ pub fn decodeTableUpdate(payload: []const u8) !TableUpdateArgs {
     return .{ .table = table, .setsBytes = setsBytes, .exprText = exprText };
 }
 
-// --- table delete ---
-
-/// Wire request for a remote `table delete`: a table name and the raw text
-/// of an `expr.zig` predicate expression (empty text deletes every row, the
-/// same convention `encodeTableSelect`/`encodeTableExplain`'s `exprText`
-/// uses). Identical wire shape to `encodeTableExplain` - both are just
-/// "table + predicate", no `SET` clause like `encodeTableUpdate` needs - but
-/// kept as its own named pair rather than reused directly, the same
-/// per-opcode-gets-its-own-function precedent every other opcode here
-/// follows even when two shapes coincide.
 pub fn encodeTableDelete(allocator: Allocator, table: []const u8, exprText: []const u8) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -2038,8 +1620,6 @@ pub fn encodeTableDelete(allocator: Allocator, table: []const u8, exprText: []co
 
 pub const TableDeleteArgs = struct { table: []const u8, exprText: []const u8 };
 
-/// `table` and `exprText` are borrowed slices into `payload`, the same
-/// convention `decodeTableExplain`/`decodeTableUpdate` use.
 pub fn decodeTableDelete(payload: []const u8) !TableDeleteArgs {
     var c = Cursor{ .data = payload };
     const table = try c.takeLenPrefixed();
@@ -2047,21 +1627,11 @@ pub fn decodeTableDelete(payload: []const u8) !TableDeleteArgs {
     return .{ .table = table, .exprText = exprText };
 }
 
-// --- table export / table import ---
-
-/// Which interchange format a `table_export`/`table_import` request uses -
-/// the wire counterpart of the CLI's `csv`/`json` string argument (see
-/// `main.zig`'s local `table export`/`table import`), carried as one byte
-/// instead of a length-prefixed string since there are only ever two.
 pub const DumpFormat = enum(u8) {
     csv = 0,
     json = 1,
 };
 
-/// Wire request for a remote `table export`: a table name and which format
-/// (`dump.zig`'s `exportCsvWriter`/`exportJsonWriter`) to render it in. No
-/// predicate/paging - export always dumps the whole table, matching the
-/// local CLI's `table export <table> csv|json <path>`.
 pub fn encodeTableExport(allocator: Allocator, table: []const u8, format: DumpFormat) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -2081,11 +1651,6 @@ pub fn decodeTableExport(payload: []const u8) !TableExportArgs {
     return .{ .table = table, .format = format };
 }
 
-/// Wire response for `table_export`: the row count `dump.zig`'s exporter
-/// reported (so the CLI can print the same count the local `table export`
-/// prints) followed by the rendered content bytes verbatim - a "count then
-/// rest of the payload" shape, the same idea `exprText` fields elsewhere in
-/// this file use for their own trailing variable-length piece.
 pub fn encodeExportResult(allocator: Allocator, rowCount: u64, content: []const u8) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -2097,10 +1662,6 @@ pub fn encodeExportResult(allocator: Allocator, rowCount: u64, content: []const 
 
 pub const ExportResult = struct { rowCount: u64, content: []const u8 };
 
-/// `content` is a borrowed slice into `payload`, the same convention
-/// `decodeTableExplain`'s `exprText` uses - the caller decides whether to
-/// copy it (`client.zig`'s `tableExport` dupes it into an allocation the
-/// caller owns once the response frame itself is about to be freed).
 pub fn decodeExportResult(payload: []const u8) !ExportResult {
     var c = Cursor{ .data = payload };
     const rowCount = try c.takeU64();
@@ -2108,12 +1669,6 @@ pub fn decodeExportResult(payload: []const u8) !ExportResult {
     return .{ .rowCount = rowCount, .content = content };
 }
 
-/// Wire request for a remote `table import`: a table name, which format the
-/// following `content` bytes are encoded in, and the content itself.
-/// `content` comes last (decoded as "everything left in the payload", the
-/// same convention every `exprText` field in this file relies on) since it
-/// is arbitrary-length and, unlike `table`, needs no length prefix of its
-/// own.
 pub fn encodeTableImport(allocator: Allocator, table: []const u8, format: DumpFormat, content: []const u8) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
@@ -2126,8 +1681,6 @@ pub fn encodeTableImport(allocator: Allocator, table: []const u8, format: DumpFo
 
 pub const TableImportArgs = struct { table: []const u8, format: DumpFormat, content: []const u8 };
 
-/// `table` and `content` are borrowed slices into `payload`, the same
-/// convention every other decode function in this file uses.
 pub fn decodeTableImport(payload: []const u8) !TableImportArgs {
     var c = Cursor{ .data = payload };
     const table = try c.takeLenPrefixed();
@@ -2136,8 +1689,6 @@ pub fn decodeTableImport(payload: []const u8) !TableImportArgs {
     const content = payload[c.pos..];
     return .{ .table = table, .format = format, .content = content };
 }
-
-// --- stats ---
 
 pub fn encodeStats(allocator: Allocator, stats: dbmod.Stats) ![]u8 {
     var buf = std.ArrayList(u8).init(allocator);
@@ -2504,8 +2055,6 @@ test "decodeTableSelect rejects an order-by count claiming more columns than wer
     const allocator = std.testing.allocator;
     const payload = try encodeTableSelect(allocator, "users", "", 0, 0, &.{.{ .field = "age" }});
     defer allocator.free(payload);
-    // The count byte sits right after the two u32 page fields: 4 (table
-    // len prefix) + 5 ("users") + 4 (offset) + 4 (limit).
     const countBytePos = 4 + 5 + 4 + 4;
     try std.testing.expectEqual(@as(u8, 1), payload[countBytePos]);
     var corrupted = try allocator.dupe(u8, payload);
@@ -2758,7 +2307,7 @@ test "decodeTableAggregate rejects an unknown agg kind byte instead of corruptin
     try putLenPrefixed(w, "orders");
     try putLenPrefixed(w, "city");
     try w.putU32(1);
-    try w.byte(200); // not a valid AggKind tag
+    try w.byte(200);
     try putLenPrefixed(w, "total");
 
     try std.testing.expectError(error.Malformed, decodeTableAggregate(allocator, buf.items));
@@ -2831,20 +2380,15 @@ test "decodeAggGroupRows rejects a corrupted second group without leaking the fi
 
     var goodGroup = rowmod.Row.init(allocator);
     defer goodGroup.deinit();
-    // Use rowmod.encodeValue directly for a real, well-formed first group so
-    // the corruption below is unambiguously in the SECOND group only.
     const goodGroupValue = try rowmod.encodeValue(allocator, .{ .text = "warsaw" });
     defer allocator.free(goodGroupValue);
     const goodMemberValue = try rowmod.encodeValue(allocator, .{ .int = 1 });
     defer allocator.free(goodMemberValue);
 
-    try w.putU32(2); // claims two groups, only one is well-formed
+    try w.putU32(2);
     try putLenPrefixed(w, goodGroupValue);
     try w.putU32(1);
     try putLenPrefixed(w, goodMemberValue);
-    // Second group: a length-prefixed blob whose declared value tag is
-    // invalid - `takeDecodedValue` must surface `error.Malformed` here
-    // rather than fabricating a bogus `Value`.
     try putLenPrefixed(w, &[_]u8{99});
 
     try std.testing.expectError(error.Malformed, decodeAggGroupRows(allocator, buf.items));
@@ -3024,7 +2568,7 @@ test "decodePlan rejects an unknown PlanKind byte instead of corrupting a plan" 
     var buf = std.ArrayList(u8).init(allocator);
     defer buf.deinit();
     const w = encode.ByteWriter.init(&buf);
-    try w.byte(200); // not a valid PlanKind tag
+    try w.byte(200);
     try putLenPrefixed(w, "");
     try w.putU32(0);
     try w.putU32(0);
@@ -3619,14 +3163,14 @@ test "decodeTableWindow rejects an unknown frame byte instead of silently defaul
     defer buf.deinit();
     const w = encode.ByteWriter.init(&buf);
     try putLenPrefixed(w, "orders");
-    try w.byte(1); // specs count
+    try w.byte(1);
     try w.byte(@intFromEnum(windowmod.WindowKind.sum));
     try putLenPrefixed(w, "total");
-    try w.byte(0); // partitionBy count
-    try w.byte(0); // orderBy count
+    try w.byte(0);
+    try w.byte(0);
     try w.putU32(0);
     try w.putU32(0);
-    try w.byte(200); // not a valid FrameMode tag
+    try w.byte(200);
 
     try std.testing.expectError(error.Malformed, decodeTableWindow(allocator, buf.items));
 }
@@ -3660,11 +3204,11 @@ test "decodeTableWindow rejects an unknown window kind byte instead of corruptin
     defer buf.deinit();
     const w = encode.ByteWriter.init(&buf);
     try putLenPrefixed(w, "orders");
-    try w.byte(1); // specs count
-    try w.byte(200); // not a valid WindowKind tag
+    try w.byte(1);
+    try w.byte(200);
     try putLenPrefixed(w, "total");
-    try w.byte(0); // partitionBy count
-    try w.byte(0); // orderBy count
+    try w.byte(0);
+    try w.byte(0);
     try w.putU32(0);
     try w.putU32(0);
 
@@ -3800,7 +3344,6 @@ test "unsubscribe args round trip an empty channel list" {
 
 test "decodeUnsubscribe rejects a truncated channel count" {
     const allocator = std.testing.allocator;
-    // 8 bytes of subscriber id, then only 2 of the 4 count bytes.
     try std.testing.expectError(error.Malformed, decodeUnsubscribe(allocator, &.{ 0, 0, 0, 0, 0, 0, 0, 1, 0, 0 }));
 }
 
@@ -3971,12 +3514,11 @@ test "decodeTableWindow rejects a truncated nth_value default value instead of m
     defer buf.deinit();
     const w = encode.ByteWriter.init(&buf);
     try putLenPrefixed(w, "orders");
-    try w.byte(1); // one spec
+    try w.byte(1);
     try w.byte(@intFromEnum(windowmod.WindowKind.nth_value));
     try putLenPrefixed(w, "amount");
-    try w.putU64(2); // n
-    try w.byte(@intFromEnum(rowmod.ValueTag.int)); // default tag says int...
-    // ...but the 8-byte payload is missing entirely.
+    try w.putU64(2);
+    try w.byte(@intFromEnum(rowmod.ValueTag.int));
 
     try std.testing.expectError(error.Malformed, decodeTableWindow(allocator, buf.items));
 }
@@ -3987,12 +3529,11 @@ test "decodeTableWindow rejects a truncated lag/lead default value instead of mi
     defer buf.deinit();
     const w = encode.ByteWriter.init(&buf);
     try putLenPrefixed(w, "orders");
-    try w.byte(1); // one spec
+    try w.byte(1);
     try w.byte(@intFromEnum(windowmod.WindowKind.lag));
     try putLenPrefixed(w, "amount");
-    try w.putU64(1); // offset
-    try w.byte(@intFromEnum(rowmod.ValueTag.text)); // default tag says text...
-    // ...but the length-prefixed payload is missing entirely.
+    try w.putU64(1);
+    try w.byte(@intFromEnum(rowmod.ValueTag.text));
 
     try std.testing.expectError(error.Malformed, decodeTableWindow(allocator, buf.items));
 }

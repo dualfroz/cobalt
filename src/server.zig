@@ -17,30 +17,36 @@ const aggregatemod = @import("aggregate.zig");
 const windowmod = @import("window.zig");
 const dumpmod = @import("dump.zig");
 const pubsubmod = @import("pubsub.zig");
+const keyspace = @import("keyspace.zig");
 
 const Allocator = std.mem.Allocator;
 const Db = dbmod.Db;
 
-/// Which role a given opcode needs at minimum when auth is enabled. `ping`
-/// and `auth` itself are handled before this is ever consulted (see
-/// `dispatch`) - every other read op needs `readonly`, every mutation
-/// needs `readwrite`, and `user_admin` (remote user management: create,
-/// change password, change role, delete, list) needs `admin` - the one
-/// opcode reserved for administrative server operations. Bootstrapping the
-/// very first admin account still has to happen CLI-only over a local Db
-/// handle (see `main.zig`'s `user add` and `serve --auth`'s refusal to
-/// start without one), since a fresh server has no admin to authenticate
-/// this opcode with in the first place.
-///
-/// `ttl_op` bundles four actions (see `protocol.TtlAction`) behind one
-/// opcode, unlike every other entry here which is a single action - so it
-/// is the one case that needs to peek at the payload's first byte (the
-/// action tag) rather than deciding purely from `op`. `query` is read-only;
-/// `expire`/`persist`/`sweep` all mutate the store and need `readwrite`. A
-/// payload too short to carry an action byte falls back to `readwrite` (the
-/// stricter requirement) - the actual decode in `handleTtlOp` will reject it
-/// as malformed either way, so this only affects which error status a
-/// bad frame gets before it is ever decoded.
+pub fn storageStatus(err: anyerror) protocol.Status {
+    return switch (err) {
+        error.InputOutput,
+        error.NoSpaceLeft,
+        error.DiskQuota,
+        error.ReadOnlyFileSystem,
+        error.AccessDenied,
+        error.FileTooBig,
+        error.FileNotFound,
+        error.IsDir,
+        error.NotOpenForWriting,
+        error.NotOpenForReading,
+        error.Unseekable,
+        error.DeviceBusy,
+        error.NoDevice,
+        error.LockViolation,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.CorruptBlock,
+        error.CorruptSstable,
+        => .io_error,
+        else => .internal,
+    };
+}
+
 fn requiredRole(op: protocol.Op, payload: []const u8) authmod.Role {
     return switch (op) {
         .ping, .auth, .auth_token => .readonly,
@@ -51,19 +57,10 @@ fn requiredRole(op: protocol.Op, payload: []const u8) authmod.Role {
             .readonly
         else
             .readwrite,
-        // Same action-byte peek as `.ttl_op` above, and for the same
-        // reason: `coll_ttl_op` bundles the same four actions, just
-        // against a whole collection instead of one flat key.
         .coll_ttl_op => if (payload.len > 0 and payload[0] == @intFromEnum(protocol.TtlAction.query))
             .readonly
         else
             .readwrite,
-        // `coll_op` bundles thirty collection actions behind one opcode
-        // (see `protocol.CollAction`) - same action-byte peek as `ttl_op`/
-        // `coll_ttl_op`, but the read/write split is looked up from
-        // `CollAction.isReadOnly` instead of a single fixed action value,
-        // since unlike the four TTL actions this opcode's actions are not
-        // all one enum-comparison away from each other.
         .coll_op => if (payload.len > 0)
             (if ((protocol.CollAction.fromByte(payload[0]) catch null)) |a|
                 (if (a.isReadOnly()) authmod.Role.readonly else .readwrite)
@@ -71,20 +68,7 @@ fn requiredRole(op: protocol.Op, payload: []const u8) authmod.Role {
                 .readwrite)
         else
             .readwrite,
-        // `txn_op` is always a write (every entry is a put or a delete),
-        // unlike `ttl_op`/`coll_ttl_op`/`coll_op` above it has no read-only
-        // action to peek for, so it needs no payload inspection at all.
         .txn_op => .readwrite,
-        // Pub/sub never touches `Db` at all (see `pubsub.zig`'s `Hub` doc
-        // comment) - all three are gated `readonly` purely so a server with
-        // auth enabled still requires SOME authenticated connection before
-        // any of them works, matching every other opcode's default
-        // posture, rather than because any of them reads storage.
-        // `unsubscribe` in particular is always sent from a DIFFERENT
-        // connection than the one that subscribed (see
-        // `protocol.encodeUnsubscribe`'s doc comment) - it needs no
-        // stronger role than `subscribe`/`publish` just because it arrives
-        // over its own connection.
         .subscribe, .publish, .unsubscribe => .readonly,
     };
 }
@@ -94,10 +78,6 @@ const PerConnLimitConfig = struct {
     refillPerSecond: f64,
 };
 
-/// A TCP server that exposes a single `Db` over the binary protocol in
-/// `protocol.zig`. One accept loop thread hands each connection off to
-/// its own detached worker thread; every worker serialises its access to
-/// `db` through `mutex` since `Db` itself keeps no internal locking.
 pub const Server = struct {
     allocator: Allocator,
     db: *Db,
@@ -126,10 +106,6 @@ pub const Server = struct {
     collTtlSweepIntervalNanos: u64 = 0,
     collTtlSweeperThread: ?std.Thread = null,
     collTtlSweptTotal: metrics.MetricCounter = .{},
-    /// Channel registry for `subscribe`/`publish` - see `pubsub.zig`'s doc
-    /// comment on `Hub` for why this is entirely separate from `mutex`/`db`
-    /// above (a live subscriber must never be able to block a store read or
-    /// write, or vice versa).
     pubsub: pubsubmod.Hub = undefined,
     messagesPublishedTotal: metrics.MetricCounter = .{},
 
@@ -142,107 +118,39 @@ pub const Server = struct {
         return self.net.listen_address;
     }
 
-    /// Number of connections currently being served. Exposed for tests
-    /// that need to wait for a handler to finish without racing on
-    /// thread teardown.
     pub fn activeConnections(self: *Server) usize {
         return self.active.load(.acquire);
     }
 
-    /// Turns on a token-bucket rate limit shared across every connection:
-    /// each dispatched request consumes one token before it is allowed to
-    /// touch `db.mutex` at all, so an overload is rejected cheaply instead
-    /// of queuing behind real storage work. Disabled (unlimited) by
-    /// default; call once before `start()`.
     pub fn enableRateLimit(self: *Server, capacity: f64, refillPerSecond: f64) void {
         self.limiter = metrics.TokenBucket.init(capacity, refillPerSecond, @intCast(std.time.nanoTimestamp()));
     }
 
-    /// Gives every accepted connection its own private token bucket,
-    /// independent of every other connection's budget and of the shared
-    /// `limiter` above. A fresh bucket is created per connection in
-    /// `handleConnection` (not shared state, so no locking is needed beyond
-    /// what TokenBucket already does internally) - one noisy client cannot
-    /// starve another client's share of the server, which a single global
-    /// bucket cannot express. Both limits can be enabled together: a
-    /// request must clear the per-connection budget before it is even
-    /// checked against the global one. Disabled by default; call once
-    /// before `start()`.
     pub fn enablePerConnectionRateLimit(self: *Server, capacity: f64, refillPerSecond: f64) void {
         self.perConnLimit = .{ .capacity = capacity, .refillPerSecond = refillPerSecond };
     }
 
-    /// Turns on username/password authentication and role enforcement for
-    /// every connection: after this call, every opcode except `ping` and
-    /// `auth` itself requires a prior successful `auth` on that connection
-    /// (`unauthorized` otherwise), and the authenticated role must meet
-    /// `requiredRole(op)` (`forbidden` otherwise). `store` is not owned by
-    /// the server - the caller keeps managing the underlying `Db` user
-    /// records (creating the first admin, etc.) through `store` directly.
-    /// Disabled (no auth required, matching every prior version of this
-    /// server) by default; call once before `start()`.
     pub fn enableAuth(self: *Server, store: authmod.Store) void {
         self.authStore = store;
     }
 
-    /// Layers expiring session tokens on top of password auth (requires
-    /// `enableAuth` to also be called - sessions are only ever minted from
-    /// a successful password check, never a substitute for one). Once
-    /// enabled: a successful `auth` response carries a fresh token in its
-    /// payload (empty payload otherwise, unchanged from before this
-    /// existed) valid for `ttlNanos`; a NEW connection can skip the
-    /// password entirely by sending that token as `auth_token` instead;
-    /// and - the actual behavior change from plain password auth - a
-    /// connection's authenticated role stops being honored the moment its
-    /// session's expiry passes, even if the TCP connection itself has
-    /// stayed open the whole time (`dispatch` re-checks the wall clock on
-    /// every request, not just at `auth` time). `store` is not owned by
-    /// the server, exactly like `enableAuth`'s `authmod.Store` - the
-    /// caller keeps it alive and can inspect/revoke sessions directly.
     pub fn enableSessions(self: *Server, store: *sessionmod.SessionStore, ttlNanos: i128) void {
         self.sessions = store;
         self.sessionTtlNanos = ttlNanos;
     }
 
-    /// Runs `SessionStore.sweepExpired` on a background thread every
-    /// `intervalNanos`, starting once `start()` is called. Without this, a
-    /// session nobody ever presents again (the client that held it simply
-    /// vanished) sits in `sessions` forever - `validate()` only ever cleans
-    /// up a token someone actually tries to use. Requires `enableSessions`
-    /// to have been called first (checked in `start()`, not here, since
-    /// callers are free to call these two in either order before `start`).
     pub fn enableSessionSweep(self: *Server, intervalNanos: u64) void {
         self.sweepIntervalNanos = intervalNanos;
     }
 
-    /// Runs `ttl.sweepExpired` on a background thread every `intervalNanos`,
-    /// starting once `start()` is called - independent of `enableAuth`/
-    /// `enableSessions`/`enableSessionSweep` above, since key TTLs (set via
-    /// the `ttl_op` opcode or the CLI's local `put --ttl`/`expire`) are a
-    /// property of the `Db` itself, not of authentication. Without this, a
-    /// key whose TTL elapsed but that nobody ever reads again (so
-    /// `ttl.getLive`'s lazy expiry never fires) sits in the store forever -
-    /// exactly the same gap `enableSessionSweep` closes for session tokens.
-    /// Call once before `start()`.
     pub fn enableTtlSweep(self: *Server, intervalNanos: u64) void {
         self.ttlSweepIntervalNanos = intervalNanos;
     }
 
-    /// Runs `collttl.sweepExpired` on a background thread every
-    /// `intervalNanos`, starting once `start()` is called - the whole-
-    /// collection counterpart of `enableTtlSweep` above, independent of it
-    /// (a server can enable one, both, or neither). Without this, a
-    /// collection whose TTL elapsed but that nobody ever touches again (so
-    /// `coll_ttl_op`'s lazy `expireIfDue` never fires, matching the CLI's
-    /// local `coll` dispatcher) sits in the store forever. Call once before
-    /// `start()`.
     pub fn enableCollTtlSweep(self: *Server, intervalNanos: u64) void {
         self.collTtlSweepIntervalNanos = intervalNanos;
     }
 
-    /// Registers this server's request counters into `reg` under fixed
-    /// names, so they show up alongside any other Prometheus metrics an
-    /// embedding application already exports.
     pub fn registerMetrics(self: *Server, reg: *metrics.Registry) !void {
         try reg.registerCounter("cobalt_server_requests_total", &self.requestsTotal);
         try reg.registerCounter("cobalt_server_rate_limited_total", &self.rateLimitedTotal);
@@ -269,19 +177,10 @@ pub const Server = struct {
         }
     }
 
-    /// Blocks until the accept loop exits (only happens via `stop()` or
-    /// an unrecoverable accept error). Used by long-running foreground
-    /// servers such as the CLI's `serve` command.
     pub fn wait(self: *Server) void {
         if (self.acceptThread) |t| t.join();
     }
 
-    /// Background loop started by `start()` when `enableSessionSweep` set a
-    /// nonzero interval and sessions are enabled. Sleeps the full interval
-    /// between sweeps (a sweep is pure housekeeping, never load-bearing for
-    /// correctness - `validate()` already refuses an expired token on its
-    /// own), and checks `stopping` both before and after each sleep so
-    /// `stop()` never has to wait more than one interval to join it.
     fn sweepLoop(self: *Server) void {
         const store = self.sessions orelse return;
         while (!self.stopping.load(.acquire)) {
@@ -292,14 +191,6 @@ pub const Server = struct {
         }
     }
 
-    /// Background loop started by `start()` when `enableTtlSweep` set a
-    /// nonzero interval. Unlike `sweepLoop` above, `ttl.sweepExpired` reads
-    /// and mutates the same `Db` every request handler touches, so this
-    /// loop must take `self.mutex` around the call exactly like `dispatch`
-    /// does for every opcode - `Db` itself keeps no internal locking (see
-    /// the doc comment on `Server`). A failed sweep (e.g. a transient I/O
-    /// error) is skipped rather than crashing the server; the next tick
-    /// tries again.
     fn ttlSweepLoop(self: *Server) void {
         while (!self.stopping.load(.acquire)) {
             std.time.sleep(self.ttlSweepIntervalNanos);
@@ -314,13 +205,6 @@ pub const Server = struct {
         }
     }
 
-    /// Background loop started by `start()` when `enableCollTtlSweep` set a
-    /// nonzero interval - the whole-collection counterpart of `ttlSweepLoop`
-    /// above, same shape (own thread, takes `self.mutex` around the actual
-    /// `Db` access, skips a failed sweep rather than crashing).
-    /// `collttl.sweepExpired` walks every kind's marker namespace in one
-    /// prefix scan, so one thread covers Counter/Hash/Set/List/ZSet at once
-    /// rather than needing one sweeper per kind.
     fn collTtlSweepLoop(self: *Server) void {
         while (!self.stopping.load(.acquire)) {
             std.time.sleep(self.collTtlSweepIntervalNanos);
@@ -357,26 +241,13 @@ pub const Server = struct {
         defer _ = self.active.fetchSub(1, .acq_rel);
         var stream = conn.stream;
 
-        // A private bucket for this one connection, if enabled. It lives on
-        // this worker's own stack and is only ever touched by this thread,
-        // so unlike `self.limiter` it needs no cross-thread synchronization
-        // even though TokenBucket carries its own mutex regardless.
         var connLimiter: ?metrics.TokenBucket = if (self.perConnLimit) |cfg|
             metrics.TokenBucket.init(cfg.capacity, cfg.refillPerSecond, @intCast(std.time.nanoTimestamp()))
         else
             null;
 
-        // Which role (if any) this one connection has authenticated as.
-        // Lives on this worker's stack, exactly like `connLimiter` above -
-        // a fresh, private slot per connection, never shared.
         var connRole: ?authmod.Role = null;
 
-        // When sessions are enabled (see `enableSessions`), the nanosecond
-        // timestamp at which `connRole` above stops being honored - set
-        // whenever `auth`/`auth_token` succeeds, re-checked on every
-        // request in `dispatch`. Stays null (never expires on its own) for
-        // a server with auth but no session store, matching the original
-        // "authenticated for as long as the connection is open" behavior.
         var connExpiresAtNanos: ?i128 = null;
 
         while (true) {
@@ -389,6 +260,14 @@ pub const Server = struct {
 
     fn writeErr(writer: anytype, status: protocol.Status, message: []const u8) !void {
         try protocol.writeFrame(writer, @intFromEnum(status), message);
+    }
+
+    fn writeStorageErr(writer: anytype, err: anyerror) !void {
+        try protocol.writeFrame(writer, @intFromEnum(storageStatus(err)), @errorName(err));
+    }
+
+    fn writeReservedKey(writer: anytype) !void {
+        try writeErr(writer, .bad_request, "key is in the reserved internal namespace (first byte 0xF5-0xFF)");
     }
 
     fn dispatch(self: *Server, frame: *protocol.Frame, stream: std.net.Stream, writer: anytype, connLimiter: ?*metrics.TokenBucket, connRole: *?authmod.Role, connExpiresAtNanos: *?i128) !void {
@@ -418,11 +297,6 @@ pub const Server = struct {
                     self.unauthorizedTotal.incr();
                     return writeErr(writer, .unauthorized, "authentication required");
                 };
-                // A role survives only as long as its session does, when
-                // sessions are enabled: a session that expired since the
-                // last request on this same connection is treated exactly
-                // like never having authenticated at all, forcing a fresh
-                // `auth`/`auth_token` before anything else proceeds.
                 if (connExpiresAtNanos.*) |expiresAt| {
                     if (std.time.nanoTimestamp() >= expiresAt) {
                         connRole.* = null;
@@ -439,13 +313,6 @@ pub const Server = struct {
             }
         }
 
-        // `subscribe`/`publish` never touch `db` - handled here, before
-        // `self.mutex` is ever taken, so neither one can be blocked behind
-        // (or block) a store read/write. `subscribe` in particular can hold
-        // this stack frame open for the entire remaining lifetime of the
-        // connection (see `handleSubscribe`'s doc comment), which would
-        // starve every other connection forever if it happened under
-        // `self.mutex`.
         if (op == .subscribe) return self.handleSubscribe(frame.payload, stream);
         if (op == .publish) return self.handlePublish(frame.payload, writer);
         if (op == .unsubscribe) return self.handleUnsubscribe(frame.payload, writer);
@@ -456,23 +323,14 @@ pub const Server = struct {
         switch (op) {
             .ping => try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "PONG"),
 
-            // Only reachable when `self.authStore == null` - a server with
-            // auth enabled answers `auth` requests in `handleAuth` above,
-            // before this switch is ever entered. A server with auth
-            // disabled has nothing to check credentials against, so it
-            // always accepts, matching every other opcode's "auth is
-            // simply not enforced" behavior on this server.
             .auth => try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), ""),
 
-            // Only reachable when `self.authStore == null`, for the exact
-            // same reason as `.auth` above: a server without auth enabled
-            // has no notion of a session either, so it accepts any token
-            // unconditionally rather than ever consulting a session store.
             .auth_token => try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), ""),
 
             .get => {
-                const value = self.db.get(self.allocator, frame.payload) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                if (keyspace.isInternal(frame.payload)) return writeReservedKey(writer);
+                const value = ttlmod.getLive(self.db, self.allocator, frame.payload, std.time.nanoTimestamp()) catch |err| {
+                    return writeStorageErr(writer, err);
                 };
                 if (value) |v| {
                     defer self.allocator.free(v);
@@ -486,15 +344,17 @@ pub const Server = struct {
                 const args = protocol.decodeSet(frame.payload) catch {
                     return writeErr(writer, .bad_request, "malformed set payload");
                 };
-                self.db.put(args.key, args.value) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                if (keyspace.isInternal(args.key)) return writeReservedKey(writer);
+                ttlmod.putPersistent(self.db, self.allocator, args.key, args.value) catch |err| {
+                    return writeStorageErr(writer, err);
                 };
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
             },
 
             .del => {
-                self.db.delete(frame.payload) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                if (keyspace.isInternal(frame.payload)) return writeReservedKey(writer);
+                ttlmod.deleteKey(self.db, self.allocator, frame.payload) catch |err| {
+                    return writeStorageErr(writer, err);
                 };
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
             },
@@ -505,7 +365,7 @@ pub const Server = struct {
             .stats => {
                 const s = self.db.stats();
                 const payload = protocol.encodeStats(self.allocator, s) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 defer self.allocator.free(payload);
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), payload);
@@ -513,14 +373,14 @@ pub const Server = struct {
 
             .flush => {
                 self.db.flush() catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
             },
 
             .compact => {
                 self.db.compact() catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
             },
@@ -534,8 +394,6 @@ pub const Server = struct {
             .table_aggregate => try self.handleTableAggregate(frame.payload, writer),
             .table_window => try self.handleTableWindow(frame.payload, writer),
 
-            // All three already handled and returned from above, before
-            // `self.mutex` was ever taken - never reached here.
             .subscribe, .publish, .unsubscribe => unreachable,
 
             .table_explain => try self.handleTableExplain(frame.payload, writer),
@@ -562,56 +420,43 @@ pub const Server = struct {
         }
     }
 
-    /// Answers the `ttl_op` opcode: the network counterpart of the CLI's
-    /// local `expire`/`persist`/`ttl`/`expire-sweep` (main.zig), all backed
-    /// by the same `ttl.zig` functions the local commands call directly -
-    /// `query`/`sweep` were previously reachable only from a process that
-    /// had the `Db` open itself. `expire` mirrors the CLI's Redis-EXPIRE-
-    /// strict existence check (main.zig checks `db.get` before calling
-    /// `ttl.setExpireSeconds`; here the same check happens before the same
-    /// call) and answers `not_found` rather than `ok` when the key does not
-    /// currently exist, instead of the looser PEXPIREAT-like
-    /// `ttl.setExpireAt` that would silently accept it.
     fn handleTtlOp(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodeTtlOp(payload) catch {
             return writeErr(writer, .bad_request, "malformed ttl payload");
         };
+        if (keyspace.isInternal(args.key)) return writeReservedKey(writer);
         const now = std.time.nanoTimestamp();
         switch (args.action) {
             .expire => {
-                const existing = self.db.get(self.allocator, args.key) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                const live = ttlmod.expireLive(self.db, self.allocator, args.key, now, args.seconds) catch |err| {
+                    return writeStorageErr(writer, err);
                 };
-                if (existing == null) return writeErr(writer, .not_found, "no such key");
-                self.allocator.free(existing.?);
-                ttlmod.setExpireSeconds(self.db, self.allocator, args.key, now, args.seconds) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
-                };
+                if (!live) return writeErr(writer, .not_found, "no such key");
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
             },
             .persist => {
                 ttlmod.clearExpire(self.db, self.allocator, args.key) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
             },
             .query => {
                 const result = ttlmod.remaining(self.db, self.allocator, args.key, now) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 const respPayload = protocol.encodeTtlResult(self.allocator, result) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 defer self.allocator.free(respPayload);
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), respPayload);
             },
             .sweep => {
                 const reaped = ttlmod.sweepExpired(self.db, self.allocator, now) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 if (reaped > 0) self.ttlSweptTotal.incrBy(@intCast(reaped));
                 const respPayload = protocol.encodeTtlSweepCount(self.allocator, @intCast(reaped)) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 defer self.allocator.free(respPayload);
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), respPayload);
@@ -619,14 +464,6 @@ pub const Server = struct {
         }
     }
 
-    /// Answers the `coll_ttl_op` opcode: the network counterpart of the
-    /// CLI's local `coll <kind> expire|ttl|persist <name>`/`coll
-    /// expire-sweep` (main.zig), all backed by the same `collttl.zig`
-    /// functions the local commands call directly - same shape as
-    /// `handleTtlOp` above, but `expire`'s existence check is
-    /// `collections.collectionExists` (a whole namespace) instead of
-    /// `db.get` (one key), matching the CLI's own `coll <kind> expire`
-    /// check.
     fn handleCollTtlOp(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodeCollTtlOp(payload) catch {
             return writeErr(writer, .bad_request, "malformed coll ttl payload");
@@ -635,37 +472,37 @@ pub const Server = struct {
         switch (args.action) {
             .expire => {
                 const exists = collmod.collectionExists(self.db, self.allocator, args.kind, args.name) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 if (!exists) return writeErr(writer, .not_found, "no such collection");
                 collttlmod.setExpireSeconds(self.db, self.allocator, args.kind, args.name, now, args.seconds) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
             },
             .persist => {
                 collttlmod.clearExpire(self.db, self.allocator, args.kind, args.name) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
             },
             .query => {
                 const result = collttlmod.remaining(self.db, self.allocator, args.kind, args.name, now) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 const respPayload = protocol.encodeTtlResult(self.allocator, result) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 defer self.allocator.free(respPayload);
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), respPayload);
             },
             .sweep => {
                 const reaped = collttlmod.sweepExpired(self.db, self.allocator, now) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 if (reaped > 0) self.collTtlSweptTotal.incrBy(@intCast(reaped));
                 const respPayload = protocol.encodeTtlSweepCount(self.allocator, @intCast(reaped)) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 defer self.allocator.free(respPayload);
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), respPayload);
@@ -673,17 +510,6 @@ pub const Server = struct {
         }
     }
 
-    /// Answers the `coll_op` opcode: the network counterpart of the CLI's
-    /// local `coll <kind> <op> ...` (main.zig's `runColl`, backed by
-    /// `collections.zig`) - collections were previously reachable only from
-    /// a process holding the `Db` directly, the same gap `ttl_op`/
-    /// `coll_ttl_op` already closed for TTL management. Applies the same
-    /// lazy-expiry check `runColl` performs locally before every dispatch
-    /// (`collttl.expireIfDue` on the target name, plus `expireIfDueMany` on
-    /// the extra names of the three multi-set actions) so a collection
-    /// whose TTL is already due never appears alive over the wire either.
-    /// The actual per-action work lives in `dispatchCollOp` below; this
-    /// function only handles decode and the shared expiry check.
     fn handleCollOp(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodeCollOp(self.allocator, payload) catch {
             return writeErr(writer, .bad_request, "malformed coll payload");
@@ -691,40 +517,28 @@ pub const Server = struct {
         defer self.allocator.free(args.args);
         const now = std.time.nanoTimestamp();
         _ = collttlmod.expireIfDue(self.db, self.allocator, args.action.kind(), args.name, now) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         switch (args.action) {
             .set_inter, .set_union, .set_diff => _ = collttlmod.expireIfDueMany(self.db, self.allocator, .set, args.args, now) catch |err| {
-                return writeErr(writer, .internal, @errorName(err));
+                return writeStorageErr(writer, err);
             },
             else => {},
         }
-        // Thirty actions each wrapping their own `db` call in a `catch |err|
-        // return writeErr(...)` (the pattern every other handler in this
-        // file uses) would triple the size of this function for no benefit
-        // over one shared boundary: `dispatchCollOp` uses plain `try` and
-        // two sentinel errors for malformed arguments, and this one catch
-        // maps both cases to the right status - the same information either
-        // way, just not repeated thirty times.
         self.dispatchCollOp(args, writer) catch |err| return switch (err) {
             error.InvalidArgCount, error.InvalidNumber => writeErr(writer, .bad_request, @errorName(err)),
-            else => writeErr(writer, .internal, @errorName(err)),
+            else => writeStorageErr(writer, err),
         };
     }
 
     fn writeCollReply(self: *Server, writer: anytype, reply: protocol.CollReply) !void {
         const respPayload = protocol.encodeCollReply(self.allocator, reply) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer self.allocator.free(respPayload);
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), respPayload);
     }
 
-    /// One arm per `protocol.CollAction`, each translating straight from
-    /// `args.args` (the CLI-text-form string arguments) into the matching
-    /// `collections.zig` call and back into a `protocol.CollReply` - the
-    /// exact same translation `main.zig`'s `runColl` already does for the
-    /// local CLI, just producing a wire reply instead of a printed line.
     fn dispatchCollOp(self: *Server, args: protocol.CollOpArgs, writer: anytype) !void {
         const a = args.args;
         switch (args.action) {
@@ -929,32 +743,19 @@ pub const Server = struct {
         }
     }
 
-    /// Answers the `metrics` opcode: the network counterpart of the CLI's
-    /// `stats --prom` (which only ever renders `Db.stats()` locally) plus
-    /// this server's own request/rate-limit/auth/session counters from
-    /// `registerMetrics` - until now those counters were only ever
-    /// observable in-process, by a test holding a direct `*Server`
-    /// pointer. The registry is built fresh per request and thrown away
-    /// immediately after rendering: there is nothing to keep alive between
-    /// calls, since every counter it reads lives on `self` regardless.
     fn handleMetrics(self: *Server, writer: anytype) !void {
         var reg = metrics.Registry.init(self.allocator);
         defer reg.deinit();
-        self.registerMetrics(&reg) catch |err| return writeErr(writer, .internal, @errorName(err));
+        self.registerMetrics(&reg) catch |err| return writeStorageErr(writer, err);
 
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
-        reg.exportText(self.allocator, buf.writer()) catch |err| return writeErr(writer, .internal, @errorName(err));
-        metrics.formatDbStats(buf.writer(), "cobalt", self.db.stats()) catch |err| return writeErr(writer, .internal, @errorName(err));
+        reg.exportText(self.allocator, buf.writer()) catch |err| return writeStorageErr(writer, err);
+        metrics.formatDbStats(buf.writer(), "cobalt", self.db.stats()) catch |err| return writeStorageErr(writer, err);
 
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), buf.items);
     }
 
-    /// Verifies credentials against `store` and, on success, stamps the
-    /// resulting role into this connection's `connRole` slot so every
-    /// subsequent request on the same connection is dispatched under it.
-    /// Locks `self.mutex` only around the actual `Db` read `verify`
-    /// performs, same as every other handler here.
     fn handleAuth(self: *Server, store: authmod.Store, payload: []const u8, writer: anytype, connRole: *?authmod.Role, connExpiresAtNanos: *?i128) !void {
         const args = protocol.decodeAuth(payload) catch {
             return writeErr(writer, .bad_request, "malformed auth payload");
@@ -968,7 +769,7 @@ pub const Server = struct {
             self.unauthorizedTotal.incr();
             return switch (err) {
                 error.InvalidCredentials, error.Malformed => writeErr(writer, .unauthorized, "invalid credentials"),
-                else => writeErr(writer, .internal, @errorName(err)),
+                else => writeStorageErr(writer, err),
             };
         };
         connRole.* = role;
@@ -977,12 +778,12 @@ pub const Server = struct {
         if (self.sessions) |store_| {
             const now = std.time.nanoTimestamp();
             const token = store_.issue(role, self.sessionTtlNanos, now) catch |err| {
-                return writeErr(writer, .internal, @errorName(err));
+                return writeStorageErr(writer, err);
             };
             defer self.allocator.free(token);
             connExpiresAtNanos.* = now + self.sessionTtlNanos;
             const responsePayload = protocol.encodeAuthOk(self.allocator, token) catch |err| {
-                return writeErr(writer, .internal, @errorName(err));
+                return writeStorageErr(writer, err);
             };
             defer self.allocator.free(responsePayload);
             return protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), responsePayload);
@@ -990,10 +791,6 @@ pub const Server = struct {
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
     }
 
-    /// Authenticates a connection from a previously issued session token
-    /// instead of a username/password pair (see `enableSessions`). Only
-    /// reachable when `self.sessions` is set, since `dispatch` only routes
-    /// `auth_token` here while `self.authStore` is also set.
     fn handleAuthToken(self: *Server, payload: []const u8, writer: anytype, connRole: *?authmod.Role, connExpiresAtNanos: *?i128) !void {
         const store = self.sessions orelse {
             self.unauthorizedTotal.incr();
@@ -1013,54 +810,43 @@ pub const Server = struct {
         const args = protocol.decodeScan(payload) catch {
             return writeErr(writer, .bad_request, "malformed scan payload");
         };
-        var entries = std.ArrayList(dbmod.Entry).init(self.allocator);
-        defer entries.deinit();
-
+        const options = dbmod.ScanOptions{ .start = args.start, .end = args.end };
+        const now = std.time.nanoTimestamp();
         if (args.reverse) {
-            var it = self.db.scanReverse(self.allocator, .{ .start = args.start, .end = args.end }) catch |err| {
-                return writeErr(writer, .internal, @errorName(err));
+            var it = keyspace.scanUserReverse(self.db, self.allocator, options, now) catch |err| {
+                return writeStorageErr(writer, err);
             };
             defer it.deinit();
-            while (try it.next()) |e| {
-                try entries.append(e);
-                if (args.limit != 0 and entries.items.len >= args.limit) break;
-            }
-        } else {
-            var it = self.db.scanRange(self.allocator, .{ .start = args.start, .end = args.end }) catch |err| {
-                return writeErr(writer, .internal, @errorName(err));
-            };
-            defer it.deinit();
-            while (try it.next()) |e| {
-                try entries.append(e);
-                if (args.limit != 0 and entries.items.len >= args.limit) break;
-            }
+            return self.writeEntries(&it, args.limit, writer);
         }
-
-        const out = protocol.encodeEntries(self.allocator, entries.items) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+        var it = keyspace.scanUser(self.db, self.allocator, options, now) catch |err| {
+            return writeStorageErr(writer, err);
         };
-        defer self.allocator.free(out);
-        try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
+        defer it.deinit();
+        return self.writeEntries(&it, args.limit, writer);
     }
 
     fn handlePrefix(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodePrefix(payload) catch {
             return writeErr(writer, .bad_request, "malformed prefix payload");
         };
-        var it = self.db.scanPrefix(self.allocator, args.prefix) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+        var it = keyspace.scanUserPrefix(self.db, self.allocator, args.prefix, std.time.nanoTimestamp()) catch |err| {
+            return writeStorageErr(writer, err);
         };
         defer it.deinit();
+        return self.writeEntries(&it, args.limit, writer);
+    }
 
+    fn writeEntries(self: *Server, it: anytype, limit: u32, writer: anytype) !void {
         var entries = std.ArrayList(dbmod.Entry).init(self.allocator);
         defer entries.deinit();
-        while (try it.next()) |e| {
+        while (it.next() catch |err| return writeStorageErr(writer, err)) |e| {
             try entries.append(e);
-            if (args.limit != 0 and entries.items.len >= args.limit) break;
+            if (limit != 0 and entries.items.len >= limit) break;
         }
 
         const out = protocol.encodeEntries(self.allocator, entries.items) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer self.allocator.free(out);
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
@@ -1075,32 +861,26 @@ pub const Server = struct {
         var wb = dbmod.WriteBatch.init(self.allocator);
         defer wb.deinit();
         for (ops) |op| {
+            const key = switch (op) {
+                .put => |kv| kv.key,
+                .del => |k| k,
+            };
+            if (keyspace.isInternal(key)) return writeReservedKey(writer);
             switch (op) {
-                .put => |kv| try wb.put(kv.key, kv.value),
-                .del => |key| try wb.delete(key),
+                .put => |kv| ttlmod.stagePersistentPut(self.db, self.allocator, &wb, kv.key, kv.value) catch |err| {
+                    return writeStorageErr(writer, err);
+                },
+                .del => ttlmod.stageDelete(self.db, self.allocator, &wb, key) catch |err| {
+                    return writeStorageErr(writer, err);
+                },
             }
         }
         self.db.apply(&wb) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
     }
 
-    /// Executes a `txn_op` request: the network counterpart of the CLI's
-    /// local `txn <script-file>` (main.zig's `runTxn`), applying every
-    /// put/delete in `entries` as one atomic `Transaction` commit across
-    /// however many tables they touch. Runs entirely inside `dispatch`'s
-    /// single `self.mutex` acquisition, like every other opcode - which
-    /// means, unlike a raw multi-thread `Transaction` against an unguarded
-    /// `*Db` (see `concurrent.zig`'s `GuardedDb` doc comment), no other
-    /// connection's request can ever interleave between this transaction's
-    /// begin and its commit. `txn.commit()`'s OCC conflict check stays in
-    /// place and still maps to `Status.conflict` below, but under this
-    /// server's locking discipline nothing can actually trigger it for a
-    /// request that arrives, stages, and commits within one dispatch call -
-    /// the same reason `concurrent.zig`'s `TableTransferWorker` test treats
-    /// a real `error.Conflict` under `GuardedDb.acquire()` as a bug, not an
-    /// expected outcome.
     fn handleTxnOp(self: *Server, payload: []const u8, writer: anytype) !void {
         const entries = protocol.decodeTxnOp(self.allocator, payload) catch {
             return writeErr(writer, .bad_request, "malformed txn_op payload");
@@ -1120,7 +900,7 @@ pub const Server = struct {
 
         for (entries) |e| {
             const gop = tables.getOrPut(e.table) catch |err| {
-                return writeErr(writer, .internal, @errorName(err));
+                return writeStorageErr(writer, err);
             };
             if (!gop.found_existing) {
                 gop.value_ptr.* = txntablemod.TableTxn.open(&txn, self.allocator, e.table) catch |err| {
@@ -1142,12 +922,12 @@ pub const Server = struct {
                     };
                     defer fieldsRow.deinit();
                     table.put(pk, fieldsRow.fields.items) catch |err| {
-                        return writeErr(writer, .internal, @errorName(err));
+                        return writeStorageErr(writer, err);
                     };
                 },
                 .del => {
                     table.delete(pk) catch |err| {
-                        return writeErr(writer, .internal, @errorName(err));
+                        return writeStorageErr(writer, err);
                     };
                 },
             }
@@ -1156,29 +936,17 @@ pub const Server = struct {
         txn.commit() catch |err| {
             return switch (err) {
                 error.Conflict => writeErr(writer, .conflict, "transaction conflict"),
-                else => writeErr(writer, .internal, @errorName(err)),
+                else => writeStorageErr(writer, err),
             };
         };
 
         const out = protocol.encodeTxnResult(self.allocator, @intCast(entries.len)) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer self.allocator.free(out);
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
     }
 
-    /// Executes a `table select <table> [expr]` remotely: opens the named
-    /// table over the same `*Db` the rest of the server serves (so it sees
-    /// exactly the indexes/rows a local CLI `table` command would), parses
-    /// the expression text with the same `expr.zig` grammar the CLI uses
-    /// (empty text means "every row", matching `Table.select(null)`), and
-    /// wire-encodes the resulting rows. `args.orderBy`, when present, is
-    /// forwarded to `Table.selectPageOrdered` so the offset/limit window
-    /// applies AFTER sorting, exactly like the local `table select
-    /// --order-by` CLI path - `null` falls through to the plain
-    /// `selectPage` early-stop behavior instead. A bad table name or
-    /// malformed expression is a client mistake (`bad_request`), not a
-    /// server fault.
     fn handleTableSelect(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodeTableSelect(self.allocator, payload) catch {
             return writeErr(writer, .bad_request, "malformed table_select payload");
@@ -1200,35 +968,17 @@ pub const Server = struct {
         const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
 
         const rows = table.selectPageOrdered(pred, .{ .offset = args.offset, .limit = args.limit }, args.orderBy) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer querymod.freeRows(self.allocator, rows);
 
         const out = protocol.encodeRows(self.allocator, rows) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer self.allocator.free(out);
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
     }
 
-    /// Executes a `table_join` request against `join.zig`'s four equi-join
-    /// variants, chosen by `args.mode` - the network counterpart of the
-    /// CLI's local `table join [--left|--right|--full]`. Each variant
-    /// produces its own result type (`JoinedRow`/`OuterJoinedRow`/
-    /// `RightOuterJoinedRow`/`FullOuterJoinedRow`), but every one of them is
-    /// just two optional `Row`s under the hood, so this flattens whichever
-    /// one came back into `protocol.JoinPair` before encoding - one wire
-    /// format for all four modes, exactly like `coll_op` bundles thirty
-    /// collection actions behind one opcode instead of thirty. Ownership of
-    /// each row is moved (by value) from the mode-specific slice into
-    /// `pairs`, then that mode-specific slice is freed as a raw allocation
-    /// (not through `join.freeJoined`/`freeOuterJoined`/etc, which would
-    /// double-deinit rows already moved into `pairs`) - `pairs`'s own defer
-    /// is what actually frees the row contents, once encoding is done.
-    /// `args.offset`/`args.limit` window the mode-specific slice through
-    /// `join.applyPage` right after it comes back, before the flatten -
-    /// `applyPage` already frees the pre-page slice and hands back a fresh
-    /// one, so the pattern below frees `paged`, never `joined` directly.
     fn handleTableJoin(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodeTableJoin(payload) catch {
             return writeErr(writer, .bad_request, "malformed table_join payload");
@@ -1275,40 +1025,40 @@ pub const Server = struct {
         switch (args.mode) {
             .inner => {
                 const joined = joinmod.innerJoin(self.allocator, &left, args.leftField, leftPred, &right, args.rightField, rightPred) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 const paged = joinmod.applyPage(joinmod.JoinedRow, self.allocator, joined, page) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 defer self.allocator.free(paged);
                 for (paged) |p| try pairs.append(.{ .left = p.left, .right = p.right });
             },
             .left => {
                 const joined = joinmod.leftOuterJoin(self.allocator, &left, args.leftField, leftPred, &right, args.rightField, rightPred) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 const paged = joinmod.applyPage(joinmod.OuterJoinedRow, self.allocator, joined, page) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 defer self.allocator.free(paged);
                 for (paged) |p| try pairs.append(.{ .left = p.left, .right = p.right });
             },
             .right => {
                 const joined = joinmod.rightOuterJoin(self.allocator, &left, args.leftField, leftPred, &right, args.rightField, rightPred) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 const paged = joinmod.applyPage(joinmod.RightOuterJoinedRow, self.allocator, joined, page) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 defer self.allocator.free(paged);
                 for (paged) |p| try pairs.append(.{ .left = p.left, .right = p.right });
             },
             .full => {
                 const joined = joinmod.fullOuterJoin(self.allocator, &left, args.leftField, leftPred, &right, args.rightField, rightPred) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 const paged = joinmod.applyPage(joinmod.FullOuterJoinedRow, self.allocator, joined, page) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 defer self.allocator.free(paged);
                 for (paged) |p| try pairs.append(.{ .left = p.left, .right = p.right });
@@ -1316,38 +1066,12 @@ pub const Server = struct {
         }
 
         const out = protocol.encodeJoinedRows(self.allocator, pairs.items) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer self.allocator.free(out);
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
     }
 
-    /// Executes a `table_aggregate` request: opens the named table over the
-    /// same `*Db` the rest of the server serves, filters rows with the same
-    /// `expr.zig` grammar `table_select`/`table_join` already use (empty
-    /// text selects every row), then hands the filtered rows to
-    /// `aggregate.zig` - `runGlobal` when `args.groupField` is empty (the
-    /// network counterpart of the CLI's `*` sentinel for "no GROUP BY"),
-    /// `run` otherwise. When `args.havingText` is non-empty, it is parsed
-    /// with the same `expr.zig` grammar and applied AFTER aggregation but
-    /// BEFORE paging - `globalMatchesHaving` on the `runGlobal` path (an
-    /// excluded single result comes back as zero values, not an error) or
-    /// `filterHaving` on the grouped path - then, on the grouped path only,
-    /// a non-empty `args.orderBy` sorts the HAVING-narrowed groups via
-    /// `aggregate.sortGroupsBy` (an unknown order field is `bad_request`,
-    /// same treatment as a malformed HAVING expr) - then windowed by
-    /// `args.offset`/`args.limit` through `aggregate.applyPageGroups` (0/0 =
-    /// unlimited, ignored for the `runGlobal` path since that always
-    /// produces at most one result row, same as `args.orderBy`). Two distinct wire shapes come back
-    /// (`encodeAggGlobalResult` vs `encodeAggGroupRows`) because the client
-    /// already knows which one it asked for (it is the one that chose
-    /// `groupField`), so no extra discriminator byte is needed on the wire -
-    /// the client just decodes with whichever matches its own request, the
-    /// same reasoning `Client.tableAggregateGlobal`/`tableAggregateGroups`
-    /// document. A bad table name, malformed expr, or a spec referencing a
-    /// non-numeric field (`error.NonNumericField`/`error.Overflow` from
-    /// `aggregate.zig`) is a client mistake (`bad_request`), not a server
-    /// fault.
     fn handleTableAggregate(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodeTableAggregate(self.allocator, payload) catch {
             return writeErr(writer, .bad_request, "malformed table_aggregate payload");
@@ -1379,7 +1103,7 @@ pub const Server = struct {
         const havingPred: ?querymod.Predicate = if (havingParsed) |p| p.predicate else null;
 
         const rows = table.select(pred) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer querymod.freeRows(self.allocator, rows);
 
@@ -1387,18 +1111,18 @@ pub const Server = struct {
             const values = aggregatemod.runGlobal(self.allocator, rows, args.specs) catch |err| {
                 return switch (err) {
                     error.NonNumericField, error.Overflow => writeErr(writer, .bad_request, @errorName(err)),
-                    else => writeErr(writer, .internal, @errorName(err)),
+                    else => writeStorageErr(writer, err),
                 };
             };
             defer aggregatemod.freeGlobalResult(self.allocator, values);
             const matches = if (havingPred) |hp|
                 aggregatemod.globalMatchesHaving(self.allocator, args.specs, values, hp) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 }
             else
                 true;
             const out = protocol.encodeAggGlobalResult(self.allocator, if (matches) values else &.{}) catch |err| {
-                return writeErr(writer, .internal, @errorName(err));
+                return writeStorageErr(writer, err);
             };
             defer self.allocator.free(out);
             try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
@@ -1406,12 +1130,12 @@ pub const Server = struct {
             const unpaged = aggregatemod.run(self.allocator, rows, args.groupField, args.specs) catch |err| {
                 return switch (err) {
                     error.NonNumericField, error.Overflow => writeErr(writer, .bad_request, @errorName(err)),
-                    else => writeErr(writer, .internal, @errorName(err)),
+                    else => writeStorageErr(writer, err),
                 };
             };
             const filtered = if (havingPred) |hp|
                 aggregatemod.filterHaving(self.allocator, unpaged, args.groupField, args.specs, hp) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 }
             else
                 unpaged;
@@ -1420,74 +1144,23 @@ pub const Server = struct {
                     protocol.freeAggGroupRows(self.allocator, filtered);
                     return switch (err) {
                         error.UnknownOrderField => writeErr(writer, .bad_request, @errorName(err)),
-                        else => writeErr(writer, .internal, @errorName(err)),
+                        else => writeStorageErr(writer, err),
                     };
                 };
             }
             const page = querymod.Page{ .offset = args.offset, .limit = args.limit };
             const groups = aggregatemod.applyPageGroups(self.allocator, filtered, page) catch |err| {
-                return writeErr(writer, .internal, @errorName(err));
+                return writeStorageErr(writer, err);
             };
             defer protocol.freeAggGroupRows(self.allocator, groups);
             const out = protocol.encodeAggGroupRows(self.allocator, groups) catch |err| {
-                return writeErr(writer, .internal, @errorName(err));
+                return writeStorageErr(writer, err);
             };
             defer self.allocator.free(out);
             try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
         }
     }
 
-    /// Executes a `table_window` request: opens the named table, filters
-    /// rows with the same `expr.zig` grammar every other `table_*` opcode
-    /// uses (empty text selects every row), then hands the filtered rows to
-    /// `window.compute` for the single `args.spec` annotation, along with
-    /// `args.frame` (ROWS or RANGE - see `window.zig`'s `FrameMode` doc
-    /// comment) - unlike `table_aggregate`, this NEVER collapses rows, so
-    /// `results[i]` stays aligned 1:1 with `rows[i]` regardless of paging (a
-    /// `NonNumericField`/`Overflow`/`MissingField`/`RangeNotApplicable` from
-    /// `window.zig` is a client mistake, `bad_request`, same treatment as
-    /// `table_aggregate`).
-    /// `args.offset`/`args.limit` then window which rows get PRINTED, walked
-    /// in `window.orderedIndices`' partition-then-order sequence (the same
-    /// display order local `table window` uses, not raw scan order) rather
-    /// than slicing `rows`/`results` directly - the exact bug local `table
-    /// window` hit and fixed (see `window.zig`'s `orderedIndices` doc
-    /// comment) before this network path existed, so it is built paginated
-    /// the correct way from the start instead of repeating that mistake.
-    /// Each surviving row is paired with its already-computed value into a
-    /// `protocol.WindowRow` and sent back via `encodeWindowRows` - the
-    /// client prints them in the order received, no further sorting needed.
-    /// A `subscribe` request never returns in the normal sense: once the
-    /// connection is registered in `self.pubsub`, this function owns the
-    /// rest of the connection's lifetime (both directions of the socket)
-    /// until the client disconnects, then propagates `error.SubscriptionEnded`
-    /// so `handleConnection`'s `catch return` unwinds cleanly - the same
-    /// "any error just ends the connection" contract every other opcode
-    /// already relies on for a plain disconnect mid-frame.
-    ///
-    /// Design: a `subscribe` connection becomes receive-only after the ack.
-    /// A dedicated watcher thread does exactly one blocking read attempt on
-    /// `stream` - whatever it gets back (a byte the client sent, or an
-    /// error/EOF from a disconnect) closes the subscription, since there is
-    /// no way to both keep reading further commands AND push messages on
-    /// one TCP connection without either a second concurrent writer (a
-    /// write race against the push loop below) or re-entering this same
-    /// read/dispatch loop (a read race against the watcher). Unlike a
-    /// protocol like Redis's, which multiplexes further commands
-    /// (UNSUBSCRIBE, PING) onto the same subscribed connection, this
-    /// connection itself never reads another request - but `unsubscribe`
-    /// (see `handleUnsubscribe`) reaches the SAME `sub` from a completely
-    /// different connection, keyed by the id this function's ack carries
-    /// (`sub.id`), so dropping a subset of channels still does not require
-    /// closing the connection outright; only dropping every remaining
-    /// channel does (`pubsub.Hub.unsubscribe`'s doc comment). Once the push loop ends (for any reason - the
-    /// watcher closed `sub`, or a write here failed because the peer is
-    /// gone), `std.posix.shutdown` unblocks the watcher's still-pending read
-    /// (rather than relying on `conn.stream.close()` racing a live read on
-    /// the same fd from another thread, which is a well-known way to
-    /// recycle a file descriptor into an unrelated, concurrently-accepted
-    /// connection) before joining it - so by the time this returns, no
-    /// other thread still touches `stream` or `sub`.
     fn handleSubscribe(self: *Server, payload: []const u8, stream: std.net.Stream) !void {
         const args = protocol.decodeSubscribe(self.allocator, payload) catch {
             return writeErr(stream.writer(), .bad_request, "malformed subscribe payload");
@@ -1529,25 +1202,12 @@ pub const Server = struct {
         return error.SubscriptionEnded;
     }
 
-    /// The watcher half of `handleSubscribe`: blocks on exactly one read
-    /// attempt, then closes `sub` regardless of the outcome (data, EOF, or
-    /// an error - all three mean "stop pushing to this connection"). Runs
-    /// on its own thread so `handleSubscribe`'s push loop can block
-    /// independently on `sub.waitMessage()` - see that function's doc
-    /// comment for why this is a single read, not a loop.
     fn watchForDisconnect(hub: *pubsubmod.Hub, sub: *pubsubmod.Subscriber, stream: std.net.Stream) void {
         var buf: [1]u8 = undefined;
         _ = stream.read(&buf) catch {};
         hub.closeSubscriber(sub);
     }
 
-    /// Executes a `publish` request: any connection may call this
-    /// regardless of whether it has ever subscribed to anything (see
-    /// `protocol.encodePublish`'s doc comment). Delivery is fire-and-forget
-    /// from this handler's point of view - `pubsub.Hub.publish` never
-    /// blocks on a slow subscriber, so this returns as soon as every
-    /// currently-registered subscriber's mailbox has been handed its own
-    /// copy (or dropped one, under `Subscriber.push`'s backpressure policy).
     fn handlePublish(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodePublish(payload) catch {
             return writeErr(writer, .bad_request, "malformed publish payload");
@@ -1561,17 +1221,6 @@ pub const Server = struct {
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), resp);
     }
 
-    /// Executes an `unsubscribe` request: unlike `subscribe`, this is a
-    /// plain request/response opcode that returns like any other - it never
-    /// touches the connection that originally subscribed, because that
-    /// connection became receive-only the moment its ack arrived (see
-    /// `handleSubscribe`'s doc comment) and this one is always a separate
-    /// connection entirely (see `protocol.encodeUnsubscribe`'s doc
-    /// comment). `pubsub.Hub.unsubscribe`'s `error.UnknownSubscriber` (a
-    /// stale id, a typo, or a subscriber that already disconnected on its
-    /// own - all indistinguishable from here, see that function's doc
-    /// comment) is the caller's mistake, `bad_request`, the same treatment
-    /// `table_window` gives a `MissingField` from a bad field name.
     fn handleUnsubscribe(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodeUnsubscribe(self.allocator, payload) catch {
             return writeErr(writer, .bad_request, "malformed unsubscribe payload");
@@ -1588,7 +1237,7 @@ pub const Server = struct {
         const removed = self.pubsub.unsubscribe(args.subscriberId, channelNames) catch |err| {
             return switch (err) {
                 error.UnknownSubscriber => writeErr(writer, .bad_request, "unknown subscriber id"),
-                else => writeErr(writer, .internal, @errorName(err)),
+                else => writeStorageErr(writer, err),
             };
         };
 
@@ -1620,20 +1269,20 @@ pub const Server = struct {
         const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
 
         const rows = table.select(pred) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer querymod.freeRows(self.allocator, rows);
 
         const results = windowmod.computeMany(self.allocator, rows, args.partitionBy, args.orderBy, args.specs, args.frame) catch |err| {
             return switch (err) {
                 error.NonNumericField, error.Overflow, error.MissingField, error.RangeNotApplicable => writeErr(writer, .bad_request, @errorName(err)),
-                else => writeErr(writer, .internal, @errorName(err)),
+                else => writeStorageErr(writer, err),
             };
         };
         defer windowmod.freeManyResults(self.allocator, results);
 
         const displayOrder = windowmod.orderedIndices(self.allocator, rows, args.partitionBy, args.orderBy) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer self.allocator.free(displayOrder);
 
@@ -1641,13 +1290,6 @@ pub const Server = struct {
         const pageStart = @min(args.offset, total);
         const end = if (args.limit == 0) total else @min(pageStart + args.limit, total);
 
-        // `out`'s WindowRow.values arrays hold SHALLOW copies borrowed from
-        // `results` (safe: `encodeWindowRows` below only reads them to
-        // serialize, never frees them) - `results` stays the true owner,
-        // freed by the `defer` above; only the borrowing arrays themselves
-        // get freed here, same "shallow copy into a throwaway wire-shape
-        // struct, one true owner frees the contents" pattern
-        // `handleTableAggregate`'s `GroupRow`-to-wire path already relies on.
         var out = std.ArrayList(protocol.WindowRow).init(self.allocator);
         defer {
             for (out.items) |wr| self.allocator.free(wr.values);
@@ -1662,19 +1304,12 @@ pub const Server = struct {
         }
 
         const encoded = protocol.encodeWindowRows(self.allocator, out.items) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer self.allocator.free(encoded);
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), encoded);
     }
 
-    /// Executes a `table_explain` request: opens the named table over the
-    /// same `*Db` the rest of the server serves, parses the expr text with
-    /// the same grammar `table_select`/`table_join`/`table_aggregate`
-    /// already use, then reports which strategy `querymod.Table.explain`
-    /// says a matching `table select`/`table_select` would take - without
-    /// running the query or touching any row. A bad table name or malformed
-    /// expression is a client mistake (`bad_request`), not a server fault.
     fn handleTableExplain(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodeTableExplain(payload) catch {
             return writeErr(writer, .bad_request, "malformed table_explain payload");
@@ -1695,26 +1330,17 @@ pub const Server = struct {
         const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
 
         var plan = table.explain(self.allocator, pred) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer plan.deinit(self.allocator);
 
         const out = protocol.encodePlan(self.allocator, plan) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer self.allocator.free(out);
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
     }
 
-    /// Executes a `table_update` request: the network counterpart of the
-    /// CLI's local `table update <table> --set ... [expr...]`, running
-    /// `query.Table.updateWhere` against the server's `*Db`. The wire
-    /// `sets` field list arrives pre-encoded with `Row.encode` (the same
-    /// trick `decodeTxnOp`'s `fieldsBytes` uses), so it is decoded into a
-    /// real `Row` here before `updateWhere` ever sees it. The response is a
-    /// bare row count reusing `encodeTtlSweepCount`'s u64 wire shape - the
-    /// same "no new response type, an existing shape already fits"
-    /// precedent `coll_ttl_op` set for `ttl_op`'s result encoding.
     fn handleTableUpdate(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodeTableUpdate(payload) catch {
             return writeErr(writer, .bad_request, "malformed table_update payload");
@@ -1740,22 +1366,16 @@ pub const Server = struct {
         const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
 
         const updated = table.updateWhere(pred, setsRow.fields.items) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
 
         const out = protocol.encodeTtlSweepCount(self.allocator, @intCast(updated)) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer self.allocator.free(out);
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
     }
 
-    /// Executes a `table_delete` request: the network counterpart of the
-    /// CLI's local `table delete <table> [expr...]`, running
-    /// `query.Table.deleteWhere` against the server's `*Db`. Same wire shape
-    /// as `table_explain` (table + exprText, no `SET` clause) and same
-    /// response shape as `table_update` (a bare row count reusing
-    /// `encodeTtlSweepCount`'s u64 wire shape).
     fn handleTableDelete(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodeTableDelete(payload) catch {
             return writeErr(writer, .bad_request, "malformed table_delete payload");
@@ -1776,23 +1396,16 @@ pub const Server = struct {
         const pred: ?querymod.Predicate = if (parsed) |p| p.predicate else null;
 
         const deleted = table.deleteWhere(pred) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
 
         const out = protocol.encodeTtlSweepCount(self.allocator, @intCast(deleted)) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer self.allocator.free(out);
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
     }
 
-    /// Executes a `table_export` request: the network counterpart of the
-    /// CLI's local `table export <table> csv|json <path>`, rendering the
-    /// whole table through `dump.zig`'s `exportCsvWriter`/`exportJsonWriter`
-    /// (the same functions the local path calls, just pointed at an
-    /// in-memory `ArrayList` writer instead of a file, since there is no
-    /// filesystem path to write to on the server side of a request) and
-    /// sending the row count plus the rendered bytes back in one frame.
     fn handleTableExport(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodeTableExport(payload) catch {
             return writeErr(writer, .bad_request, "malformed table_export payload");
@@ -1809,24 +1422,16 @@ pub const Server = struct {
             .csv => dumpmod.exportCsvWriter(self.allocator, &table, buf.writer()),
             .json => dumpmod.exportJsonWriter(self.allocator, &table, buf.writer()),
         } catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
 
         const out = protocol.encodeExportResult(self.allocator, @intCast(rowCount), buf.items) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer self.allocator.free(out);
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
     }
 
-    /// Executes a `table_import` request: the network counterpart of the
-    /// CLI's local `table import <table> csv|json <path>`, feeding the
-    /// wire-carried `content` bytes straight into `dump.zig`'s
-    /// `importCsvContent`/`importJsonContent` (the same functions the local
-    /// path calls after reading a file into memory - the client already did
-    /// that reading, so the server only ever sees bytes, never a path)
-    /// against the server's `*Db`. The response is a bare row count, the
-    /// same u64 wire shape `table_update`/`table_delete` already use.
     fn handleTableImport(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodeTableImport(payload) catch {
             return writeErr(writer, .bad_request, "malformed table_import payload");
@@ -1841,26 +1446,16 @@ pub const Server = struct {
             .csv => dumpmod.importCsvContent(self.allocator, &table, args.content),
             .json => dumpmod.importJsonContent(self.allocator, &table, args.content),
         } catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
 
         const out = protocol.encodeTtlSweepCount(self.allocator, @intCast(imported)) catch |err| {
-            return writeErr(writer, .internal, @errorName(err));
+            return writeStorageErr(writer, err);
         };
         defer self.allocator.free(out);
         try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
     }
 
-    /// Executes a `user_admin` request (create/set_password/set_role/delete/
-    /// list) against a fresh `authmod.Store` over the same `*Db` the rest of
-    /// the server serves. Deliberately does NOT consult `self.authStore` -
-    /// that field only controls whether *login enforcement* is turned on
-    /// for this server, not whether the user table exists, so remote user
-    /// management works the same way whether or not `--auth` is active.
-    /// `requiredRole` already gates this opcode behind `admin` whenever
-    /// auth enforcement IS enabled; a server with auth disabled enforces
-    /// nothing on any opcode, this one included, matching every other op's
-    /// documented behavior.
     fn handleUserAdmin(self: *Server, payload: []const u8, writer: anytype) !void {
         const args = protocol.decodeUserAdmin(payload) catch {
             return writeErr(writer, .bad_request, "malformed user_admin payload");
@@ -1876,7 +1471,7 @@ pub const Server = struct {
                 store.createUser(self.allocator, args.username, args.password, role, rounds) catch |err| {
                     return switch (err) {
                         error.UserExists => writeErr(writer, .conflict, "user already exists"),
-                        else => writeErr(writer, .internal, @errorName(err)),
+                        else => writeStorageErr(writer, err),
                     };
                 };
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
@@ -1887,7 +1482,7 @@ pub const Server = struct {
                 store.setPassword(self.allocator, args.username, args.password, rounds) catch |err| {
                     return switch (err) {
                         error.UserNotFound => writeErr(writer, .not_found, "user not found"),
-                        else => writeErr(writer, .internal, @errorName(err)),
+                        else => writeStorageErr(writer, err),
                     };
                 };
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
@@ -1900,7 +1495,7 @@ pub const Server = struct {
                 store.setRole(self.allocator, args.username, role) catch |err| {
                     return switch (err) {
                         error.UserNotFound => writeErr(writer, .not_found, "user not found"),
-                        else => writeErr(writer, .internal, @errorName(err)),
+                        else => writeStorageErr(writer, err),
                     };
                 };
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
@@ -1910,7 +1505,7 @@ pub const Server = struct {
                 store.deleteUser(self.allocator, args.username) catch |err| {
                     return switch (err) {
                         error.UserNotFound => writeErr(writer, .not_found, "user not found"),
-                        else => writeErr(writer, .internal, @errorName(err)),
+                        else => writeStorageErr(writer, err),
                     };
                 };
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), "");
@@ -1918,11 +1513,11 @@ pub const Server = struct {
 
             .list => {
                 const users = store.listUsers(self.allocator) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 defer authmod.freeUserList(self.allocator, users);
                 const out = protocol.encodeUserList(self.allocator, users) catch |err| {
-                    return writeErr(writer, .internal, @errorName(err));
+                    return writeStorageErr(writer, err);
                 };
                 defer self.allocator.free(out);
                 try protocol.writeFrame(writer, @intFromEnum(protocol.Status.ok), out);
@@ -1930,38 +1525,6 @@ pub const Server = struct {
         }
     }
 
-    /// Stops accepting new connections and waits for the accept loop to
-    /// exit. Closing the listening socket while another thread is
-    /// blocked inside `accept()` on that same fd is a race the standard
-    /// library treats as a bug (it asserts on EBADF), so instead we flip
-    /// `stopping` and connect a throwaway client to our own listen
-    /// address: that wakes the pending `accept()` with a real, briefly
-    /// alive connection, which the loop then discards and exits on. Only
-    /// once the accept thread has rejoined is it safe to close the
-    /// listening socket itself.
-    ///
-    /// Already-accepted connections are `.detach()`ed worker threads this
-    /// struct holds no `std.Thread` handle for, so they cannot be `join`ed
-    /// directly - `drainConnections` below waits on the `active` counter
-    /// instead. This used to be entirely the caller's problem ("leave them
-    /// to finish on their own, call `activeConnections()` first if you need
-    /// to wait"), but every real caller in this codebase - every test in
-    /// this file included - called `stop()` and then immediately tore down
-    /// the `Db`/allocator the detached worker's `dispatch()` still reads
-    /// from, with nothing enforcing that the worker had actually noticed
-    /// its connection closed and returned first. Most of the time the
-    /// worker's blocking read already sees EOF and exits before the caller
-    /// gets around to teardown, so the race stayed invisible for a long
-    /// time; occasionally it does not, and a worker thread touches a freed
-    /// `Db`/`Allocator.VTable`, corrupting the heap in a way that only
-    /// surfaces later as an unrelated test's leak/double-free abort - this
-    /// is exactly the flaky `zig build test` failure the gate re-run in
-    /// this session caught (roughly 1 run in 4-6, always attributed to
-    /// whichever unrelated test happened to run next). Waiting here by
-    /// default, bounded so a genuinely long-lived idle connection (still
-    /// blocked in `stream.reader()` with nothing sent and no EOF) cannot
-    /// hang shutdown forever, closes that gap for every caller instead of
-    /// relying on each one to remember `activeConnections()`.
     pub fn stop(self: *Server) void {
         if (self.acceptThread == null) return;
         self.stopping.store(true, .release);
@@ -1985,19 +1548,9 @@ pub const Server = struct {
         }
         self.drainConnections(500 * std.time.ns_per_ms);
         self.net.deinit();
-        // Best-effort, same as `drainConnections` above: a subscriber
-        // connection that never disconnects (client vanished without
-        // closing its socket) is still `active` past the drain timeout, so
-        // its `Subscriber` is never `destroySubscriber`'d and leaks for the
-        // remaining life of the process - this `deinit` only frees `Hub`'s
-        // own channel map, which by then holds no dangling entries for any
-        // subscriber that WAS properly torn down.
         self.pubsub.deinit();
     }
 
-    /// Polls `activeConnections()` until it reaches zero or `timeoutNanos`
-    /// elapses, whichever comes first. See the doc comment on `stop()` for
-    /// why this exists and why it is bounded rather than unconditional.
     fn drainConnections(self: *Server, timeoutNanos: u64) void {
         const startedAt = std.time.nanoTimestamp();
         while (self.activeConnections() > 0) {
@@ -2011,11 +1564,6 @@ fn testDb(allocator: Allocator, dir: []const u8) !Db {
     return Db.open(allocator, dir, .{});
 }
 
-// `drainConnections` only ever touches `self.active`/`self.stopping`, so it
-// can be exercised on a `Server` value that was never `init()`ed with a
-// real `Db`/socket - every other field stays `undefined` and is never
-// read. This isolates the drain/timeout contract itself from the (much
-// harder to force deterministically) real-socket race it exists to close.
 fn undefinedServerForDrainTest() Server {
     var srv: Server = undefined;
     srv.active = std.atomic.Value(usize).init(0);
@@ -2051,23 +1599,18 @@ test "drainConnections waits for a connection that finishes before the timeout" 
     const elapsedNanos = std.time.nanoTimestamp() - start;
 
     try std.testing.expectEqual(@as(usize, 0), srv.activeConnections());
-    // Returned once the worker actually finished, not after burning the
-    // full 2-second timeout - proves this is a real wait-for-drain, not a
-    // fixed sleep in disguise.
     try std.testing.expect(elapsedNanos < 1 * std.time.ns_per_s);
 }
 
 test "drainConnections gives up after the timeout instead of hanging forever" {
     var srv = undefinedServerForDrainTest();
-    srv.active.store(1, .release); // never decremented by anyone
+    srv.active.store(1, .release);
 
     const start = std.time.nanoTimestamp();
     srv.drainConnections(20 * std.time.ns_per_ms);
     const elapsedNanos = std.time.nanoTimestamp() - start;
 
     try std.testing.expect(elapsedNanos >= 20 * std.time.ns_per_ms);
-    // Still stuck at 1 - drainConnections gave up, it did not (and cannot)
-    // force the phantom connection closed itself.
     try std.testing.expectEqual(@as(usize, 1), srv.activeConnections());
 }
 
@@ -2171,6 +1714,113 @@ test "server batch applies puts and deletes atomically" {
     try std.testing.expect(kept == null);
 }
 
+test "server scan and prefix show only user keys and refuse raw access to internal namespaces" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+    _ = try collmod.Counter.incrBy(&db, allocator, "hits", 1);
+    try authmod.Store.init(&db).createUser(allocator, "root", "pw", .admin, 16);
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.set("session:9", "live");
+    try client.set("Tsession:9", "user");
+    try client.ttlExpire("session:9", 3600);
+
+    const scanned = try client.scan(allocator, .{});
+    defer protocol.freeOwnedEntries(allocator, scanned);
+    try std.testing.expectEqual(@as(usize, 2), scanned.len);
+    try std.testing.expectEqualStrings("Tsession:9", scanned[0].key);
+    try std.testing.expectEqualStrings("session:9", scanned[1].key);
+
+    const reversed = try client.scan(allocator, .{ .reverse = true });
+    defer protocol.freeOwnedEntries(allocator, reversed);
+    try std.testing.expectEqual(@as(usize, 2), reversed.len);
+    try std.testing.expectEqualStrings("session:9", reversed[0].key);
+
+    const everything = try client.prefix(allocator, "", 0);
+    defer protocol.freeOwnedEntries(allocator, everything);
+    try std.testing.expectEqual(@as(usize, 2), everything.len);
+
+    const markerPrefix = try client.prefix(allocator, &[_]u8{ttlmod.nsTag}, 0);
+    defer protocol.freeOwnedEntries(allocator, markerPrefix);
+    try std.testing.expectEqual(@as(usize, 0), markerPrefix.len);
+
+    const markerKey = [_]u8{ttlmod.nsTag} ++ "session:9".*;
+    try std.testing.expectError(error.ServerBadRequest, client.get(allocator, &markerKey));
+    try std.testing.expectError(error.ServerBadRequest, client.set(&markerKey, "forged"));
+    try std.testing.expectError(error.ServerBadRequest, client.delete(&markerKey));
+    try std.testing.expectError(error.ServerBadRequest, client.ttlExpire(&markerKey, 5));
+    const forgedBatch = [_]protocol.BatchOp{
+        .{ .put = .{ .key = "fine", .value = "1" } },
+        .{ .put = .{ .key = &markerKey, .value = "forged" } },
+    };
+    try std.testing.expectError(error.ServerBadRequest, client.batch(&forgedBatch));
+    try std.testing.expect((try client.get(allocator, "fine")) == null);
+
+    switch (try client.ttlQuery("session:9")) {
+        .seconds => |s| try std.testing.expect(s > 3500),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "server answers io_error when the storage layer fails to write" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.set("before", "ok");
+
+    db.wal.file.close();
+    db.wal.file = try std.fs.openFileAbsolute("/dev/full", .{ .mode = .write_only });
+
+    try std.testing.expectError(error.ServerIoError, client.set("after", "lost"));
+    const ops = [_]protocol.BatchOp{.{ .put = .{ .key = "batched", .value = "lost" } }};
+    try std.testing.expectError(error.ServerIoError, client.batch(&ops));
+
+    const stream = try std.net.tcpConnectToAddress(server.boundAddress());
+    defer stream.close();
+    try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.del), "before");
+    var frame = try protocol.readFrame(allocator, stream.reader());
+    defer frame.deinit();
+    try std.testing.expectEqual(@intFromEnum(protocol.Status.io_error), frame.tag);
+    try std.testing.expectEqualStrings("NoSpaceLeft", frame.payload);
+}
+
+test "storageStatus maps filesystem errors to io_error and everything else to internal" {
+    try std.testing.expectEqual(protocol.Status.io_error, storageStatus(error.InputOutput));
+    try std.testing.expectEqual(protocol.Status.io_error, storageStatus(error.NoSpaceLeft));
+    try std.testing.expectEqual(protocol.Status.io_error, storageStatus(error.CorruptSstable));
+    try std.testing.expectEqual(protocol.Status.internal, storageStatus(error.OutOfMemory));
+    try std.testing.expectEqual(protocol.Status.internal, storageStatus(error.UniqueViolation));
+}
+
 test "server rejects a malformed frame with bad_request without crashing" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2253,9 +1903,6 @@ test "server enforces a token-bucket rate limit and rejects the overflow" {
 
     const address = try std.net.Address.parseIp("127.0.0.1", 0);
     var server = try Server.init(allocator, &db, address);
-    // Slow refill (1 token/sec): the whole burst below completes in well
-    // under a second of wall-clock time, so refill contributes nowhere
-    // near a full token and the outcome is deterministic.
     server.enableRateLimit(3, 1);
     try server.start();
     defer server.stop();
@@ -2330,8 +1977,6 @@ test "per-connection rate limit gives each connection its own budget" {
     var clientB = try client_mod.Client.connect(allocator, server.boundAddress());
     defer clientB.close();
 
-    // Exhaust A's private budget first: B must be unaffected because each
-    // connection got its own bucket, not a bucket shared across the server.
     try clientA.ping();
     try clientA.ping();
     try std.testing.expectError(client_mod.ClientError.ServerRateLimited, clientA.ping());
@@ -2369,8 +2014,6 @@ test "per-connection and global rate limits both apply, connection budget checke
     try client.ping();
     try std.testing.expectError(client_mod.ClientError.ServerRateLimited, client.ping());
 
-    // The global bucket was the one that actually ran out, not the
-    // per-connection one (which had plenty of headroom left).
     try std.testing.expectEqual(@as(u64, 1), server.rateLimitedTotal.get());
     try std.testing.expectEqual(@as(u64, 0), server.connRateLimitedTotal.get());
 }
@@ -2452,13 +2095,11 @@ test "server table_explain reports index_eq, composite_eq, and full_scan over re
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
 
-    // Single-field index eq on `age`.
     var agePlan = try client.tableExplain(allocator, "users", "age eq i:30");
     defer agePlan.deinit(allocator);
     try std.testing.expectEqual(querymod.PlanKind.index_eq, agePlan.kind);
     try std.testing.expectEqualStrings("age", agePlan.indexName.?);
 
-    // Composite index, full prefix matched by equality on both columns.
     var compositePlan = try client.tableExplain(allocator, "users", "city eq s:warsaw and age eq i:30");
     defer compositePlan.deinit(allocator);
     try std.testing.expectEqual(querymod.PlanKind.composite_eq, compositePlan.kind);
@@ -2466,14 +2107,10 @@ test "server table_explain reports index_eq, composite_eq, and full_scan over re
     try std.testing.expectEqual(@as(usize, 2), compositePlan.matchedFields);
     try std.testing.expectEqual(@as(usize, 2), compositePlan.totalFields);
 
-    // No predicate on an indexed field anywhere -> full scan.
     var scanPlan = try client.tableExplain(allocator, "users", "city eq s:warsaw");
     defer scanPlan.deinit(allocator);
     try std.testing.expectEqual(querymod.PlanKind.full_scan, scanPlan.kind);
 
-    // Cross-check: what table_explain reports for the composite query is
-    // exactly what table_select actually finds when it runs it - the whole
-    // point of an explain feature is not lying about what execution does.
     const rows = try client.tableSelect(allocator, "users", "city eq s:warsaw and age eq i:30", 0, 0, &.{});
     defer protocol.freeRows(allocator, rows);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
@@ -2507,9 +2144,6 @@ test "server table_explain rejects a malformed expr with bad_request, not a cras
     const err = client.tableExplain(allocator, "users", "city bogus s:warsaw");
     try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
 
-    // The connection survives a bad_request and can still serve a good
-    // request right after - same expectation `table_select`'s malformed-expr
-    // test above holds for its own opcode.
     var plan = try client.tableExplain(allocator, "users", "");
     defer plan.deinit(allocator);
     try std.testing.expectEqual(querymod.PlanKind.full_scan, plan.kind);
@@ -2547,13 +2181,10 @@ test "server table_update applies a set clause to matching rows over real TCP, k
     const updated = try client.tableUpdate("users", &sets, "city eq s:warsaw");
     try std.testing.expectEqual(@as(u64, 2), updated);
 
-    // The old index entry is gone for both moved rows...
     const stale = try client.tableSelect(allocator, "users", "city eq s:warsaw", 0, 0, &.{});
     defer protocol.freeRows(allocator, stale);
     try std.testing.expectEqual(@as(usize, 0), stale.len);
 
-    // ...a fresh one under the new value finds them, and the row not
-    // matched by the predicate (pk 3, krakow) was left untouched.
     const moved = try client.tableSelect(allocator, "users", "city eq s:gdansk", 0, 0, &.{});
     defer protocol.freeRows(allocator, moved);
     try std.testing.expectEqual(@as(usize, 2), moved.len);
@@ -2592,9 +2223,6 @@ test "server table_update rejects a malformed expr with bad_request, not a crash
     const err = client.tableUpdate("users", &sets, "city bogus s:warsaw");
     try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
 
-    // The connection survives a bad_request and can still serve a good
-    // request right after - same expectation `table_explain`'s malformed
-    // test above holds for its own opcode.
     const updated = try client.tableUpdate("users", &sets, "");
     try std.testing.expectEqual(@as(u64, 1), updated);
 }
@@ -2617,11 +2245,6 @@ test "server rejects a malformed table_update frame (bad set fields) with bad_re
     const stream = try std.net.tcpConnectToAddress(server.boundAddress());
     defer stream.close();
 
-    // A well-formed table name ("users"), then a "set fields" byte string
-    // that decodeTableUpdate happily hands back as opaque bytes but
-    // Row.decode rejects (a field count of 0xFFFFFFFF with nothing behind
-    // it) - the decode failure `handleTableUpdate` itself must catch,
-    // unlike `decodeTableUpdate`'s own malformed-frame check above it.
     var payload = std.ArrayList(u8).init(allocator);
     defer payload.deinit();
     var lenBuf: [4]u8 = undefined;
@@ -2638,31 +2261,12 @@ test "server rejects a malformed table_update frame (bad set fields) with bad_re
     defer frame.deinit();
     try std.testing.expectEqual(@intFromEnum(protocol.Status.bad_request), frame.tag);
 
-    // The connection must still be usable afterward.
     try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.ping), "");
     var pingFrame = try protocol.readFrame(allocator, stream.reader());
     defer pingFrame.deinit();
     try std.testing.expectEqual(@intFromEnum(protocol.Status.ok), pingFrame.tag);
 }
 
-// `table_update` shares the same underlying-sstable-reshaping hazard as
-// `table_select`/`table_join`/`table_aggregate` above, but with a sharper
-// edge: `updateWhere` both READS (via `selectAllMatches`) and WRITES (via
-// `put`) in the same request, while those three only read. `self.mutex` in
-// `Server.dispatch` still serializes every request end-to-end including
-// `flush`/`compact`, so no single request can observe a torn sstable set -
-// what this test actually proves is that real structural reshaping,
-// interleaved via real OS threads through the real TCP/dispatch path, never
-// desyncs `updateWhere`'s read-then-write from the index it must keep in
-// sync, and that a single updater thread's own sequence of writes lands
-// exactly where expected once every other thread has stopped.
-//
-// Thirty rows split evenly three ways by `@mod(pk, 3)` (same helper as the
-// `table_aggregate` concurrency test above) so the "city" index always
-// holds exactly 10 rows per bucket - that count must never move, because
-// this test's single updater thread only ever touches the "epoch" field,
-// never "city" itself, so index population is an invariant a reader can
-// check at every single snapshot, not just at the end.
 test "table_update survives concurrent flush and compact reshaping the underlying sstables" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2670,10 +2274,6 @@ test "table_update survives concurrent flush and compact reshaping the underlyin
     const path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(path);
 
-    // Small target size so a handful of `flush`/`compact` calls do real
-    // structural work instead of needing megabytes of data first - same
-    // trick as the `table_select`/`table_join`/`table_aggregate`
-    // concurrency tests above.
     var db = try Db.open(allocator, path, .{ .sstableTargetBytes = 512 });
     defer db.close();
 
@@ -2802,10 +2402,6 @@ test "table_update survives concurrent flush and compact reshaping the underlyin
     for (0..reshapeThreads) |i| try std.testing.expect(reshapeContexts[i].ok);
     try std.testing.expect(updaterContext.ok);
 
-    // Final sanity check on a fresh connection: the updater alternated
-    // krakow/gdansk, so the last krakow write was iteration 18 (last even
-    // below 20) and the last gdansk write was iteration 19 (last odd) -
-    // warsaw was never touched by any predicate and must still read 0.
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
 
@@ -2825,13 +2421,6 @@ test "table_update survives concurrent flush and compact reshaping the underlyin
     for (warsawRows) |row| try std.testing.expectEqual(@as(i64, 0), row.get("epoch").?.int);
 }
 
-// Same shape as the test above, but the index guarding the concurrent
-// reads/updates is a COMPOSITE one (`city_age`, two columns) instead of a
-// single-column `city` index - `updateWhere` reached through
-// `composite_eq` was only proven correct single-threaded so far (see
-// query.zig's "updateWhere keeps a composite index in sync" test); this
-// proves the same code path survives real `flush`/`compact` reshaping the
-// underlying sstables while other connections read and write through it.
 test "table_update survives concurrent flush and compact reshaping a composite index" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2842,11 +2431,6 @@ test "table_update survives concurrent flush and compact reshaping a composite i
     var db = try Db.open(allocator, path, .{ .sstableTargetBytes = 512 });
     defer db.close();
 
-    // 30 rows: 3 cities x 2 age bands x 5 rows each. Every (city, age) pair
-    // is a full-tuple equality match against `city_age`, so
-    // `Table.selectPage`/`updateWhere` both reach it through `composite_eq`
-    // (see query.zig's "createCompositeIndex backfills then full-tuple eq
-    // select" test for the same match shape single-threaded).
     const rowCount = 30;
     {
         var accounts = try querymod.Table.open(&db, allocator, "accounts");
@@ -2953,10 +2537,6 @@ test "table_update survives concurrent flush and compact reshaping a composite i
             defer client.close();
             var i: i64 = 0;
             while (i < updaterIters) : (i += 1) {
-                // Alternates between two full-tuple matches on the composite
-                // index, never touching `city`/`age` themselves, so the
-                // (5, 5, 5, 5, 5, 5) population split is a checkable
-                // invariant on every single reader iteration in flight.
                 const combo = if (@mod(i, 2) == 0) Combo{ .city = "krakow", .age = 30 } else Combo{ .city = "gdansk", .age = 40 };
                 const expr = std.fmt.allocPrint(ctx.allocator, "city eq s:{s} and age eq i:{d}", .{ combo.city, combo.age }) catch return;
                 defer ctx.allocator.free(expr);
@@ -2990,11 +2570,6 @@ test "table_update survives concurrent flush and compact reshaping a composite i
     for (0..reshapeThreads) |i| try std.testing.expect(reshapeContexts[i].ok);
     try std.testing.expect(updaterContext.ok);
 
-    // Final sanity check on a fresh connection: the updater alternated
-    // krakow/30 and gdansk/40, so the last krakow/30 write was iteration 18
-    // (last even below 20) and the last gdansk/40 write was iteration 19
-    // (last odd) - the other four (city, age) combos were never touched by
-    // any predicate and must still read epoch 0.
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
 
@@ -3012,8 +2587,6 @@ test "table_update survives concurrent flush and compact reshaping a composite i
             0;
         for (rows) |row| try std.testing.expectEqual(wantEpoch, row.get("epoch").?.int);
 
-        // The composite index must still be the strategy actually used
-        // after all this churn, not a fallback to a full scan.
         var plan = try client.tableExplain(allocator, "accounts", expr);
         defer plan.deinit(allocator);
         try std.testing.expectEqual(querymod.PlanKind.composite_eq, plan.kind);
@@ -3051,19 +2624,14 @@ test "server table_delete removes matching rows over real TCP, keeping an index 
     const deleted = try client.tableDelete("users", "city eq s:warsaw");
     try std.testing.expectEqual(@as(u64, 2), deleted);
 
-    // The index entries for both deleted rows are gone, not just the rows -
-    // a stale entry here would surface as a phantom in a later select.
     const gone = try client.tableSelect(allocator, "users", "city eq s:warsaw", 0, 0, &.{});
     defer protocol.freeRows(allocator, gone);
     try std.testing.expectEqual(@as(usize, 0), gone.len);
 
-    // The row not matched by the predicate (pk 3, krakow) was left untouched.
     const untouched = try client.tableSelect(allocator, "users", "city eq s:krakow", 0, 0, &.{});
     defer protocol.freeRows(allocator, untouched);
     try std.testing.expectEqual(@as(usize, 1), untouched.len);
 
-    // A fresh row can reuse the "warsaw" value without colliding with a
-    // leftover index entry from the deleted rows.
     {
         var table = try querymod.Table.open(&db, allocator, "users");
         defer table.deinit();
@@ -3137,20 +2705,10 @@ test "server table_delete rejects a malformed expr with bad_request, not a crash
     const err = client.tableDelete("users", "city bogus s:warsaw");
     try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
 
-    // The connection survives a bad_request and can still serve a good
-    // request right after - same expectation `table_update`'s malformed
-    // test above holds for its own opcode.
     const deleted = try client.tableDelete("users", "");
     try std.testing.expectEqual(@as(u64, 1), deleted);
 }
 
-// `handleTableDelete` calls `Table.deleteWhere` directly (see its own
-// source), the exact function `Table.delete`'s ON DELETE RESTRICT check
-// (query.zig, backed by `ReferencedBySet`) is wired into - so this was
-// never a separate opcode to teach about FOREIGN KEY, only a round trip to
-// prove the wire path actually reaches it, the same "real dispatch, not
-// just the in-process unit test" shape the CHECK/FK/UNIQUE `txn_op` tests
-// elsewhere in this file already are.
 test "server table_delete rejects a FOREIGN KEY RESTRICT violation over the wire and leaves the row in place" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3189,7 +2747,6 @@ test "server table_delete rejects a FOREIGN KEY RESTRICT violation over the wire
     var stillThere = (try customers.get(.{ .int = 1 })).?;
     defer stillThere.deinit();
 
-    // Once the referencing order is gone, the same request succeeds.
     _ = try client.tableDelete("orders", "");
     const deleted = try client.tableDelete("customers", "");
     try std.testing.expectEqual(@as(u64, 1), deleted);
@@ -3213,9 +2770,6 @@ test "server rejects a malformed table_delete frame (bad table name) with bad_re
     const stream = try std.net.tcpConnectToAddress(server.boundAddress());
     defer stream.close();
 
-    // A length prefix (0xFFFFFFFF) claiming far more table-name bytes than
-    // the payload actually carries - `decodeTableDelete`'s own malformed-frame
-    // check must catch this before `Table.open` is ever reached.
     var payload = std.ArrayList(u8).init(allocator);
     defer payload.deinit();
     var lenBuf: [4]u8 = undefined;
@@ -3227,7 +2781,6 @@ test "server rejects a malformed table_delete frame (bad table name) with bad_re
     defer frame.deinit();
     try std.testing.expectEqual(@intFromEnum(protocol.Status.bad_request), frame.tag);
 
-    // The connection must still be usable afterward.
     try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.ping), "");
     var pingFrame = try protocol.readFrame(allocator, stream.reader());
     defer pingFrame.deinit();
@@ -3277,9 +2830,6 @@ test "server table_export renders a real table to csv and json over TCP, matchin
     var jsonResult = try client.tableExport(allocator, "people", .json);
     defer jsonResult.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 2), jsonResult.rowCount);
-    // Every row's primary key shows up somewhere in the rendered JSON -
-    // enough to prove the server actually rendered real content instead
-    // of an empty/placeholder body, without re-parsing JSON here too.
     try std.testing.expect(std.mem.indexOf(u8, jsonResult.content, "warsaw") != null);
     try std.testing.expect(std.mem.indexOf(u8, jsonResult.content, "krakow") != null);
 }
@@ -3385,9 +2935,6 @@ test "server table_export succeeds on a never-written table (schemaless tables h
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
 
-    // `table` is just a keyspace prefix, never declared ahead of time (see
-    // `query.Table.open`), so exporting one nothing has ever put a row into
-    // is a valid zero-row export, not an error.
     var exported = try client.tableExport(allocator, "nosuch", .csv);
     defer exported.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 0), exported.rowCount);
@@ -3395,8 +2942,6 @@ test "server table_export succeeds on a never-written table (schemaless tables h
     const badImport = client.tableImport("nosuch", .json, "not json");
     try std.testing.expectError(client_mod.ClientError.ServerInternal, badImport);
 
-    // The connection survives an internal error and can still serve a
-    // good request right after.
     const rowCount = try client.tableImport("nosuch", .json, "[]");
     try std.testing.expectEqual(@as(u64, 0), rowCount);
 }
@@ -3425,9 +2970,6 @@ test "server rejects a malformed table_export frame (bad format byte) with bad_r
     const stream = try std.net.tcpConnectToAddress(server.boundAddress());
     defer stream.close();
 
-    // A well-formed table name ("people") followed by a format byte
-    // outside the DumpFormat enum (99) - `decodeTableExport` itself must
-    // reject this before `Table.open` is ever reached.
     var payload = std.ArrayList(u8).init(allocator);
     defer payload.deinit();
     var lenBuf: [4]u8 = undefined;
@@ -3441,7 +2983,6 @@ test "server rejects a malformed table_export frame (bad format byte) with bad_r
     defer frame.deinit();
     try std.testing.expectEqual(@intFromEnum(protocol.Status.bad_request), frame.tag);
 
-    // The connection must still be usable afterward.
     try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.ping), "");
     var pingFrame = try protocol.readFrame(allocator, stream.reader());
     defer pingFrame.deinit();
@@ -3484,17 +3025,6 @@ test "table_export requires only readonly role, table_import requires readwrite"
     try std.testing.expectError(client_mod.ClientError.ServerForbidden, client.tableImport("people", .csv, exported.content));
 }
 
-// `table_delete` shares the same underlying-sstable-reshaping hazard as
-// `table_update` above (see that test's header comment for the full
-// rationale), but where `updateWhere` reads-then-writes each matched row in
-// place, `deleteWhere` reads-then-REMOVES it - a sharper edge again, since a
-// removed row's index entries must never resurface even if a `flush`/
-// `compact` reshapes the underlying sstables mid-scan. Three buckets
-// (warsaw/krakow/gdansk) stay untouched for the whole test and are the
-// reader threads' stable invariant (always exactly 10 rows each); a fourth
-// bucket (poznan) is what the deleter thread progressively drains one row
-// at a time via a "seq" field unrelated to the "city" index, so every
-// delete is a distinct, real structural change rather than a no-op repeat.
 test "table_delete survives concurrent flush and compact reshaping the underlying sstables" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3502,9 +3032,6 @@ test "table_delete survives concurrent flush and compact reshaping the underlyin
     const path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(path);
 
-    // Small target size so a handful of `flush`/`compact` calls do real
-    // structural work instead of needing megabytes of data first - same
-    // trick as `table_update`'s own concurrency test above.
     var db = try Db.open(allocator, path, .{ .sstableTargetBytes = 512 });
     defer db.close();
 
@@ -3635,10 +3162,6 @@ test "table_delete survives concurrent flush and compact reshaping the underlyin
     for (0..reshapeThreads) |i| try std.testing.expect(reshapeContexts[i].ok);
     try std.testing.expect(deleterContext.ok);
 
-    // Final sanity check on a fresh connection: the three stable buckets are
-    // still exactly 10 rows each, poznan is completely gone (not just its
-    // index entries - real rows too), and no phantom entry survives under
-    // the "poznan" index bucket for a later put to collide with.
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
 
@@ -3698,15 +3221,6 @@ test "server table_select pages a remote result with offset and limit" {
     try std.testing.expectEqual(@as(i64, 5), rest[1].get(querymod.pkField).?.int);
 }
 
-// `table_explain` reports which strategy `selectPage` would use, but
-// `table_select`'s own `--order-by` is the one place the network protocol
-// carries a sort key: `handleTableSelect` forwards `args.orderBy` into
-// `Table.selectPageOrdered`, which must sort BEFORE windowing by
-// offset/limit (see query.zig's "applies offset/limit after sorting"
-// test). This exercises that ordering end to end over a real socket,
-// including on a field that has an index (`age`) - `selectAllMatches`
-// still narrows through the index, it just cannot early-stop while a sort
-// is pending, and the wire round trip must not lose that.
 test "server table_select orders a remote result by a field before windowing it, ascending and descending" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3721,9 +3235,6 @@ test "server table_select orders a remote result by a field before windowing it,
         var table = try querymod.Table.open(&db, allocator, "users");
         defer table.deinit();
         try table.createIndex("age");
-        // pk order deliberately not age order: pk 1 has the highest age
-        // (50), pk 5 the lowest (10) - a bug that sorted only within pk
-        // scan order would fail every assertion below.
         var pk: i64 = 1;
         while (pk <= 5) : (pk += 1) {
             try table.put(.{ .int = pk }, &.{.{ .name = "age", .value = .{ .int = 60 - pk * 10 } }});
@@ -3747,14 +3258,6 @@ test "server table_select orders a remote result by a field before windowing it,
     try std.testing.expectEqual(@as(i64, 1), asc[4].get(querymod.pkField).?.int);
     try std.testing.expectEqual(@as(i64, 50), asc[4].get("age").?.int);
 
-    // Descending, windowed to the middle page (offset 1, limit 2). Age
-    // decreases as pk increases here, so descending-by-age happens to land
-    // on the same row order as ascending pk (pk1..5 = ages 50,40,30,20,10)
-    // - the offset/limit window (pk 2, pk 3) is still only correct if the
-    // full 5-row set was sorted first and THEN windowed, not windowed off
-    // the raw scan and left unsorted (which would coincidentally return
-    // the same two rows here, but in the ascending-age windowed case below
-    // would not).
     const midDesc = try client.tableSelect(allocator, "users", "", 1, 2, &.{.{ .field = "age", .descending = true }});
     defer protocol.freeRows(allocator, midDesc);
     try std.testing.expectEqual(@as(usize, 2), midDesc.len);
@@ -3763,11 +3266,6 @@ test "server table_select orders a remote result by a field before windowing it,
     try std.testing.expectEqual(@as(i64, 3), midDesc[1].get(querymod.pkField).?.int);
     try std.testing.expectEqual(@as(i64, 30), midDesc[1].get("age").?.int);
 
-    // Ascending, same window (offset 1, limit 2): ascending-by-age order is
-    // pk 5,4,3,2,1 (ages 10,20,30,40,50), so offset 1..3 is pk 4 then pk 3
-    // - a DIFFERENT pair than the descending window above, which a
-    // window-before-sort bug (paging the raw pk scan, then sorting only
-    // the already-cut window) would fail to distinguish.
     const midAsc = try client.tableSelect(allocator, "users", "", 1, 2, &.{.{ .field = "age" }});
     defer protocol.freeRows(allocator, midAsc);
     try std.testing.expectEqual(@as(usize, 2), midAsc.len);
@@ -3776,17 +3274,11 @@ test "server table_select orders a remote result by a field before windowing it,
     try std.testing.expectEqual(@as(i64, 3), midAsc[1].get(querymod.pkField).?.int);
     try std.testing.expectEqual(@as(i64, 30), midAsc[1].get("age").?.int);
 
-    // Cross-check: table_explain reports the `age` index is used for the
-    // predicate that would narrow this query, same as the ordered path's
-    // `selectAllMatches` internally reuses.
     var plan = try client.tableExplain(allocator, "users", "age gte i:0");
     defer plan.deinit(allocator);
     try std.testing.expectEqual(querymod.PlanKind.index_range, plan.kind);
 }
 
-// A second, INDEPENDENT `orderBy` column exercises a path the single-column
-// test above cannot: `handleTableSelect` decoding a wire count > 1 and
-// `sortRowsBy`'s tie-breaking chain, both new with multi-column support.
 test "server table_select orders a remote result by two columns, sorting then breaking ties" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3800,10 +3292,6 @@ test "server table_select orders a remote result by two columns, sorting then br
     {
         var table = try querymod.Table.open(&db, allocator, "people");
         defer table.deinit();
-        // Two cities, scores deliberately NOT already grouped by city in
-        // scan order, so a single-column `city` sort alone would leave
-        // each city's rows unsorted by `score` - only a real tiebreak
-        // fixes that.
         try table.put(.{ .int = 1 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "score", .value = .{ .int = 30 } } });
         try table.put(.{ .int = 2 }, &.{ .{ .name = "city", .value = .{ .text = "krakow" } }, .{ .name = "score", .value = .{ .int = 20 } } });
         try table.put(.{ .int = 3 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "score", .value = .{ .int = 10 } } });
@@ -3822,10 +3310,10 @@ test "server table_select orders a remote result by two columns, sorting then br
     const rows = try client.tableSelect(allocator, "people", "", 0, 0, &.{ .{ .field = "city" }, .{ .field = "score" } });
     defer protocol.freeRows(allocator, rows);
     try std.testing.expectEqual(@as(usize, 4), rows.len);
-    try std.testing.expectEqual(@as(i64, 2), rows[0].get(querymod.pkField).?.int); // krakow/20
-    try std.testing.expectEqual(@as(i64, 4), rows[1].get(querymod.pkField).?.int); // krakow/40
-    try std.testing.expectEqual(@as(i64, 3), rows[2].get(querymod.pkField).?.int); // warsaw/10
-    try std.testing.expectEqual(@as(i64, 1), rows[3].get(querymod.pkField).?.int); // warsaw/30
+    try std.testing.expectEqual(@as(i64, 2), rows[0].get(querymod.pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 4), rows[1].get(querymod.pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 3), rows[2].get(querymod.pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 1), rows[3].get(querymod.pkField).?.int);
 }
 
 test "server table_select rejects a malformed expr with bad_request, not a crash" {
@@ -3938,8 +3426,6 @@ test "server table_aggregate honors offset/limit to window the result groups ser
 
     const specs = [_]aggregatemod.AggSpec{.{ .field = "", .kind = .count }};
 
-    // Unpaged baseline: 3 distinct cities in first-seen order (warsaw twice
-    // seeded first, then krakow, then gdansk added above).
     const all = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 0, 0, &.{}, "", "");
     defer protocol.freeAggGroupRows(allocator, all);
     try std.testing.expectEqual(@as(usize, 3), all.len);
@@ -3994,7 +3480,7 @@ test "server table_aggregate applies a HAVING clause to result groups after aggr
 
     var db = try testDb(allocator, path);
     defer db.close();
-    try seedAggregateOrders(allocator, &db); // warsaw: count=2 sum=350, krakow: count=1 sum=40
+    try seedAggregateOrders(allocator, &db);
 
     const address = try std.net.Address.parseIp("127.0.0.1", 0);
     var server = try Server.init(allocator, &db, address);
@@ -4010,21 +3496,16 @@ test "server table_aggregate applies a HAVING clause to result groups after aggr
         .{ .field = "total", .kind = .sum },
     };
 
-    // Referencing the printed aggregate label (sum_total): only warsaw's
-    // group sum clears 100.
     const bySum = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 0, 0, &.{}, "sum_total gt i:100", "");
     defer protocol.freeAggGroupRows(allocator, bySum);
     try std.testing.expectEqual(@as(usize, 1), bySum.len);
     try std.testing.expectEqualStrings("warsaw", bySum[0].group.text);
 
-    // Referencing the group key itself (city), not just an aggregate result.
     const byGroup = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 0, 0, &.{}, "city eq s:krakow", "");
     defer protocol.freeAggGroupRows(allocator, byGroup);
     try std.testing.expectEqual(@as(usize, 1), byGroup.len);
     try std.testing.expectEqualStrings("krakow", byGroup[0].group.text);
 
-    // A HAVING clause that excludes every group comes back as zero groups,
-    // not an error.
     const none = try client.tableAggregateGroups(allocator, "orders", "city", &specs, 0, 0, &.{}, "count gt i:1000", "");
     defer protocol.freeAggGroupRows(allocator, none);
     try std.testing.expectEqual(@as(usize, 0), none.len);
@@ -4046,11 +3527,6 @@ test "server table_aggregate HAVING narrows groups before LIMIT/OFFSET windows t
         .{ .name = "total", .value = .{ .int = 500 } },
     });
     orders.deinit();
-    // Groups in first-seen order: warsaw(count=2 sum=350), krakow(count=1
-    // sum=40), gdansk(count=1 sum=500). HAVING count gt 0 keeps all three,
-    // but HAVING sum_total gt i:100 keeps only warsaw and gdansk (in that
-    // order) - a limit of 1 must then return warsaw, not krakow (which
-    // would be first if the window applied before HAVING).
 
     const address = try std.net.Address.parseIp("127.0.0.1", 0);
     var server = try Server.init(allocator, &db, address);
@@ -4085,7 +3561,7 @@ test "server table_aggregate HAVING on the global (no groupField) path excludes 
 
     var db = try testDb(allocator, path);
     defer db.close();
-    try seedAggregateOrders(allocator, &db); // global: count=3 sum=390
+    try seedAggregateOrders(allocator, &db);
 
     const address = try std.net.Address.parseIp("127.0.0.1", 0);
     var server = try Server.init(allocator, &db, address);
@@ -4148,9 +3624,6 @@ test "server table_aggregate count_distinct collapses repeated field values, loc
     {
         var orders = try querymod.Table.open(&db, allocator, "orders");
         defer orders.deinit();
-        // Both warsaw rows share the same region on purpose - the whole
-        // point of this test is that COUNT(DISTINCT region) collapses them
-        // to 1, unlike plain COUNT which would report 2.
         try orders.put(.{ .int = 1 }, &.{
             .{ .name = "city", .value = .{ .text = "warsaw" } },
             .{ .name = "region", .value = .{ .text = "mazovia" } },
@@ -4182,8 +3655,8 @@ test "server table_aggregate count_distinct collapses repeated field values, loc
     defer protocol.freeAggGroupRows(allocator, groups);
     try std.testing.expectEqual(@as(usize, 2), groups.len);
     try std.testing.expectEqualStrings("warsaw", groups[0].group.text);
-    try std.testing.expectEqual(@as(i64, 2), groups[0].values[0].int); // COUNT(*)
-    try std.testing.expectEqual(@as(i64, 1), groups[0].values[1].int); // COUNT(DISTINCT region)
+    try std.testing.expectEqual(@as(i64, 2), groups[0].values[0].int);
+    try std.testing.expectEqual(@as(i64, 1), groups[0].values[1].int);
     try std.testing.expectEqualStrings("krakow", groups[1].group.text);
     try std.testing.expectEqual(@as(i64, 1), groups[1].values[0].int);
     try std.testing.expectEqual(@as(i64, 1), groups[1].values[1].int);
@@ -4191,7 +3664,7 @@ test "server table_aggregate count_distinct collapses repeated field values, loc
     const globalSpecs = [_]aggregatemod.AggSpec{.{ .field = "region", .kind = .count_distinct }};
     const global = try client.tableAggregateGlobal(allocator, "orders", &globalSpecs, "", "");
     defer protocol.freeAggValues(allocator, global);
-    try std.testing.expectEqual(@as(i64, 2), global[0].int); // mazovia + malopolska
+    try std.testing.expectEqual(@as(i64, 2), global[0].int);
 }
 
 test "server table_aggregate reports a non-numeric sum field as bad_request, not a crash" {
@@ -4245,8 +3718,6 @@ test "server table_window annotates remote rows with row_number, partition-then-
     const results = try client.tableWindow(allocator, "orders", &specs, &partitionBy, &orderBy, 0, 0, "", .rows);
     defer protocol.freeWindowRows(allocator, results);
 
-    // First-seen partition order (warsaw at pk1, krakow at pk3), sorted by
-    // total within each partition: warsaw 100 then 250, krakow 40 alone.
     try std.testing.expectEqual(@as(usize, 3), results.len);
     try std.testing.expectEqualStrings("warsaw", results[0].row.get("city").?.text);
     try std.testing.expectEqual(@as(i64, 100), results[0].row.get("total").?.int);
@@ -4324,7 +3795,6 @@ test "server table_window with MULTIPLE specs returns one WindowRow.values entry
 
     try std.testing.expectEqual(@as(usize, 3), results.len);
     try std.testing.expectEqual(@as(usize, 2), results[0].values.len);
-    // warsaw: total 100 then 250 (running sum), krakow: total 40 alone.
     try std.testing.expectEqualStrings("warsaw", results[0].row.get("city").?.text);
     try std.testing.expectEqual(@as(i64, 1), results[0].values[0].int);
     try std.testing.expectEqual(@as(i64, 100), results[0].values[1].int);
@@ -4380,7 +3850,6 @@ test "server table_window RANGE frame groups tied rows by day, ROWS gives each r
     {
         var orders = try querymod.Table.open(&db, allocator, "orders");
         defer orders.deinit();
-        // Two rows tied at day=1 (10, 20), then one row at day=2 (5).
         try orders.put(.{ .int = 1 }, &.{
             .{ .name = "day", .value = .{ .int = 1 } },
             .{ .name = "amount", .value = .{ .int = 10 } },
@@ -4410,7 +3879,6 @@ test "server table_window RANGE frame groups tied rows by day, ROWS gives each r
     const rangeResults = try client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .range);
     defer protocol.freeWindowRows(allocator, rangeResults);
     try std.testing.expectEqual(@as(usize, 3), rangeResults.len);
-    // Both day=1 rows share the tie group's combined total (10+20=30).
     try std.testing.expectEqual(@as(i64, 30), rangeResults[0].values[0].int);
     try std.testing.expectEqual(@as(i64, 30), rangeResults[1].values[0].int);
     try std.testing.expectEqual(@as(i64, 35), rangeResults[2].values[0].int);
@@ -4418,7 +3886,6 @@ test "server table_window RANGE frame groups tied rows by day, ROWS gives each r
     const rowsResults = try client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .rows);
     defer protocol.freeWindowRows(allocator, rowsResults);
     try std.testing.expectEqual(@as(usize, 3), rowsResults.len);
-    // ROWS: each physical row gets its own running total, even tied ones.
     try std.testing.expectEqual(@as(i64, 10), rowsResults[0].values[0].int);
     try std.testing.expectEqual(@as(i64, 30), rowsResults[1].values[0].int);
     try std.testing.expectEqual(@as(i64, 35), rowsResults[2].values[0].int);
@@ -4478,7 +3945,6 @@ test "server table_window lag/lead read the adjacent row's value along order, NU
     const results = try client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .rows);
     defer protocol.freeWindowRows(allocator, results);
 
-    // Sorted by total ascending: krakow/40, warsaw/100, warsaw/250.
     try std.testing.expectEqual(@as(usize, 3), results.len);
     try std.testing.expectEqual(@as(i64, 40), results[0].row.get("total").?.int);
     try std.testing.expectEqual(rowmod.ValueTag.none, @as(rowmod.ValueTag, results[0].values[0]));
@@ -4516,9 +3982,6 @@ test "server table_window lag with an explicit offset and a caller-supplied defa
     const results = try client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .rows);
     defer protocol.freeWindowRows(allocator, results);
 
-    // Sorted: krakow/40, warsaw/100, warsaw/250 - lag offset 2 reaches back
-    // two physical positions, so only the LAST row has a real source (40);
-    // the first two fall outside the sequence and get the -1 default.
     try std.testing.expectEqual(@as(i64, -1), results[0].values[0].int);
     try std.testing.expectEqual(@as(i64, -1), results[1].values[0].int);
     try std.testing.expectEqual(@as(i64, 40), results[2].values[0].int);
@@ -4578,11 +4041,6 @@ test "server table_window first_value/last_value read the current RANGE tie grou
     const results = try client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .range);
     defer protocol.freeWindowRows(allocator, results);
 
-    // Sorted by total ascending: krakow/40, warsaw/100, warsaw/250 - no ties,
-    // so RANGE reduces to one tie group per row (same as ROWS): first_value
-    // is always the partition's first row (40, frame start is unaffected by
-    // ties), but last_value is each row's OWN value since it is its own
-    // singleton tie group.
     try std.testing.expectEqual(@as(usize, 3), results.len);
     for (results) |r| try std.testing.expectEqual(@as(i64, 40), r.values[0].int);
     try std.testing.expectEqual(@as(i64, 40), results[0].values[1].int);
@@ -4615,10 +4073,6 @@ test "server table_window nth_value reads a fixed frame position, default at the
     const results = try client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .rows);
     defer protocol.freeWindowRows(allocator, results);
 
-    // Sorted: krakow/40, warsaw/100, warsaw/250. Position 2 (n=2) needs a
-    // frame of at least size 2 - the first row's ROWS frame is still just
-    // itself (size 1), so it falls back to the caller's default (-1); the
-    // remaining two rows both see position 2's value, 100.
     try std.testing.expectEqual(@as(usize, 3), results.len);
     try std.testing.expectEqual(@as(i64, -1), results[0].values[0].int);
     try std.testing.expectEqual(@as(i64, 100), results[1].values[0].int);
@@ -4645,9 +4099,6 @@ test "server table_window count_distinct runs a distinct-city total over real TC
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
 
-    // Sorted by total ascending: krakow/40, warsaw/100, warsaw/250 - distinct
-    // "city" running count grows 1 (krakow), 2 (warsaw joins), then stays 2
-    // (warsaw repeats).
     const orderBy = [_]querymod.OrderBy{.{ .field = "total", .descending = false }};
     const specs = [_]windowmod.WindowSpec{.{ .field = "city", .kind = .count_distinct }};
     const results = try client.tableWindow(allocator, "orders", &specs, &.{}, &orderBy, 0, 0, "", .rows);
@@ -4757,25 +4208,11 @@ test "server table_window reports a sum spec with no field as bad_request, not a
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
 
-    // The CLI's `parseWindowSpec` would reject this before ever sending it,
-    // but nothing on the wire itself stops a client from asking for it -
-    // `window.computeMany`'s `MissingField` must come back as
-    // `bad_request`, not an internal server error.
     const specs = [_]windowmod.WindowSpec{.{ .field = "", .kind = .sum }};
     const err = client.tableWindow(allocator, "orders", &specs, &.{}, &.{}, 0, 0, "", .rows);
     try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
 }
 
-// `table_aggregate` shares the exact same underlying-sstable-reshaping
-// hazard as `table_select`/`table_join` above (see the `table_select`
-// concurrency test's header comment): `flush`/`compact` swap `Db.sstables`
-// out from under any in-flight reader while `Server.dispatch`'s `self.mutex`
-// is what keeps an aggregate's full-table scan (and the grouping/windowing
-// on top of it in `aggregate.zig`) from tearing. Thirty rows split evenly
-// three ways by `@mod(pk, 3)` so every group lands on an independently
-// checkable count and sum: pk%3==0 -> "warsaw" (pks 3,6,..,30, count 10, sum
-// 165), pk%3==1 -> "krakow" (pks 1,4,..,28, count 10, sum 145), pk%3==2 ->
-// "gdansk" (pks 2,5,..,29, count 10, sum 155) - global count 30, sum 465.
 test "table_aggregate survives concurrent flush and compact reshaping the underlying sstables" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4783,9 +4220,6 @@ test "table_aggregate survives concurrent flush and compact reshaping the underl
     const path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(path);
 
-    // Small target size so a handful of `flush`/`compact` calls do real
-    // structural work instead of needing megabytes of data first - same
-    // trick as the `table_select`/`table_join` concurrency tests above.
     var db = try Db.open(allocator, path, .{ .sstableTargetBytes = 512 });
     defer db.close();
 
@@ -4905,11 +4339,6 @@ test "table_aggregate survives concurrent flush and compact reshaping the underl
     for (0..readerThreads) |i| try std.testing.expect(readerContexts[i].ok);
     for (0..mutatorThreads) |i| try std.testing.expect(mutatorContexts[i].ok);
 
-    // Final sanity check on a fresh connection: after all the concurrent
-    // churn, the aggregate results are still exactly what they were before
-    // the server ever started - the churn wrote only unrelated
-    // `agg-churn-*` keys and reshaped physical sstable layout, never touched
-    // `orders` values.
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
     const specs = [_]aggregatemod.AggSpec{.{ .field = "", .kind = .count }};
@@ -5028,9 +4457,6 @@ test "server table_join runs left, right, and full outer variants with predicate
     defer protocol.freeJoinPairs(allocator, full);
     try std.testing.expectEqual(@as(usize, 5), full.len);
 
-    // rightExprText filters the orders side before the join runs, same as
-    // `innerJoin`'s `rightPred` - narrowing to `total gt i:40` drops one of
-    // alice's two orders.
     const filtered = try client.tableJoin(allocator, .inner, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "total gt i:40");
     defer protocol.freeJoinPairs(allocator, filtered);
     try std.testing.expectEqual(@as(usize, 1), filtered.len);
@@ -5057,7 +4483,6 @@ test "server table_join windows a real TCP result through offset and limit" {
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
 
-    // Unpaged left outer join order: (alice,101) (alice,102) (bob,nil) (carol,nil).
     const unpaged = try client.tableJoin(allocator, .left, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "");
     defer protocol.freeJoinPairs(allocator, unpaged);
     try std.testing.expectEqual(@as(usize, 4), unpaged.len);
@@ -5098,17 +4523,6 @@ test "server table_join rejects a malformed expr with bad_request, not a crash" 
     try std.testing.expectError(client_mod.ClientError.ServerBadRequest, err);
 }
 
-// `table_select` is the only networked table opcode - rows can only be
-// written locally (CLI `table put`), never over the wire - so this cannot
-// reuse the coll_op "many writers, one shared counter" shape. What it CAN
-// share with a live server is the sstable storage underneath: `flush` and
-// `compact` (both real networked opcodes) mutate `Db.sstables` in place,
-// closing and destroying old `Reader`s and swapping in new ones while
-// `compact` in particular collapses the whole list down to a single file.
-// A `table_select` cursor concurrently mid-scan over those same readers is
-// exactly the use-after-free/torn-read shape a missing lock around
-// `Server.dispatch` would produce - `self.mutex` must serialize every
-// request regardless of which opcode it is, not just same-opcode traffic.
 test "table_select survives concurrent flush and compact reshaping the underlying sstables" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5116,8 +4530,6 @@ test "table_select survives concurrent flush and compact reshaping the underlyin
     const path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(path);
 
-    // A small target size so a handful of `flush`/`compact` calls do real
-    // structural work instead of needing megabytes of data first.
     var db = try Db.open(allocator, path, .{ .sstableTargetBytes = 512 });
     defer db.close();
 
@@ -5156,14 +4568,6 @@ test "table_select survives concurrent flush and compact reshaping the underlyin
         addr: std.net.Address,
         ok: bool = false,
     };
-    // A multi-element order-by (city ascending, then age descending as a
-    // tiebreak within each city) - `handleTableSelect` decodes a wire
-    // orderBy count > 1 into `Table.selectPageOrdered`, which cannot
-    // early-stop mid-scan the way an unordered `selectPage` can, so it reads
-    // more of the table before sorting. This proves that path survives real
-    // `flush`/`compact` reshaping the underlying sstables mid-scan, not just
-    // the single-column order-by already covered by
-    // "orders a remote result by a field before windowing it" above.
     const cityOrderBy = [_]querymod.OrderBy{
         .{ .field = "city" },
         .{ .field = "age", .descending = true },
@@ -5250,10 +4654,6 @@ test "table_select survives concurrent flush and compact reshaping the underlyin
     for (0..readerThreads) |i| try std.testing.expect(readerContexts[i].ok);
     for (0..mutatorThreads) |i| try std.testing.expect(mutatorContexts[i].ok);
 
-    // Final sanity check on a fresh connection: after all the concurrent
-    // churn, the table data itself must be byte-for-byte what was written
-    // before the server ever started - `flush`/`compact` change physical
-    // layout, never live values.
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
     const finalAll = try client.tableSelect(allocator, "people", "", 0, 0, &.{});
@@ -5263,10 +4663,6 @@ test "table_select survives concurrent flush and compact reshaping the underlyin
     defer protocol.freeRows(allocator, finalWarsaw);
     try std.testing.expectEqual(@as(usize, rowCount / 3), finalWarsaw.len);
 
-    // Precise check of the multi-column order-by: city groups sorted
-    // alphabetically (gdansk < krakow < warsaw), each group internally by
-    // age (== pk*2) descending. pk%3 maps 2->gdansk, 1->krakow, 0->warsaw,
-    // so each group's highest pk (== highest age) leads that group.
     const finalOrdered = try client.tableSelect(allocator, "people", "", 0, 0, &cityOrderBy);
     defer protocol.freeRows(allocator, finalOrdered);
     try std.testing.expectEqual(@as(usize, rowCount), finalOrdered.len);
@@ -5284,15 +4680,6 @@ test "table_select survives concurrent flush and compact reshaping the underlyin
     try std.testing.expectEqual(@as(i64, 3), finalOrdered[29].get(querymod.pkField).?.int);
 }
 
-// `table_join` shares the exact same underlying-sstable-reshaping hazard as
-// `table_select` above (see that test's header comment) - `flush`/`compact`
-// swap `Db.sstables` out from under any in-flight reader while
-// `Server.dispatch`'s `self.mutex` is what keeps a join's two-table scan
-// from tearing. Ten customers / ten orders, deliberately NOT 1:1: two
-// customers (9, 10) never appear in `orders`, and two orders (9, 10) carry a
-// `customer_id` nobody has, so inner/left/right/full each land on a
-// different, independently-checkable pair count instead of degenerating to
-// the same number.
 fn seedJoinConcurrencyTables(allocator: Allocator, db: *Db) !void {
     var customers = try querymod.Table.open(db, allocator, "customers");
     defer customers.deinit();
@@ -5329,9 +4716,6 @@ test "table_join survives concurrent flush and compact reshaping the underlying 
     const path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(path);
 
-    // Small target size so a handful of `flush`/`compact` calls do real
-    // structural work instead of needing megabytes of data first - same
-    // trick as the `table_select` concurrency test above.
     var db = try Db.open(allocator, path, .{ .sstableTargetBytes = 512 });
     defer db.close();
     try seedJoinConcurrencyTables(allocator, &db);
@@ -5428,11 +4812,6 @@ test "table_join survives concurrent flush and compact reshaping the underlying 
     for (0..readerThreads) |i| try std.testing.expect(readerContexts[i].ok);
     for (0..mutatorThreads) |i| try std.testing.expect(mutatorContexts[i].ok);
 
-    // Final sanity check on a fresh connection: all four join shapes are
-    // still exactly what they were before the server ever started - the
-    // concurrent churn wrote only unrelated `join-churn-*` keys and
-    // reshaped physical sstable layout, never touched `customers`/`orders`
-    // values.
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
     const finalInner = try client.tableJoin(allocator, .inner, "customers", querymod.pkField, "orders", "customer_id", 0, 0, "", "");
@@ -5616,7 +4995,6 @@ test "a session token from one connection authenticates a brand new connection w
     defer allocator.free(token);
     first.close();
 
-    // A fully independent second connection, never given the password.
     var second = try client_mod.Client.connect(allocator, server.boundAddress());
     defer second.close();
     try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, second.get(allocator, "k"));
@@ -5712,8 +5090,6 @@ test "an expired session forces re-authentication even on the same open connecti
     try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, client.get(allocator, "k"));
     try std.testing.expectEqual(@as(u64, 1), server.sessionExpiredTotal.get());
 
-    // The very same connection re-authenticates and keeps working - the
-    // socket itself was never the thing that expired, only the session.
     try client.authenticate("alice", "hunter2");
     const got = try client.get(allocator, "k");
     defer if (got) |g| allocator.free(g);
@@ -5747,8 +5123,6 @@ test "each connection authenticates independently under auth enforcement" {
     try clientA.authenticate("alice", "hunter2");
     try clientA.set("shared", "1");
 
-    // clientB never authenticated - a separate socket does not inherit
-    // clientA's role even though it hits the exact same server/store.
     try std.testing.expectError(client_mod.ClientError.ServerUnauthorized, clientB.get(allocator, "shared"));
 }
 
@@ -5778,7 +5152,6 @@ test "server without auth enabled allows user_admin to create and list users" {
     try std.testing.expectEqualStrings("alice", users[0].username);
     try std.testing.expectEqual(authmod.Role.readwrite, users[0].role);
 
-    // The account just created over the wire really works for real auth.
     var second = try client_mod.Client.connect(allocator, server.boundAddress());
     defer second.close();
     try second.authenticate("alice", "hunter2");
@@ -5845,8 +5218,6 @@ test "user_admin set_password, set_role, and delete round trip over the wire, en
 
     try admin.adminCreateUser("alice", "old-pass", .readonly, 16);
 
-    // The freshly created account really authenticates against the live,
-    // enforced auth store - not just written to a table nobody checks.
     var probe = try client_mod.Client.connect(allocator, server.boundAddress());
     defer probe.close();
     try probe.authenticate("alice", "old-pass");
@@ -5990,13 +5361,8 @@ test "client.metricsText fetches the server's own counters and db stats over the
     const text = try client.metricsText(allocator);
     defer allocator.free(text);
 
-    // Server's own request counter: 2 sets + 1 ping + this very metrics
-    // request itself, all counted in `requestsTotal` before dispatch even
-    // looks at the opcode.
     try std.testing.expect(std.mem.indexOf(u8, text, "cobalt_server_requests_total 4\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "cobalt_server_rate_limited_total 0\n") != null);
-    // Db stats rendered by the same `formatDbStats` `stats --prom` uses
-    // locally, appended after the server's own counters in one response.
     try std.testing.expect(std.mem.indexOf(u8, text, "cobalt_memtable_entries 2\n") != null);
 }
 
@@ -6049,9 +5415,6 @@ test "enableSessionSweep periodically drops expired sessions nobody ever present
     const address = try std.net.Address.parseIp("127.0.0.1", 0);
     var server = try Server.init(allocator, &db, address);
     server.enableAuth(store);
-    // A short-lived session that nobody will ever present again: without
-    // the sweeper, this sits in `sessions` forever since `validate()` only
-    // cleans up a token someone actually tries to use.
     server.enableSessions(&sessions, 100 * std.time.ns_per_ms);
     server.enableSessionSweep(50 * std.time.ns_per_ms);
     try server.start();
@@ -6064,8 +5427,6 @@ test "enableSessionSweep periodically drops expired sessions nobody ever present
 
     try std.testing.expectEqual(@as(usize, 1), sessions.count());
 
-    // Long enough for the session to expire (100ms) and for at least one
-    // sweep tick (every 50ms) to have run past that point.
     std.time.sleep(400 * std.time.ns_per_ms);
 
     try std.testing.expectEqual(@as(usize, 0), sessions.count());
@@ -6101,9 +5462,6 @@ test "a server with sessions enabled but no sweep interval never sweeps" {
 
     std.time.sleep(200 * std.time.ns_per_ms);
 
-    // The session expired a while ago, but with no sweeper running it is
-    // still sitting in the store's map until something calls `validate` on
-    // it - `count()` still sees it, unlike the sweeper test above.
     try std.testing.expectEqual(@as(usize, 1), sessions.count());
     try std.testing.expectEqual(@as(u64, 0), server.sessionsSweptTotal.get());
 }
@@ -6127,28 +5485,18 @@ test "ttl_op over the wire: expire, query, persist, and sweep round trip against
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
 
-    // A key with no ttl at all reads back .noExpiry, not .noKey.
     try client.set("plain", "v");
     try std.testing.expectEqual(ttlmod.TtlResult.noExpiry, try client.ttlQuery("plain"));
 
-    // expire on a key that does not exist is a real, distinct failure.
     try std.testing.expectError(client_mod.ClientError.ServerKeyNotFound, client.ttlExpire("ghost", 60));
 
-    // expire on an existing key sets a marker the query action can see.
-    // Real wall-clock time (both `expire` and `query` stamp their own
-    // `std.time.nanoTimestamp()` server-side) can shave a second off by
-    // the time the second round trip lands, so accept 59 or 60 rather
-    // than pinning an exact value.
     try client.ttlExpire("plain", 60);
     const withTtl = try client.ttlQuery("plain");
     try std.testing.expect(withTtl.seconds == 59 or withTtl.seconds == 60);
 
-    // persist removes the marker again, back to .noExpiry.
     try client.ttlPersist("plain");
     try std.testing.expectEqual(ttlmod.TtlResult.noExpiry, try client.ttlQuery("plain"));
 
-    // sweep over a key that is already due for expiry reaps exactly it,
-    // and a real subsequent get proves the delete was real, not marker-only.
     try client.set("doomed", "x");
     try client.ttlExpire("doomed", 0);
     std.time.sleep(5 * std.time.ns_per_ms);
@@ -6156,9 +5504,148 @@ test "ttl_op over the wire: expire, query, persist, and sweep round trip against
     try std.testing.expectEqual(@as(u64, 1), reaped);
     try std.testing.expectEqual(@as(?[]u8, null), try client.get(allocator, "doomed"));
 
-    // querying a key that was never there at all (not merely expired) is
-    // .noKey, distinct from .noExpiry.
     try std.testing.expectEqual(ttlmod.TtlResult.noKey, try client.ttlQuery("never-existed"));
+}
+
+test "del and batched del over the wire drop the key's ttl marker together with the key" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.set("single", "v");
+    try client.ttlExpire("single", 3600);
+    try client.set("batched", "v");
+    try client.ttlExpire("batched", 3600);
+
+    try client.delete("single");
+    const ops = [_]protocol.BatchOp{.{ .del = "batched" }};
+    try client.batch(&ops);
+
+    for ([_][]const u8{ "single", "batched" }) |key| {
+        try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, key));
+        try std.testing.expectEqual(@as(?i128, null), try ttlmod.getExpiresAt(&db, allocator, key));
+    }
+}
+
+test "get, scan and prefix over the wire treat a key past its ttl as missing, like the cli" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    try client.set("gone", "stale");
+    try client.ttlExpire("gone", 0);
+    try client.set("kept", "fresh");
+    try client.ttlExpire("kept", 60);
+    try client.set("plain", "forever");
+    std.time.sleep(5 * std.time.ns_per_ms);
+
+    const scanned = try client.scan(allocator, .{});
+    defer protocol.freeOwnedEntries(allocator, scanned);
+    try std.testing.expectEqual(@as(usize, 2), scanned.len);
+    try std.testing.expectEqualStrings("kept", scanned[0].key);
+    try std.testing.expectEqualStrings("plain", scanned[1].key);
+
+    const reversed = try client.scan(allocator, .{ .reverse = true });
+    defer protocol.freeOwnedEntries(allocator, reversed);
+    try std.testing.expectEqual(@as(usize, 2), reversed.len);
+    try std.testing.expectEqualStrings("plain", reversed[0].key);
+    try std.testing.expectEqualStrings("kept", reversed[1].key);
+
+    const limited = try client.scan(allocator, .{ .limit = 1 });
+    defer protocol.freeOwnedEntries(allocator, limited);
+    try std.testing.expectEqual(@as(usize, 1), limited.len);
+    try std.testing.expectEqualStrings("kept", limited[0].key);
+
+    const prefixed = try client.prefix(allocator, "g", 0);
+    defer protocol.freeOwnedEntries(allocator, prefixed);
+    try std.testing.expectEqual(@as(usize, 0), prefixed.len);
+
+    const everything = try client.prefix(allocator, "", 0);
+    defer protocol.freeOwnedEntries(allocator, everything);
+    try std.testing.expectEqual(@as(usize, 2), everything.len);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try client.get(allocator, "gone"));
+    try std.testing.expectEqual(ttlmod.TtlResult.noKey, try client.ttlQuery("gone"));
+
+    const kept = (try client.get(allocator, "kept")).?;
+    defer allocator.free(kept);
+    try std.testing.expectEqualStrings("fresh", kept);
+}
+
+test "set and batch over the wire drop any ttl, and expire and ttl treat an expired unswept key as missing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try testDb(allocator, path);
+    defer db.close();
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try Server.init(allocator, &db, address);
+    try server.start();
+    defer server.stop();
+
+    const client_mod = @import("client.zig");
+    var client = try client_mod.Client.connect(allocator, server.boundAddress());
+    defer client.close();
+
+    for ([_][]const u8{ "dead", "rewritten", "batched" }) |key| {
+        try client.set(key, "old");
+        try client.ttlExpire(key, 0);
+    }
+    try client.set("live", "old");
+    try client.ttlExpire("live", 600);
+
+    try std.testing.expectEqual(ttlmod.TtlResult.noKey, try client.ttlQuery("dead"));
+    try std.testing.expectError(client_mod.ClientError.ServerKeyNotFound, client.ttlExpire("dead", 600));
+    try std.testing.expectEqual(ttlmod.TtlResult.noKey, try client.ttlQuery("dead"));
+    try std.testing.expectEqual(@as(?[]u8, null), try client.get(allocator, "dead"));
+
+    try client.set("rewritten", "new");
+    try client.set("live", "new");
+    const ops = [_]protocol.BatchOp{
+        .{ .put = .{ .key = "batched", .value = "new" } },
+        .{ .put = .{ .key = "plain", .value = "new" } },
+    };
+    try client.batch(&ops);
+
+    for ([_][]const u8{ "rewritten", "live", "batched", "plain" }) |key| {
+        try std.testing.expectEqual(ttlmod.TtlResult.noExpiry, try client.ttlQuery(key));
+        const value = (try client.get(allocator, key)).?;
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("new", value);
+    }
+    try std.testing.expectEqual(@as(u64, 0), try client.ttlSweep());
 }
 
 test "ttl_op gates query as readonly and expire as readwrite" {
@@ -6192,15 +5679,12 @@ test "ttl_op gates query as readonly and expire as readwrite" {
     defer reader.close();
     try reader.authenticate("reader", "pw");
 
-    // query is readonly: a readonly connection can run it.
     try std.testing.expectEqual(ttlmod.TtlResult.noExpiry, try reader.ttlQuery("k"));
 
-    // expire/persist/sweep all mutate: forbidden for a readonly connection.
     try std.testing.expectError(client_mod.ClientError.ServerForbidden, reader.ttlExpire("k", 30));
     try std.testing.expectError(client_mod.ClientError.ServerForbidden, reader.ttlPersist("k"));
     try std.testing.expectError(client_mod.ClientError.ServerForbidden, reader.ttlSweep());
 
-    // The readwrite connection can do all four.
     try writer.ttlExpire("k", 30);
     try writer.ttlPersist("k");
     _ = try writer.ttlSweep();
@@ -6253,10 +5737,6 @@ test "enableTtlSweep periodically reaps due keys nobody ever reads again" {
     try client.set("a", "1");
     try client.ttlExpire("a", 0);
 
-    // Long enough for the key to be due and for at least one sweep tick
-    // (every 50ms) to run past that point - nobody ever reads "a" again,
-    // so without the background sweeper it would sit there forever (only
-    // `ttl.getLive`'s lazy path or an explicit sweep would ever catch it).
     std.time.sleep(300 * std.time.ns_per_ms);
 
     try std.testing.expectEqual(@as(?[]u8, null), try client.get(allocator, "a"));
@@ -6286,13 +5766,8 @@ test "a server with no ttl sweep interval never runs the ttl sweeper" {
     try client.ttlExpire("a", 0);
     std.time.sleep(100 * std.time.ns_per_ms);
 
-    // Nothing swept it in the background, but the key IS logically due -
-    // client.get goes straight through db.get (not the lazy ttl path), so
-    // the underlying value is still physically present until something
-    // sweeps it.
     try std.testing.expectEqual(@as(u64, 0), server.ttlSweptTotal.get());
-    const v = (try client.get(allocator, "a")).?;
-    allocator.free(v);
+    try std.testing.expectEqual(ttlmod.TtlResult.noKey, try client.ttlQuery("a"));
 }
 
 test "coll_ttl_op over the wire: expire, query, persist, and sweep round trip against a real server" {
@@ -6314,29 +5789,18 @@ test "coll_ttl_op over the wire: expire, query, persist, and sweep round trip ag
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
 
-    // A hash with no ttl at all reads back .noExpiry, not .noKey - the
-    // collection itself has to actually exist server-side first, created
-    // directly through `db` here for brevity (the `coll_op` opcode below
-    // is this same test file's own coverage for reaching it remotely).
     _ = try collmod.Hash.set(&db, allocator, "profile", "name", "ada");
     try std.testing.expectEqual(ttlmod.TtlResult.noExpiry, try client.collTtlQuery(.hash, "profile"));
 
-    // expire on a collection that does not exist is a real, distinct failure.
     try std.testing.expectError(client_mod.ClientError.ServerCollectionNotFound, client.collTtlExpire(.hash, "ghost", 60));
 
-    // expire on an existing collection sets a marker the query action can
-    // see. Real wall-clock time can shave a second off by the time the
-    // second round trip lands, so accept 59 or 60 rather than an exact value.
     try client.collTtlExpire(.hash, "profile", 60);
     const withTtl = try client.collTtlQuery(.hash, "profile");
     try std.testing.expect(withTtl.seconds == 59 or withTtl.seconds == 60);
 
-    // persist removes the marker again, back to .noExpiry.
     try client.collTtlPersist(.hash, "profile");
     try std.testing.expectEqual(ttlmod.TtlResult.noExpiry, try client.collTtlQuery(.hash, "profile"));
 
-    // sweep over a collection that is already due for expiry reaps exactly
-    // it, and the whole hash (not just one field) is really gone afterwards.
     _ = try collmod.Hash.set(&db, allocator, "doomed", "k", "v");
     try client.collTtlExpire(.hash, "doomed", 0);
     std.time.sleep(5 * std.time.ns_per_ms);
@@ -6344,8 +5808,6 @@ test "coll_ttl_op over the wire: expire, query, persist, and sweep round trip ag
     try std.testing.expectEqual(@as(u64, 1), reaped);
     try std.testing.expect(!try collmod.collectionExists(&db, allocator, .hash, "doomed"));
 
-    // querying a collection that was never there at all (not merely
-    // expired) is .noKey, distinct from .noExpiry.
     try std.testing.expectEqual(ttlmod.TtlResult.noKey, try client.collTtlQuery(.set, "never-existed"));
 }
 
@@ -6380,15 +5842,12 @@ test "coll_ttl_op gates query as readonly and expire as readwrite" {
     defer reader.close();
     try reader.authenticate("reader", "pw");
 
-    // query is readonly: a readonly connection can run it.
     try std.testing.expectEqual(ttlmod.TtlResult.noExpiry, try reader.collTtlQuery(.hash, "k"));
 
-    // expire/persist/sweep all mutate: forbidden for a readonly connection.
     try std.testing.expectError(client_mod.ClientError.ServerForbidden, reader.collTtlExpire(.hash, "k", 30));
     try std.testing.expectError(client_mod.ClientError.ServerForbidden, reader.collTtlPersist(.hash, "k"));
     try std.testing.expectError(client_mod.ClientError.ServerForbidden, reader.collTtlSweep());
 
-    // The readwrite connection can do all four.
     try writer.collTtlExpire(.hash, "k", 30);
     try writer.collTtlPersist(.hash, "k");
     _ = try writer.collTtlSweep();
@@ -6412,8 +5871,6 @@ test "server rejects a malformed coll_ttl_op frame with bad_request without cras
     const stream = try std.net.tcpConnectToAddress(server.boundAddress());
     defer stream.close();
 
-    // A single byte is enough for an action but not the kind byte that
-    // must follow it, so `decodeCollTtlOp` fails on the second `takeByte`.
     try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.coll_ttl_op), "\x02");
     var frame = try protocol.readFrame(allocator, stream.reader());
     defer frame.deinit();
@@ -6443,9 +5900,6 @@ test "enableCollTtlSweep periodically reaps due collections nobody ever touches 
     _ = try collmod.ZSet.add(&db, allocator, "board", "alice", 10);
     try client.collTtlExpire(.zset, "board", 0);
 
-    // Long enough for the collection to be due and for at least one sweep
-    // tick (every 50ms) to run past that point - nobody ever reads "board"
-    // again, so without the background sweeper it would sit there forever.
     std.time.sleep(300 * std.time.ns_per_ms);
 
     try std.testing.expect(!try collmod.collectionExists(&db, allocator, .zset, "board"));
@@ -6475,25 +5929,11 @@ test "a server with no coll ttl sweep interval never runs the coll ttl sweeper" 
     try client.collTtlExpire(.set, "tags", 0);
     std.time.sleep(100 * std.time.ns_per_ms);
 
-    // Nothing swept it in the background, but the collection IS logically
-    // due - it is still physically present until something sweeps it.
     try std.testing.expectEqual(@as(u64, 0), server.collTtlSweptTotal.get());
     try std.testing.expect(try collmod.collectionExists(&db, allocator, .set, "tags"));
 }
 
 test "a server with the flat ttl sweeper and the coll ttl sweeper enabled at once runs both independently" {
-    // Every prior session's notes on both sweepers flagged the same gap:
-    // `enableTtlSweep` and `enableCollTtlSweep` start two structurally
-    // independent background threads on the same `Server` (separate
-    // fields, separate `std.Thread.spawn` calls, separate join calls in
-    // `stop()`), but nothing had ever exercised them running at the same
-    // time. This proves three things at once: a flat key due for
-    // expiry and a whole collection due for expiry both get reaped by
-    // their OWN sweeper without either one starving or double-counting
-    // the other's target, and `stop()` cleanly joins both sweeper threads
-    // (the exact bug class caught and fixed in session #28, where a
-    // missing join on one sweeper thread left it alive past `db.close()`
-    // and segfaulted the next test).
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6519,15 +5959,6 @@ test "a server with the flat ttl sweeper and the coll ttl sweeper enabled at onc
     _ = try collmod.Hash.set(&db, allocator, "session:1", "user", "ada");
     try client.collTtlExpire(.hash, "session:1", 0);
 
-    // Poll rather than sleep a single fixed window: two background
-    // sweeper threads plus the accept/connection threads contending for
-    // `self.mutex` on a loaded host can occasionally push either sweeper's
-    // tick past a fixed 300ms, which is not a correctness bug in the
-    // sweeper - it is exactly the kind of host-load flakiness this
-    // project's own frostbyte sessions document repeatedly. Waiting up to
-    // 3s in 50ms increments keeps the assertion meaningful (still fails
-    // for real if a sweeper never runs) without being a coin flip on a
-    // busy machine.
     var waited: u64 = 0;
     while (waited < 3000 and (server.ttlSweptTotal.get() == 0 or server.collTtlSweptTotal.get() == 0)) {
         std.time.sleep(50 * std.time.ns_per_ms);
@@ -6539,9 +5970,6 @@ test "a server with the flat ttl sweeper and the coll ttl sweeper enabled at onc
     try std.testing.expect(server.ttlSweptTotal.get() >= 1);
     try std.testing.expect(server.collTtlSweptTotal.get() >= 1);
 
-    // Neither sweeper's counter absorbed the other's reap: exactly one
-    // flat key was due and exactly one collection was due, so each
-    // counter reads exactly 1, not a shared/blended total.
     try std.testing.expectEqual(@as(u64, 1), server.ttlSweptTotal.get());
     try std.testing.expectEqual(@as(u64, 1), server.collTtlSweptTotal.get());
 }
@@ -6565,10 +5993,6 @@ test "coll_op over the wire exercises all five collection kinds against a real s
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
 
-    // Counter: get on a name nobody ever touched defaults to 0, set
-    // pins an exact value, incrby accumulates - the same three-step
-    // shape `collections.test.counter incrBy accumulates` already
-    // covers locally, now round-tripped over the wire.
     {
         var got = try client.collOp(allocator, .counter_get, "visits", &.{});
         defer got.deinit(allocator);
@@ -6583,8 +6007,6 @@ test "coll_op over the wire exercises all five collection kinds against a real s
         try std.testing.expectEqual(@as(i64, 15), incrReply.int);
     }
 
-    // Hash: set reports created vs updated as 1/0, get returns the
-    // value or nil, del removes a field, len/getall reflect what remains.
     {
         var created = try client.collOp(allocator, .hash_set, "profile", &[_][]const u8{ "name", "ada" });
         defer created.deinit(allocator);
@@ -6619,9 +6041,6 @@ test "coll_op over the wire exercises all five collection kinds against a real s
         try std.testing.expectEqualStrings("grace", all.pairList[0].value);
     }
 
-    // Set: add/rem/ismember/card/members plus the three multi-set ops,
-    // where `name` is the first set and the extra `args` are the rest -
-    // the same split `runColl` uses locally for `args[0]` vs `args[1..]`.
     {
         _ = try client.collOp(allocator, .set_add, "a", &[_][]const u8{"x"});
         _ = try client.collOp(allocator, .set_add, "a", &[_][]const u8{"y"});
@@ -6655,8 +6074,6 @@ test "coll_op over the wire exercises all five collection kinds against a real s
         try std.testing.expectEqual(@as(i64, 1), rem.int);
     }
 
-    // List: push both ends, pop both ends, range with a redis-style
-    // negative index, len reflecting what remains.
     {
         _ = try client.collOp(allocator, .list_rpush, "queue", &[_][]const u8{"one"});
         _ = try client.collOp(allocator, .list_rpush, "queue", &[_][]const u8{"two"});
@@ -6681,8 +6098,6 @@ test "coll_op over the wire exercises all five collection kinds against a real s
         try std.testing.expect(emptyPop == .nil);
     }
 
-    // ZSet: add/incrby/score/rank/card/rangebyrank/rangebyscore, with a
-    // real fractional score to exercise the f64 wire encoding end to end.
     {
         _ = try client.collOp(allocator, .zset_add, "board", &[_][]const u8{ "alice", "10.5" });
         _ = try client.collOp(allocator, .zset_add, "board", &[_][]const u8{ "bob", "20" });
@@ -6720,14 +6135,6 @@ test "coll_op over the wire exercises all five collection kinds against a real s
     }
 }
 
-// Closes the gap every `coll_op` session note since #30 has flagged and
-// deferred: every existing `coll_op` test drives ONE connection at a
-// time, so nothing has ever proven that many independent TCP connections
-// hammering `coll_op` against the SAME named collection concurrently are
-// safe - `Server.dispatch` takes `self.mutex` once per request exactly
-// like every other opcode, but that claim had never been exercised here
-// with real OS threads and real sockets the way `concurrent.zig`'s
-// `GuardedDb` tests already exercise `Db`/`TableTxn` directly.
 test "coll_op survives many real concurrent connections hammering the same counter" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6779,20 +6186,9 @@ test "coll_op survives many real concurrent connections hammering the same count
     defer client.close();
     var total = try client.collOp(allocator, .counter_get, "shared-counter", &.{});
     defer total.deinit(allocator);
-    // Every increment is a separate request from a separate connection, so
-    // a missing lock around `runColl`'s read-modify-write would show up
-    // here as a total strictly less than threadCount*perThread (lost
-    // updates), not as a crash - the mutex in `Server.dispatch` must make
-    // this land on the exact total every single run.
     try std.testing.expectEqual(@as(i64, threadCount * perThread), total.int);
 }
 
-// Same shape as the counter test above but for a structural collection
-// (`Set`) instead of a single scalar: many connections each add their OWN
-// disjoint members to one shared set, so a race would show up as a
-// missing member (an add silently lost to a concurrent writer) rather
-// than a wrong total, which is a different failure mode than incrBy's
-// lost-update and worth its own proof.
 test "coll_op survives many real concurrent connections adding disjoint members to the same set" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6849,9 +6245,6 @@ test "coll_op survives many real concurrent connections adding disjoint members 
     defer card.deinit(allocator);
     try std.testing.expectEqual(@as(i64, threadCount * perThread), card.int);
 
-    // Spot-check a member from every thread, not just the aggregate count -
-    // a bug that dropped exactly one member per thread but "gained" one
-    // duplicate elsewhere could still pass the cardinality check above.
     for (0..threadCount) |t| {
         var buf: [32]u8 = undefined;
         const member = try std.fmt.bufPrint(&buf, "t{d}-m0", .{t});
@@ -6884,8 +6277,6 @@ test "coll_op applies the same lazy-expiry check as coll_ttl_op before every dis
     try client.collTtlExpire(.hash, "session", 0);
     std.time.sleep(5 * std.time.ns_per_ms);
 
-    // The lazy check in `handleCollOp` reaps "session" before hash_get
-    // ever runs, so the field reads back as gone, not as its old value.
     var got = try client.collOp(allocator, .hash_get, "session", &[_][]const u8{"user"});
     defer got.deinit(allocator);
     try std.testing.expect(got == .nil);
@@ -6916,10 +6307,6 @@ test "coll_op set_inter/union/diff lazily expire every extra set name, not just 
     try client.collTtlExpire(.set, "b", 0);
     std.time.sleep(5 * std.time.ns_per_ms);
 
-    // "b" is due but is only referenced through `args`, never `name` - if
-    // the handler only checked `name` (like it does for every single-name
-    // action), "b" would still look alive here and `intersect` would see
-    // its stale "x" member. It must come back empty instead.
     var inter = try client.collOp(allocator, .set_inter, "a", &[_][]const u8{"b"});
     defer inter.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), inter.stringList.len);
@@ -6956,17 +6343,12 @@ test "coll_op gates a read action as readonly and a write action as readwrite" {
     defer reader.close();
     try reader.authenticate("reader", "pw");
 
-    // hash_get is read-only: a readonly connection can run it.
     var got = try reader.collOp(allocator, .hash_get, "k", &[_][]const u8{"f"});
     defer got.deinit(allocator);
     try std.testing.expectEqualStrings("v", got.bytes);
 
-    // hash_set mutates: forbidden for a readonly connection.
     try std.testing.expectError(client_mod.ClientError.ServerForbidden, reader.collOp(allocator, .hash_set, "k", &[_][]const u8{ "f", "v2" }));
 
-    // The readwrite connection can do it. "f" already exists, so hash_set
-    // reports it as updated (0), not created (1) - same int-flag shape as
-    // set_add/set_rem/hash_del elsewhere in this opcode, not `.ok`.
     var setReply = try writer.collOp(allocator, .hash_set, "k", &[_][]const u8{ "f", "v2" });
     defer setReply.deinit(allocator);
     try std.testing.expectEqual(@as(i64, 0), setReply.int);
@@ -6990,8 +6372,6 @@ test "server rejects a malformed coll_op frame with bad_request without crashing
     const stream = try std.net.tcpConnectToAddress(server.boundAddress());
     defer stream.close();
 
-    // A single action byte is not enough to decode the length-prefixed
-    // name that must follow it.
     try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.coll_op), "\x00");
     var frame = try protocol.readFrame(allocator, stream.reader());
     defer frame.deinit();
@@ -7017,27 +6397,9 @@ test "server answers coll_op with bad_request when an action gets too few argume
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
 
-    // counter_set needs a value argument - a well-formed frame that omits
-    // it should come back as a clean bad_request, not an internal error or
-    // a crash from indexing into an empty args slice.
     try std.testing.expectError(client_mod.ClientError.ServerBadRequest, client.collOp(allocator, .counter_set, "n", &.{}));
 }
 
-// Same ksztalt of proof as the two `coll_op` concurrency tests above
-// (many real OS threads, each its own TCP connection, hammering shared
-// server state) but for `ttl_op` instead - the next direction flagged at
-// the end of session solo #32 (cobalt-postep.md). `ttl_op` has no shared
-// mutable VALUE the way a counter or set does (each writer's key is its
-// own, disjoint from every other writer's), so the race worth proving
-// here is different: writer connections racing `set`+`expire` against
-// sweeper connections racing `sweep`, all against the SAME `Db.sstables`/
-// memtable underneath. `ttl.sweepExpired` reads its own prefix scan and
-// deletes what it found within a single `handleTtlOp` call, which the
-// `self.mutex` in `Server.dispatch` executes atomically end-to-end, so a
-// key can never be swept twice and no swept count can double-count - the
-// grand total across every sweep response plus one final mop-up sweep
-// must land on exactly the number of keys written, with zero lost and
-// zero duplicated, no matter how the OS interleaves the connections.
 test "ttl_op survives many real concurrent connections racing writes against sweeps" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7122,16 +6484,12 @@ test "ttl_op survives many real concurrent connections racing writes against swe
     var client = try client_mod.Client.connect(allocator, server.boundAddress());
     defer client.close();
 
-    // Any key that lost the race against every sweeper (written after the
-    // last sweep call landed) is mopped up by one final sweep here.
     const finalReaped = try client.ttlSweep();
 
     var total: u64 = finalReaped;
     for (0..sweeperCount) |i| total += sweepContexts[i].reaped.load(.monotonic);
     try std.testing.expectEqual(@as(u64, writerCount * perWriter), total);
 
-    // Spot-check one key from every writer thread: all must be truly gone
-    // (not just marker-cleared), proving the sweeps were real deletes.
     for (0..writerCount) |t| {
         var buf: [32]u8 = undefined;
         const key = try std.fmt.bufPrint(&buf, "ttl-conc-{d}-0", .{t});
@@ -7140,13 +6498,6 @@ test "ttl_op survives many real concurrent connections racing writes against swe
     }
 }
 
-// Mirrors the `ttl_op` concurrency test above but against `coll_ttl_op`
-// and a real collection (`Counter`) instead of a flat key - the sibling
-// gap the same end-of-#32 note called out explicitly ("ttl_op dziala na
-// plaskim keyspace... analogiczny test... jest wykonalny, ale odlozony").
-// `collttl.sweepExpired` (collttl.zig) shares the exact same
-// scan-then-delete-within-one-call shape as `ttl.sweepExpired`, so the
-// same exactly-once accounting argument applies.
 test "coll_ttl_op survives many real concurrent connections racing writes against sweeps" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7238,8 +6589,6 @@ test "coll_ttl_op survives many real concurrent connections racing writes agains
     for (0..sweeperCount) |i| total += sweepContexts[i].reaped.load(.monotonic);
     try std.testing.expectEqual(@as(u64, writerCount * perWriter), total);
 
-    // Spot-check one collection from every writer thread: the WHOLE
-    // counter namespace must be gone, not merely its TTL marker.
     for (0..writerCount) |t| {
         var buf: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&buf, "ttlcoll-conc-{d}-0", .{t});
@@ -7248,18 +6597,6 @@ test "coll_ttl_op survives many real concurrent connections racing writes agains
     }
 }
 
-// `coll_op`/`ttl_op`/`coll_ttl_op`/`table_select` above all have their own
-// concurrency proof now (#31/#32/#33's end-of-session notes tracked this
-// gap explicitly); `user_admin` was the one opcode still missing one. Its
-// shared mutable state is `auth.Store` (auth.zig), itself just a thin
-// get/put layer over the same `*Db` - `createUser` is a plain
-// check-then-write (`db.get` then `db.put`, no compare-and-swap), so a
-// missing lock around it would let two concurrent `create` calls for the
-// SAME username both observe "absent" and both write, silently doubling
-// the account (or worse, interleaving two different `UserRecord.encode()`
-// outputs into one key). `self.mutex` in `Server.dispatch` is the only
-// thing standing between that and reality here, same as every other
-// opcode's concurrency test in this file.
 test "user_admin survives many real concurrent connections racing to create the same username" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7318,9 +6655,6 @@ test "user_admin survives many real concurrent connections racing to create the 
         if (contexts[i].created) createdCount += 1;
         if (contexts[i].conflicted) conflictedCount += 1;
     }
-    // A missing lock around the check-then-write in `createUser` would let
-    // more than one racer observe "absent" and both succeed, so this must
-    // land on EXACTLY one winner - not "at least one".
     try std.testing.expectEqual(@as(usize, 1), createdCount);
     try std.testing.expectEqual(@as(usize, threadCount - 1), conflictedCount);
 
@@ -7328,21 +6662,10 @@ test "user_admin survives many real concurrent connections racing to create the 
     defer client.close();
     const users = try client.adminListUsers(allocator);
     defer authmod.freeUserList(allocator, users);
-    // Guards against the OTHER failure mode a lost lock could produce: the
-    // two racing `db.put` calls interleaving their encoded bytes into one
-    // corrupted record instead of cleanly overwriting each other, which
-    // would still leave exactly one key but might fail to decode, or a
-    // duplicate row under the same key if compaction ever saw two
-    // physically distinct writes land as one logically doubled entry.
     try std.testing.expectEqual(@as(usize, 1), users.len);
     try std.testing.expectEqualStrings("shared-user", users[0].username);
 }
 
-// Same shared-mutex proof as the create-race test above, but for the
-// read-modify-write shape (`setPassword`/`setRole`, each its own
-// `mustGet` then `db.put`) rather than the check-then-write shape of
-// `create`, plus a concurrent reader (`list`) racing the writers - the
-// third distinct access pattern `user_admin` exposes over the wire.
 test "user_admin survives many real concurrent connections mutating and listing the same account" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7404,11 +6727,6 @@ test "user_admin survives many real concurrent connections mutating and listing 
             defer client.close();
             var i: usize = 0;
             while (i < readsPerReader) : (i += 1) {
-                // Any decode failure inside the server (a torn/corrupted
-                // record) surfaces here as `error.ServerInternal`, not a
-                // silently wrong answer, since `handleUserAdmin` maps every
-                // `UserRecord.decode` error straight to an `internal`
-                // status frame.
                 const users = client.adminListUsers(ctx.allocator) catch return;
                 defer authmod.freeUserList(ctx.allocator, users);
                 if (users.len != 1) return;
@@ -7436,15 +6754,6 @@ test "user_admin survives many real concurrent connections mutating and listing 
     for (0..writerCount) |i| try std.testing.expect(writeContexts[i].ok);
     for (0..readerCount) |i| try std.testing.expect(readContexts[i].ok);
 
-    // A final, deterministic write from the main thread after every racer
-    // has joined, then verified through `auth.Store.verify` directly
-    // (bypassing the network entirely) against the SAME `*Db` the server
-    // just hammered concurrently: this proves the record surviving on disk
-    // is not merely "decodable" (the readers above already checked that)
-    // but functionally intact - the exact salt/rounds/hash triple that
-    // `setPassword` wrote is still paired correctly with the role
-    // `setRole` wrote after it, not a torn mix of two different racers'
-    // writes.
     try setup.adminSetPassword("shared-admin", "final-known-pw", 4);
     try setup.adminSetRole("shared-admin", .admin);
 
@@ -7458,17 +6767,6 @@ test "user_admin survives many real concurrent connections mutating and listing 
     try std.testing.expectEqual(authmod.Role.admin, finalUsers[0].role);
 }
 
-// `txn_op` is the network counterpart of the local CLI's `txn <script>`
-// (main.zig's `runTxn`) - until now atomic multi-row/multi-table commits
-// were reachable only from a process holding the `Db` directly, the same
-// gap `table_select`/`coll_op`/`ttl_op` already closed for their own
-// subsystems. This round trip exercises both verbs across two tables in
-// one commit, including a pre-existing secondary index, to prove the field
-// list and primary key survive the wire encoding (`Row.encode`/
-// `rowmod.encodeValue`) intact enough for `TableTxn.put`'s index
-// maintenance to run correctly on the decoded side, not just for the raw
-// bytes to round-trip in isolation the way protocol.zig's own unit tests
-// already check.
 test "server txn_op commits put and del atomically across two tables, keeping an index in sync" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7523,14 +6821,6 @@ test "server txn_op commits put and del atomically across two tables, keeping an
     try std.testing.expectEqual(@as(usize, 2), warsaw.len);
 }
 
-// Closes a gap left open by the CHECK constraint's introduction alongside
-// UNIQUE/FOREIGN KEY: `TableTxn.put` enforces all three identically (see
-// txn_table.zig), and this server's only write path (`handleTxnOp`) already
-// runs every entry through `TableTxn.put` - so a remote `txn_op` rejecting a
-// CHECK violation was already true the moment `TableTxn.put` gained the
-// check, never separately wired. This test is the same kind of "prove the
-// wire path actually exercises it, not just the in-process unit test" round
-// trip the FK/UNIQUE `txn_op` test above already is.
 test "server txn_op rejects a CHECK constraint violation over the wire and commits nothing" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7562,24 +6852,12 @@ test "server txn_op rejects a CHECK constraint violation over the wire and commi
     };
     try std.testing.expectError(client_mod.ClientError.ServerInternal, client.txnOp(&entries));
 
-    // Whole transaction is atomic across both entries: the earlier,
-    // individually-valid row 1 must not have been committed either.
     var orders = try querymod.Table.open(&db, allocator, "orders");
     defer orders.deinit();
     try std.testing.expect((try orders.get(.{ .int = 1 })) == null);
     try std.testing.expect((try orders.get(.{ .int = 2 })) == null);
 }
 
-// `handleTxnOp` runs every entry through `TableTxn.put`/`TableTxn.delete`
-// (see txn_table.zig), which now enforce ON DELETE RESTRICT exactly like
-// CHECK/UNIQUE/FOREIGN KEY on put above - never separately wired for this
-// opcode either. The interesting case a plain `table_delete` test cannot
-// cover: both the child insert AND the restricted parent delete are only
-// staged within this ONE `txn_op` batch, never durable on their own -
-// `TableTxn.delete`'s RESTRICT check has to see the child through
-// `Transaction.scanPrefix`'s same-transaction visibility (see
-// txn_table.zig's own unit test for this), not a plain Db scan, or this
-// would wrongly let the delete through.
 test "server txn_op rejects an ON DELETE RESTRICT violation over the wire, seeing a child staged earlier in the same batch" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7615,7 +6893,6 @@ test "server txn_op rejects an ON DELETE RESTRICT violation over the wire, seein
     };
     try std.testing.expectError(client_mod.ClientError.ServerInternal, client.txnOp(&entries));
 
-    // Nothing committed: neither the staged order nor the rejected delete.
     var orders = try querymod.Table.open(&db, allocator, "orders");
     defer orders.deinit();
     try std.testing.expect((try orders.get(.{ .int = 100 })) == null);
@@ -7666,8 +6943,6 @@ test "server rejects a malformed txn_op frame with bad_request without crashing"
     const stream = try std.net.tcpConnectToAddress(server.boundAddress());
     defer stream.close();
 
-    // A u32 entry count of 1 promises one full entry, but the payload ends
-    // right after it - not even a verb byte follows.
     var payload: [4]u8 = undefined;
     std.mem.writeInt(u32, &payload, 1, .little);
     try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.txn_op), &payload);
@@ -7675,28 +6950,12 @@ test "server rejects a malformed txn_op frame with bad_request without crashing"
     defer frame.deinit();
     try std.testing.expectEqual(@intFromEnum(protocol.Status.bad_request), frame.tag);
 
-    // The connection must still be usable afterward - a malformed frame is
-    // a client mistake, not a fatal error for the server.
     try protocol.writeFrame(stream.writer(), @intFromEnum(protocol.Op.ping), "");
     var pingFrame = try protocol.readFrame(allocator, stream.reader());
     defer pingFrame.deinit();
     try std.testing.expectEqual(@intFromEnum(protocol.Status.ok), pingFrame.tag);
 }
 
-// Proves the `txn_op` code path (decode -> `Transaction`/`TableTxn` ->
-// index maintenance -> commit, all under `Server.dispatch`'s single
-// `self.mutex`) holds up under real concurrent OS threads each on their
-// own real TCP connection - the same rigor `coll_op`'s/`table_select`'s
-// own concurrency tests apply, but for the table+index layer instead of
-// the flat keyspace or the Redis-like collections, which is a genuinely
-// different code path (this is the first concurrency test to drive
-// `TableTxn`/index maintenance through a live socket at all;
-// `concurrent.zig`'s own `TableTxn` concurrency test bypasses the network
-// entirely via `GuardedDb`). Each worker writes into two disjoint rows per
-// round (its own row in `widgets`, indexed by `owner`, and a companion row
-// in `tags`) so a lost or duplicated write from bad interleaving would
-// show up as a wrong row count or a wrong index membership, not just a
-// wrong number.
 test "server txn_op survives many real concurrent connections writing disjoint rows across two tables" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7769,9 +7028,6 @@ test "server txn_op survives many real concurrent connections writing disjoint r
         const ownerTag = try std.fmt.bufPrint(&buf, "owner-{d}", .{t});
         const owned = try widgets.select(.{ .eq = .{ .field = "owner", .value = .{ .text = ownerTag } } });
         defer querymod.freeRows(allocator, owned);
-        // Every widget this thread wrote must show up under its own index
-        // entry, exactly `perThread` of them - not fewer (a lost write)
-        // and not more (a duplicated one).
         try std.testing.expectEqual(@as(usize, perThread), owned.len);
         total += owned.len;
     }
@@ -7878,9 +7134,6 @@ test "server publish to a channel with no subscribers returns 0 without crashing
     defer client.close();
 
     try std.testing.expectEqual(@as(u64, 0), try client.publish("nobody-home", "hello"));
-    // A no-receiver publish is not a mutation of anything - `ping` still
-    // works on the same connection right after, proving `publish` never
-    // left the connection or the server in some half-dispatched state.
     try client.ping();
 }
 
@@ -7927,9 +7180,6 @@ test "closing a subscriber's connection unregisters it - a later publish no long
     try std.testing.expectEqual(@as(usize, 1), server.pubsub.channelSubscriberCount("ch"));
     sub.close();
 
-    // The watcher thread's disconnect detection runs asynchronously - poll
-    // with a bounded timeout instead of a fixed sleep, the same style
-    // `drainConnections` already uses elsewhere in this file.
     const startedAt = std.time.nanoTimestamp();
     while (server.pubsub.channelSubscriberCount("ch") != 0) {
         if (std.time.nanoTimestamp() - startedAt > 2 * std.time.ns_per_s) break;
@@ -8001,16 +7251,10 @@ test "server unsubscribe over real TCP drops one channel while the other keeps f
     defer sub.close();
     const subId = try sub.subscribe(&.{ "orders", "alerts" });
 
-    // The subscribe connection itself never answers another request (see
-    // `handleSubscribe`'s doc comment) - unsubscribe always goes over its
-    // own, separate connection.
     var ctrl = try client_mod.Client.connect(allocator, server.boundAddress());
     defer ctrl.close();
     const removed = try ctrl.unsubscribe(subId, &.{"orders"});
     try std.testing.expectEqual(@as(u32, 1), removed);
-    // `ctrl` is an ordinary connection - it must still answer further
-    // requests normally after an unsubscribe, proving `handleUnsubscribe`
-    // returns like any other opcode rather than hijacking the connection.
     try ctrl.ping();
 
     var pub_ = try client_mod.Client.connect(allocator, server.boundAddress());
@@ -8048,8 +7292,6 @@ test "server unsubscribe from every remaining channel ends the subscription like
     defer ctrl.close();
     try std.testing.expectEqual(@as(u32, 1), try ctrl.unsubscribe(subId, &.{"ch"}));
 
-    // The push loop must notice the close exactly like a real disconnect -
-    // `nextMessage` returns `null`, never blocks forever or errors.
     try std.testing.expect((try sub.nextMessage(allocator)) == null);
 
     const startedAt = std.time.nanoTimestamp();
@@ -8080,8 +7322,6 @@ test "server rejects unsubscribe with an unknown subscriber id as bad_request" {
     defer client.close();
 
     try std.testing.expectError(client_mod.ClientError.ServerBadRequest, client.unsubscribe(999999, &.{"ch"}));
-    // A rejected unsubscribe must not leave the connection in some
-    // half-dispatched state - `ping` still works right after.
     try client.ping();
 }
 

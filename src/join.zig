@@ -7,11 +7,6 @@ const Row = rowmod.Row;
 const Table = querymod.Table;
 const Predicate = querymod.Predicate;
 
-/// One matched pair produced by `innerJoin`: the left table's row and the
-/// right table's row that satisfied `leftRow.get(leftField) ==
-/// rightRow.get(rightField)`. Kept as two separate owned Rows rather than
-/// merged into one flat namespace, so join output never has to invent a
-/// collision rule for a field name that happens to exist on both sides.
 pub const JoinedRow = struct {
     left: Row,
     right: Row,
@@ -27,35 +22,12 @@ pub fn freeJoined(allocator: Allocator, rows: []JoinedRow) void {
     allocator.free(rows);
 }
 
-/// Independent copy of `row` via its own encode/decode round trip, so a
-/// join result can outlive (and be freed separately from) the pooled
-/// `Table.select` slice it was matched out of - the same row can appear in
-/// more than one output pair on a one-to-many join.
 fn dupeRow(allocator: Allocator, row: *const Row) !Row {
     const buf = try row.encode(allocator);
     defer allocator.free(buf);
     return try Row.decode(allocator, buf);
 }
 
-/// Inner equi-join between `left` and `right` on
-/// `leftRow.get(leftField) == rightRow.get(rightField)` (compared with
-/// `row.compare`, so a mismatched type - e.g. an int on one side against a
-/// float on the other - never matches, exactly like `Predicate.eq`).
-/// `leftPred`/`rightPred` filter each side first, evaluated exactly like
-/// `Table.select` (including its own index usage). A row missing the join
-/// field entirely never matches anything, on either side.
-///
-/// Join strategy is chosen once, not per call site: if `right` already has
-/// a secondary index on `rightField`, this runs an index nested-loop join -
-/// one `right.select` per surviving left row, narrowed through that index
-/// exactly the way a plain `eq` query would be. Otherwise it builds an
-/// in-memory hash table over the (already `rightPred`-filtered) right rows
-/// keyed by the join value and probes it once per left row - a hash join,
-/// so an unindexed join over two large tables still costs
-/// O(leftRows + rightRows) rather than O(leftRows * rightRows).
-///
-/// Caller owns the returned slice and every `JoinedRow` in it; free with
-/// `freeJoined`.
 pub fn innerJoin(
     allocator: Allocator,
     left: *Table,
@@ -138,10 +110,6 @@ pub fn innerJoin(
     return results.toOwnedSlice();
 }
 
-/// One row produced by `leftOuterJoin`: every left row appears at least
-/// once, with `right` set to `null` when nothing on the right side matched
-/// (SQL LEFT OUTER JOIN semantics - the left side is never dropped, unlike
-/// `innerJoin` where an unmatched left row disappears entirely).
 pub const OuterJoinedRow = struct {
     left: Row,
     right: ?Row,
@@ -157,15 +125,6 @@ pub fn freeOuterJoined(allocator: Allocator, rows: []OuterJoinedRow) void {
     allocator.free(rows);
 }
 
-/// Left outer equi-join: same matching rules, strategy selection (index
-/// nested-loop vs. hash join) and predicate semantics as `innerJoin`, but a
-/// left row with zero matches on the right (missing join field, filtered
-/// out by `rightPred`, or genuinely no equal value on the right) still
-/// produces exactly one `OuterJoinedRow` with `right = null` instead of
-/// vanishing from the output.
-///
-/// Caller owns the returned slice and every `OuterJoinedRow` in it; free
-/// with `freeOuterJoined`.
 pub fn leftOuterJoin(
     allocator: Allocator,
     left: *Table,
@@ -269,10 +228,6 @@ pub fn leftOuterJoin(
     return results.toOwnedSlice();
 }
 
-/// One row produced by `rightOuterJoin`: every right row appears at least
-/// once, with `left` set to `null` when nothing on the left side matched
-/// (SQL RIGHT OUTER JOIN semantics - the mirror image of `OuterJoinedRow`,
-/// where it is the right side that is optional).
 pub const RightOuterJoinedRow = struct {
     left: ?Row,
     right: Row,
@@ -288,19 +243,6 @@ pub fn freeRightOuterJoined(allocator: Allocator, rows: []RightOuterJoinedRow) v
     allocator.free(rows);
 }
 
-/// Right outer equi-join: same matching rules and predicate semantics as
-/// `innerJoin`/`leftOuterJoin`, but every `right` row appears at least once,
-/// with `left = null` when nothing on the left side matched.
-///
-/// Implemented by delegating to `leftOuterJoin` with the two sides swapped
-/// and remapping the result, rather than re-deriving the index/hash-join
-/// strategy selection a third time - `leftOuterJoin(right, ..., left, ...)`
-/// already produces exactly "every row of `right`, paired with an optional
-/// match from `left`", which is right outer join semantics with the two
-/// output fields named the other way round.
-///
-/// Caller owns the returned slice and every `RightOuterJoinedRow` in it;
-/// free with `freeRightOuterJoined`.
 pub fn rightOuterJoin(
     allocator: Allocator,
     left: *Table,
@@ -320,10 +262,6 @@ pub fn rightOuterJoin(
     return results;
 }
 
-/// One row produced by `fullOuterJoin`: both `left` and `right` are
-/// optional, and every row from either side that never matched on the other
-/// still appears exactly once (SQL FULL OUTER JOIN semantics - the union of
-/// what `leftOuterJoin` and `rightOuterJoin` each produce).
 pub const FullOuterJoinedRow = struct {
     left: ?Row,
     right: ?Row,
@@ -339,17 +277,6 @@ pub fn freeFullOuterJoined(allocator: Allocator, rows: []FullOuterJoinedRow) voi
     allocator.free(rows);
 }
 
-/// Full outer equi-join: the union of `leftOuterJoin` (every left row,
-/// matched or not) and every right row `rightOuterJoin` reports as
-/// unmatched (`left == null`) - those are exactly the right-side rows a
-/// plain left outer join would never produce. Built from the two existing
-/// outer joins rather than a third independent matching pass, at the
-/// honest cost of computing the match twice (once per direction) - the
-/// same "correctness over a second matching pass" tradeoff already used by
-/// `rank`/`rangeByRank` in collections.zig.
-///
-/// Caller owns the returned slice and every `FullOuterJoinedRow` in it;
-/// free with `freeFullOuterJoined`.
 pub fn fullOuterJoin(
     allocator: Allocator,
     left: *Table,
@@ -396,23 +323,6 @@ pub fn fullOuterJoin(
     return results.toOwnedSlice();
 }
 
-/// Trims one of the four join result slices above to a `query.zig` `Page`
-/// window (0 = unlimited, the same convention `Table.selectPage` uses) -
-/// the join counterpart of pagination for `table_join`/`remote-join`.
-/// Unlike `Table.selectPage`, which narrows an index scan and can stop
-/// before materializing a row past the limit, a join has already had to
-/// produce a full pair to know it matched at all, so there is no cheaper
-/// way to honor `offset`/`limit` than windowing the already-complete
-/// result - this always runs after `innerJoin`/`leftOuterJoin`/
-/// `rightOuterJoin`/`fullOuterJoin` returns, never instead of it.
-///
-/// Takes ownership of `rows`: frees the backing slice, `.deinit()`s every
-/// pair that falls outside `[offset, offset+limit)`, and returns a freshly
-/// allocated slice holding only the kept pairs in their original order.
-/// Callers own the returned slice and the pairs in it exactly as they
-/// would have owned `rows` - free the pairs, then `allocator.free` the
-/// slice (or hand ownership onward, as `server.zig`'s `table_join` handler
-/// does by moving each kept pair into a `protocol.JoinPair`).
 pub fn applyPage(comptime T: type, allocator: Allocator, rows: []T, page: querymod.Page) ![]T {
     const total = rows.len;
     const start = @min(page.offset, total);
@@ -457,7 +367,7 @@ test "innerJoin: unindexed hash join matches on equal field value" {
     try orders.put(.{ .int = 100 }, &.{ .{ .name = "customer_id", .value = .{ .int = 1 } }, .{ .name = "item", .value = .{ .text = "widget" } } });
     try orders.put(.{ .int = 101 }, &.{ .{ .name = "customer_id", .value = .{ .int = 1 } }, .{ .name = "item", .value = .{ .text = "gadget" } } });
     try orders.put(.{ .int = 102 }, &.{ .{ .name = "customer_id", .value = .{ .int = 2 } }, .{ .name = "item", .value = .{ .text = "gizmo" } } });
-    try orders.put(.{ .int = 103 }, &.{.{ .name = "customer_id", .value = .{ .int = 999 } }}); // no matching customer
+    try orders.put(.{ .int = 103 }, &.{.{ .name = "customer_id", .value = .{ .int = 999 } }});
 
     const joined = try innerJoin(testing.allocator, &customers, "__pk", null, &orders, "customer_id", null);
     defer freeJoined(testing.allocator, joined);
@@ -476,7 +386,7 @@ test "innerJoin: unindexed hash join matches on equal field value" {
             seenBob = true;
             try testing.expectEqualStrings("gizmo", item);
         } else {
-            try testing.expect(false); // unreachable: only alice/bob should ever match
+            try testing.expect(false);
         }
     }
     try testing.expect(aliceItems.contains("widget"));
@@ -608,7 +518,7 @@ test "innerJoin: rows missing the join field on either side never match" {
 
     var left = try Table.open(&db, testing.allocator, "left");
     defer left.deinit();
-    try left.put(.{ .int = 1 }, &.{}); // no "k" field at all
+    try left.put(.{ .int = 1 }, &.{});
     try left.put(.{ .int = 2 }, &.{.{ .name = "k", .value = .{ .int = 7 } }});
 
     var right = try Table.open(&db, testing.allocator, "right");
@@ -676,7 +586,7 @@ test "leftOuterJoin: unmatched left row survives with right=null instead of vani
     var customers = try Table.open(&db, testing.allocator, "customers");
     defer customers.deinit();
     try customers.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "alice" } }});
-    try customers.put(.{ .int = 2 }, &.{.{ .name = "name", .value = .{ .text = "bob" } }}); // never ordered
+    try customers.put(.{ .int = 2 }, &.{.{ .name = "name", .value = .{ .text = "bob" } }});
 
     var orders = try Table.open(&db, testing.allocator, "orders");
     defer orders.deinit();
@@ -711,7 +621,7 @@ test "leftOuterJoin: index nested-loop join produces identical results to hash j
     var customers = try Table.open(&db, testing.allocator, "customers");
     defer customers.deinit();
     try customers.put(.{ .int = 1 }, &.{});
-    try customers.put(.{ .int = 2 }, &.{}); // no matching order either way
+    try customers.put(.{ .int = 2 }, &.{});
 
     var orders = try Table.open(&db, testing.allocator, "orders");
     defer orders.deinit();
@@ -724,7 +634,6 @@ test "leftOuterJoin: index nested-loop join produces identical results to hash j
     const joined = try leftOuterJoin(testing.allocator, &customers, "__pk", null, &orders, "customer_id", null);
     defer freeOuterJoined(testing.allocator, joined);
 
-    // customer 1 matches twice, customer 2 matches zero times but still appears once.
     try testing.expectEqual(@as(usize, 3), joined.len);
     var unmatchedCount: usize = 0;
     for (joined) |pair| {
@@ -763,7 +672,7 @@ test "leftOuterJoin: left row missing the join field entirely still appears once
 
     var left = try Table.open(&db, testing.allocator, "left");
     defer left.deinit();
-    try left.put(.{ .int = 1 }, &.{}); // no "k" field at all
+    try left.put(.{ .int = 1 }, &.{});
     try left.put(.{ .int = 2 }, &.{.{ .name = "k", .value = .{ .int = 7 } }});
 
     var right = try Table.open(&db, testing.allocator, "right");
@@ -845,7 +754,7 @@ test "rightOuterJoin: unmatched right row survives with left=null instead of van
     var orders = try Table.open(&db, testing.allocator, "orders");
     defer orders.deinit();
     try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
-    try orders.put(.{ .int = 101 }, &.{.{ .name = "customer_id", .value = .{ .int = 999 } }}); // no matching customer
+    try orders.put(.{ .int = 101 }, &.{.{ .name = "customer_id", .value = .{ .int = 999 } }});
 
     const joined = try rightOuterJoin(testing.allocator, &customers, "__pk", null, &orders, "customer_id", null);
     defer freeRightOuterJoined(testing.allocator, joined);
@@ -882,7 +791,7 @@ test "rightOuterJoin: index nested-loop join (index on left table) matches hash 
     var orders = try Table.open(&db, testing.allocator, "orders");
     defer orders.deinit();
     try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
-    try orders.put(.{ .int = 101 }, &.{.{ .name = "customer_id", .value = .{ .int = 2 } }}); // unmatched
+    try orders.put(.{ .int = 101 }, &.{.{ .name = "customer_id", .value = .{ .int = 2 } }});
 
     const joined = try rightOuterJoin(testing.allocator, &customers, "__pk", null, &orders, "customer_id", null);
     defer freeRightOuterJoined(testing.allocator, joined);
@@ -974,18 +883,17 @@ test "fullOuterJoin: rows unmatched on either side survive, matched pairs appear
 
     var customers = try Table.open(&db, testing.allocator, "customers");
     defer customers.deinit();
-    try customers.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "alice" } }}); // matches
-    try customers.put(.{ .int = 2 }, &.{.{ .name = "name", .value = .{ .text = "bob" } }}); // never ordered
+    try customers.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "alice" } }});
+    try customers.put(.{ .int = 2 }, &.{.{ .name = "name", .value = .{ .text = "bob" } }});
 
     var orders = try Table.open(&db, testing.allocator, "orders");
     defer orders.deinit();
     try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
-    try orders.put(.{ .int = 101 }, &.{.{ .name = "customer_id", .value = .{ .int = 999 } }}); // orphan order
+    try orders.put(.{ .int = 101 }, &.{.{ .name = "customer_id", .value = .{ .int = 999 } }});
 
     const joined = try fullOuterJoin(testing.allocator, &customers, "__pk", null, &orders, "customer_id", null);
     defer freeFullOuterJoined(testing.allocator, joined);
 
-    // alice+order100 (matched), bob+null (left-only), null+order101 (right-only).
     try testing.expectEqual(@as(usize, 3), joined.len);
     var sawMatched = false;
     var sawLeftOnly = false;
@@ -1001,7 +909,7 @@ test "fullOuterJoin: rows unmatched on either side survive, matched pairs appear
             try testing.expectEqual(@as(i64, 999), pair.right.?.get("customer_id").?.int);
             sawRightOnly = true;
         } else {
-            try testing.expect(false); // unreachable: both sides null never happens
+            try testing.expect(false);
         }
     }
     try testing.expect(sawMatched);
@@ -1138,21 +1046,9 @@ test "applyPage propagates OutOfMemory from its own result allocation without le
     var db = try openTestDb(&tmp);
     defer db.close();
 
-    // `joined` itself is built with the real `testing.allocator` - every
-    // `Row` inside stores that same allocator (see `row.zig`'s `Row.init`),
-    // so `applyPage`'s error path frees each one through it regardless of
-    // which allocator `applyPage` was asked to allocate its OWN result
-    // slice with below. Isolates the OOM path to exactly one call site:
-    // the `allocator.alloc(T, kept)` in `applyPage` itself, not the join
-    // that already succeeded.
     const joined = try openFourPairJoin(&tmp, &db);
     try testing.expectEqual(@as(usize, 4), joined.len);
 
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     try testing.expectError(error.OutOfMemory, applyPage(JoinedRow, failing.allocator(), joined, .{ .offset = 1, .limit = 2 }));
-    // No explicit assertion beyond this: `testing.allocator`'s leak
-    // detector at process exit is the real check - every one of the 4
-    // `JoinedRow`s (2 kept by the window, 2 trimmed outside it) must have
-    // been `.deinit()`-ed on the error path in `applyPage`, and the
-    // `rows` backing slice itself freed, or this test fails on leak.
 }

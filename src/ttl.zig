@@ -1,23 +1,13 @@
 const std = @import("std");
 const dbmod = @import("db.zig");
+const txnmod = @import("txn.zig");
 
 const Allocator = std.mem.Allocator;
 const Db = dbmod.Db;
+const WriteBatch = dbmod.WriteBatch;
+const Transaction = txnmod.Transaction;
 
-/// Per-key expiry markers layered over the flat KV keyspace, sharing one Db
-/// with tables/collections/auth (row.zig/index.zig use 'R'/'I'/'J'/'M',
-/// collections.zig uses 'X', auth.zig uses 'A'; every key here starts with
-/// 'T' so none of the namespaces collide):
-///   "T" <key>  -> raw i128 (expiresAtNanos, big-endian)
-/// The marker lives in the SAME Db as the key it guards (same WAL, same
-/// flush/compaction lifecycle, same crash-durability boundary) but expiry
-/// is enforced lazily: nothing here runs a background clock itself. A
-/// caller must present nowNanos, either on every read (expireIfDue/getLive)
-/// or through an explicit sweep (sweepExpired) - matching how session.zig's
-/// SessionStore already treats "now" as an input rather than ambient state
-/// (and uses the same i128 type std.time.nanoTimestamp() returns), so both
-/// are trivially testable without sleeping in unit tests.
-pub const nsTag: u8 = 'T';
+pub const nsTag: u8 = 0xFC;
 
 pub const secondNanos: i128 = 1_000_000_000;
 
@@ -39,10 +29,6 @@ fn readI128(data: []const u8) !i128 {
     return std.mem.readInt(i128, data[0..16], .big);
 }
 
-/// Sets (or replaces) an absolute expiry deadline on `key`. Does not verify
-/// `key` currently exists in the main keyspace - callers that need
-/// existence-checked semantics (the CLI `expire` command) check db.get
-/// first, same as Redis distinguishes EXPIRE from the looser PEXPIREAT.
 pub fn setExpireAt(db: *Db, allocator: Allocator, key: []const u8, expiresAtNanos: i128) !void {
     const k = try markerKey(allocator, key);
     defer allocator.free(k);
@@ -74,10 +60,6 @@ pub fn isDue(expiresAtNanos: i128, nowNanos: i128) bool {
     return nowNanos >= expiresAtNanos;
 }
 
-/// Redis TTL(2) semantics for the CLI: `.noKey` mirrors return -2 (the key
-/// itself is absent), `.noExpiry` mirrors -1 (it exists but carries no
-/// expiry), `.seconds` is the whole seconds left, floored at 0 so a marker
-/// that is due but not yet reaped never reports a negative remainder.
 pub const TtlResult = union(enum) {
     noKey,
     noExpiry,
@@ -88,42 +70,166 @@ pub fn remaining(db: *Db, allocator: Allocator, key: []const u8, nowNanos: i128)
     const existing = try db.get(allocator, key) orelse return .noKey;
     allocator.free(existing);
     const expiresAt = try getExpiresAt(db, allocator, key) orelse return .noExpiry;
-    if (nowNanos >= expiresAt) return .{ .seconds = 0 };
+    if (isDue(expiresAt, nowNanos)) return .noKey;
     return .{ .seconds = @intCast(@divFloor(expiresAt - nowNanos, secondNanos)) };
 }
 
-/// Lazily enforces expiry on read: if `key` carries a due marker, deletes
-/// both the marker and the underlying key (a real delete through the normal
-/// WAL/tombstone path, not just "pretend it's gone") and reports true.
-pub fn expireIfDue(db: *Db, allocator: Allocator, key: []const u8, nowNanos: i128) !bool {
+pub fn expireLive(db: *Db, allocator: Allocator, key: []const u8, nowNanos: i128, seconds: u64) !bool {
+    const existing = try getLive(db, allocator, key, nowNanos) orelse return false;
+    allocator.free(existing);
+    try setExpireSeconds(db, allocator, key, nowNanos, seconds);
+    return true;
+}
+
+pub fn isExpired(db: *Db, allocator: Allocator, key: []const u8, nowNanos: i128) !bool {
     const expiresAt = try getExpiresAt(db, allocator, key) orelse return false;
-    if (!isDue(expiresAt, nowNanos)) return false;
+    return isDue(expiresAt, nowNanos);
+}
+
+pub fn expireIfDue(db: *Db, allocator: Allocator, key: []const u8, nowNanos: i128) !bool {
+    if (!try isExpired(db, allocator, key, nowNanos)) return false;
     try db.delete(key);
     try clearExpire(db, allocator, key);
     return true;
 }
 
-/// db.get with lazy expiry applied first - the read-path counterpart of
-/// putWithTtl, so a caller never observes a logically-expired value just
-/// because no sweep has run yet.
+pub fn LiveIterator(comptime Inner: type) type {
+    return struct {
+        inner: Inner,
+        db: *Db,
+        allocator: Allocator,
+        nowNanos: i128,
+
+        const Self = @This();
+
+        pub fn next(self: *Self) !?dbmod.Entry {
+            while (try self.inner.next()) |entry| {
+                if (!try isExpired(self.db, self.allocator, entry.key, self.nowNanos)) return entry;
+            }
+            return null;
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.inner.deinit();
+        }
+    };
+}
+
+pub fn liveOnly(db: *Db, allocator: Allocator, inner: anytype, nowNanos: i128) LiveIterator(@TypeOf(inner)) {
+    return .{ .inner = inner, .db = db, .allocator = allocator, .nowNanos = nowNanos };
+}
+
 pub fn getLive(db: *Db, allocator: Allocator, key: []const u8, nowNanos: i128) !?[]u8 {
     _ = try expireIfDue(db, allocator, key, nowNanos);
     return db.get(allocator, key);
 }
 
 pub fn putWithTtl(db: *Db, allocator: Allocator, key: []const u8, value: []const u8, nowNanos: i128, seconds: u64) !void {
-    try db.put(key, value);
-    try setExpireSeconds(db, allocator, key, nowNanos, seconds);
+    const k = try markerKey(allocator, key);
+    defer allocator.free(k);
+    var out = std.ArrayList(u8).init(allocator);
+    defer out.deinit();
+    try putI128(&out, nowNanos + @as(i128, @intCast(seconds)) * secondNanos);
+    var wb = WriteBatch.init(allocator);
+    defer wb.deinit();
+    try wb.put(key, value);
+    try wb.put(k, out.items);
+    try db.apply(&wb);
 }
 
-/// Active sweep: scans every marker under the 'T' namespace and reaps every
-/// one that is due, deleting both the underlying key and its marker.
-/// Returns the number reaped. Two passes on purpose - a RangeIterator's
-/// merge heap holds live cursor positions directly into the memtable being
-/// walked (only the Entry it hands back through next() is arena-copied),
-/// so issuing db.delete mid-scan would mutate the very structure the
-/// iterator's cursors are threaded through. Collect the due keys first,
-/// mutate only after the iterator (and its cursors) are closed.
+pub fn stagePersistentPut(db: *Db, allocator: Allocator, wb: *WriteBatch, key: []const u8, value: []const u8) !void {
+    try wb.put(key, value);
+    const k = try markerKey(allocator, key);
+    defer allocator.free(k);
+    const marker = try db.get(allocator, k) orelse return;
+    allocator.free(marker);
+    try wb.delete(k);
+}
+
+pub fn putPersistent(db: *Db, allocator: Allocator, key: []const u8, value: []const u8) !void {
+    var wb = WriteBatch.init(allocator);
+    defer wb.deinit();
+    try stagePersistentPut(db, allocator, &wb, key, value);
+    if (wb.count() == 1) return db.put(key, value);
+    try db.apply(&wb);
+}
+
+pub fn stagePersistentPutInTxn(txn: *Transaction, allocator: Allocator, key: []const u8, value: []const u8) !void {
+    try txn.put(key, value);
+    const k = try markerKey(allocator, key);
+    defer allocator.free(k);
+    const marker = try txn.get(allocator, k) orelse return;
+    allocator.free(marker);
+    try txn.delete(k);
+}
+
+pub fn isExpiredInTxn(txn: *Transaction, allocator: Allocator, key: []const u8, nowNanos: i128) !bool {
+    const k = try markerKey(allocator, key);
+    defer allocator.free(k);
+    const raw = try txn.get(allocator, k) orelse return false;
+    defer allocator.free(raw);
+    return isDue(try readI128(raw), nowNanos);
+}
+
+pub fn expireLiveInTxn(txn: *Transaction, allocator: Allocator, key: []const u8, nowNanos: i128, seconds: u64) !bool {
+    const existing = try txn.get(allocator, key) orelse return false;
+    allocator.free(existing);
+    if (try isExpiredInTxn(txn, allocator, key, nowNanos)) return false;
+    const k = try markerKey(allocator, key);
+    defer allocator.free(k);
+    var out = std.ArrayList(u8).init(allocator);
+    defer out.deinit();
+    try putI128(&out, nowNanos + @as(i128, @intCast(seconds)) * secondNanos);
+    try txn.put(k, out.items);
+    return true;
+}
+
+pub fn clearExpireInTxn(txn: *Transaction, allocator: Allocator, key: []const u8) !void {
+    const k = try markerKey(allocator, key);
+    defer allocator.free(k);
+    const marker = try txn.get(allocator, k) orelse return;
+    allocator.free(marker);
+    try txn.delete(k);
+}
+
+pub fn remainingInTxn(txn: *Transaction, allocator: Allocator, key: []const u8, nowNanos: i128) !TtlResult {
+    const existing = try txn.get(allocator, key) orelse return .noKey;
+    allocator.free(existing);
+    const k = try markerKey(allocator, key);
+    defer allocator.free(k);
+    const raw = try txn.get(allocator, k) orelse return .noExpiry;
+    defer allocator.free(raw);
+    const expiresAt = try readI128(raw);
+    if (isDue(expiresAt, nowNanos)) return .noKey;
+    return .{ .seconds = @intCast(@divFloor(expiresAt - nowNanos, secondNanos)) };
+}
+
+pub fn stageDelete(db: *Db, allocator: Allocator, wb: *WriteBatch, key: []const u8) !void {
+    try wb.delete(key);
+    const k = try markerKey(allocator, key);
+    defer allocator.free(k);
+    const marker = try db.get(allocator, k) orelse return;
+    allocator.free(marker);
+    try wb.delete(k);
+}
+
+pub fn deleteKey(db: *Db, allocator: Allocator, key: []const u8) !void {
+    var wb = WriteBatch.init(allocator);
+    defer wb.deinit();
+    try stageDelete(db, allocator, &wb, key);
+    if (wb.count() == 1) return db.delete(key);
+    try db.apply(&wb);
+}
+
+pub fn stageDeleteInTxn(txn: *Transaction, allocator: Allocator, key: []const u8) !void {
+    try txn.delete(key);
+    const k = try markerKey(allocator, key);
+    defer allocator.free(k);
+    const marker = try txn.get(allocator, k) orelse return;
+    allocator.free(marker);
+    try txn.delete(k);
+}
+
 pub fn sweepExpired(db: *Db, allocator: Allocator, nowNanos: i128) !usize {
     var due = std.ArrayList([]u8).init(allocator);
     defer {
@@ -206,8 +312,6 @@ test "getLive lazily expires exactly at the deadline" {
     try std.testing.expectEqualStrings("hot", before);
 
     try std.testing.expectEqual(@as(?[]u8, null), try getLive(&db, allocator, "cache:x", 2 * secondNanos));
-    // A plain db.get after the lazy expiry proves the delete was real, not
-    // getLive-only bookkeeping - the tombstone is now the source of truth.
     try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "cache:x"));
 }
 
@@ -253,7 +357,6 @@ test "sweepExpired reaps every due key without touching live or unrelated keys" 
     defer allocator.free(d);
     try std.testing.expectEqualStrings("forever", d);
 
-    // Idempotent: a second sweep at the same instant finds nothing left.
     try std.testing.expectEqual(@as(usize, 0), try sweepExpired(&db, allocator, 2 * secondNanos));
 }
 
@@ -278,8 +381,6 @@ test "sweep survives a wal reopen: markers are durable, not in-memory bookkeepin
 }
 
 test "setExpireAt on a nonexistent key is a real marker, not silently rejected" {
-    // Documents the PEXPIREAT-like looseness of setExpireAt directly (the
-    // CLI layer is what adds the Redis EXPIRE existence check on top).
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -290,4 +391,218 @@ test "setExpireAt on a nonexistent key is a real marker, not silently rejected" 
     try std.testing.expectEqual(TtlResult.noKey, try remaining(&db, allocator, "ghost", 0));
     const expiresAt = (try getExpiresAt(&db, allocator, "ghost")).?;
     try std.testing.expectEqual(@as(i128, 10 * secondNanos), expiresAt);
+}
+
+test "remaining reports noKey for a key past its deadline that was not swept yet" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try putWithTtl(&db, allocator, "cache:y", "v", 0, 2);
+    try std.testing.expectEqual(@as(u64, 1), (try remaining(&db, allocator, "cache:y", 1 * secondNanos)).seconds);
+    try std.testing.expectEqual(TtlResult.noKey, try remaining(&db, allocator, "cache:y", 2 * secondNanos));
+    try std.testing.expectEqual(TtlResult.noKey, try remaining(&db, allocator, "cache:y", 9 * secondNanos));
+    const unswept = (try db.get(allocator, "cache:y")).?;
+    allocator.free(unswept);
+}
+
+test "putPersistent over an expired, unswept key stores the new value without a ttl" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try putWithTtl(&db, allocator, "session:2", "old", 0, 1);
+    try putPersistent(&db, allocator, "session:2", "new");
+
+    try std.testing.expectEqual(@as(?i128, null), try getExpiresAt(&db, allocator, "session:2"));
+    try std.testing.expectEqual(TtlResult.noExpiry, try remaining(&db, allocator, "session:2", 5 * secondNanos));
+    const v = (try getLive(&db, allocator, "session:2", 5 * secondNanos)).?;
+    defer allocator.free(v);
+    try std.testing.expectEqualStrings("new", v);
+    try std.testing.expectEqual(@as(usize, 0), try sweepExpired(&db, allocator, 5 * secondNanos));
+}
+
+test "putPersistent drops a live ttl in the same wal batch as the write" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try openTemp(&tmp, allocator);
+        defer db.close();
+        try putWithTtl(&db, allocator, "k", "old", 0, 100);
+        try putPersistent(&db, allocator, "k", "new");
+        const k = try markerKey(allocator, "k");
+        defer allocator.free(k);
+        try std.testing.expectEqual(db.latestSeq("k").? + 1, db.latestSeq(k).?);
+    }
+
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    try std.testing.expectEqual(TtlResult.noExpiry, try remaining(&db, allocator, "k", 200 * secondNanos));
+    const v = (try getLive(&db, allocator, "k", 200 * secondNanos)).?;
+    defer allocator.free(v);
+    try std.testing.expectEqualStrings("new", v);
+}
+
+test "putPersistent on a key without a ttl writes no marker tombstone" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try putPersistent(&db, allocator, "plain", "v");
+    const k = try markerKey(allocator, "plain");
+    defer allocator.free(k);
+    try std.testing.expectEqual(@as(?u64, null), db.latestSeq(k));
+}
+
+test "stagePersistentPut clears ttls of batched keys together with the batch" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try putWithTtl(&db, allocator, "a", "old", 0, 1);
+    try putWithTtl(&db, allocator, "b", "keep", 0, 1);
+
+    var wb = WriteBatch.init(allocator);
+    defer wb.deinit();
+    try stagePersistentPut(&db, allocator, &wb, "a", "new");
+    try stagePersistentPut(&db, allocator, &wb, "c", "fresh");
+    try std.testing.expectEqual(@as(usize, 3), wb.count());
+    try db.apply(&wb);
+
+    const a = (try getLive(&db, allocator, "a", 5 * secondNanos)).?;
+    defer allocator.free(a);
+    try std.testing.expectEqualStrings("new", a);
+    const c = (try getLive(&db, allocator, "c", 5 * secondNanos)).?;
+    defer allocator.free(c);
+    try std.testing.expectEqualStrings("fresh", c);
+    try std.testing.expectEqual(@as(?[]u8, null), try getLive(&db, allocator, "b", 5 * secondNanos));
+}
+
+test "stagePersistentPutInTxn makes the staged value live inside the txn and after commit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try putWithTtl(&db, allocator, "t", "old", 0, 1);
+
+    var txn = Transaction.begin(&db);
+    defer txn.deinit();
+    try std.testing.expect(try isExpiredInTxn(&txn, allocator, "t", 5 * secondNanos));
+    try stagePersistentPutInTxn(&txn, allocator, "t", "new");
+    try std.testing.expect(!try isExpiredInTxn(&txn, allocator, "t", 5 * secondNanos));
+    try std.testing.expect(try isExpired(&db, allocator, "t", 5 * secondNanos));
+    try txn.commit();
+
+    try std.testing.expectEqual(@as(?i128, null), try getExpiresAt(&db, allocator, "t"));
+    const v = (try getLive(&db, allocator, "t", 5 * secondNanos)).?;
+    defer allocator.free(v);
+    try std.testing.expectEqualStrings("new", v);
+}
+
+test "expireLive refuses an expired, unswept key and reaps it instead of reviving it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try putWithTtl(&db, allocator, "dead", "v", 0, 1);
+    try std.testing.expect(!try expireLive(&db, allocator, "dead", 5 * secondNanos, 100));
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "dead"));
+    try std.testing.expectEqual(@as(?i128, null), try getExpiresAt(&db, allocator, "dead"));
+    try std.testing.expectEqual(TtlResult.noKey, try remaining(&db, allocator, "dead", 6 * secondNanos));
+
+    try std.testing.expect(!try expireLive(&db, allocator, "missing", 0, 100));
+    try std.testing.expectEqual(@as(?i128, null), try getExpiresAt(&db, allocator, "missing"));
+
+    try db.put("alive", "v");
+    try std.testing.expect(try expireLive(&db, allocator, "alive", 0, 100));
+    try std.testing.expectEqual(@as(u64, 100), (try remaining(&db, allocator, "alive", 0)).seconds);
+}
+
+test "deleteKey drops a live ttl in the same wal batch as the delete" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try openTemp(&tmp, allocator);
+        defer db.close();
+        try putWithTtl(&db, allocator, "k", "v", 0, 100);
+        try deleteKey(&db, allocator, "k");
+        const k = try markerKey(allocator, "k");
+        defer allocator.free(k);
+        try std.testing.expectEqual(db.latestSeq("k").? + 1, db.latestSeq(k).?);
+    }
+
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "k"));
+    try std.testing.expectEqual(@as(?i128, null), try getExpiresAt(&db, allocator, "k"));
+}
+
+test "stageDelete adds the marker delete only for keys that have a ttl" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try putWithTtl(&db, allocator, "timed", "v", 0, 100);
+    try db.put("plain", "v");
+
+    var wb = WriteBatch.init(allocator);
+    defer wb.deinit();
+    try stageDelete(&db, allocator, &wb, "timed");
+    try stageDelete(&db, allocator, &wb, "plain");
+    try std.testing.expectEqual(@as(usize, 3), wb.count());
+    try db.apply(&wb);
+
+    try std.testing.expectEqual(@as(?i128, null), try getExpiresAt(&db, allocator, "timed"));
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "plain"));
+    const k = try markerKey(allocator, "plain");
+    defer allocator.free(k);
+    try std.testing.expectEqual(@as(?u64, null), db.latestSeq(k));
+}
+
+test "stageDeleteInTxn and expireLiveInTxn only touch the ttl marker on commit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+
+    try putWithTtl(&db, allocator, "gone", "v", 0, 100);
+    try putWithTtl(&db, allocator, "dead", "v", 0, 1);
+    try db.put("alive", "v");
+
+    var txn = Transaction.begin(&db);
+    defer txn.deinit();
+    try stageDeleteInTxn(&txn, allocator, "gone");
+    try std.testing.expect(try expireLiveInTxn(&txn, allocator, "alive", 0, 50));
+    try std.testing.expect(!try expireLiveInTxn(&txn, allocator, "gone", 0, 50));
+    try std.testing.expect(!try expireLiveInTxn(&txn, allocator, "dead", 5 * secondNanos, 50));
+    try std.testing.expect(!try expireLiveInTxn(&txn, allocator, "missing", 0, 50));
+
+    try std.testing.expectEqual(@as(?i128, 100 * secondNanos), try getExpiresAt(&db, allocator, "gone"));
+    try std.testing.expectEqual(@as(?i128, null), try getExpiresAt(&db, allocator, "alive"));
+    try std.testing.expectEqual(@as(?i128, 1 * secondNanos), try getExpiresAt(&db, allocator, "dead"));
+    try txn.commit();
+
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "gone"));
+    try std.testing.expectEqual(@as(?i128, null), try getExpiresAt(&db, allocator, "gone"));
+    try std.testing.expectEqual(@as(u64, 50), (try remaining(&db, allocator, "alive", 0)).seconds);
+    try std.testing.expectEqual(@as(?i128, null), try getExpiresAt(&db, allocator, "missing"));
 }

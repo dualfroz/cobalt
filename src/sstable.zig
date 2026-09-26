@@ -29,12 +29,6 @@ const footerLen = 4 + 4 + 8 + 4 + 8 + 4 + 8 + 8;
 const recordHeader = 1 + 8 + 4 + 4;
 const defaultBlockTarget = 4096;
 
-/// Every Nth record in a data block is a "restart point": stored with its
-/// full key (shared == 0) instead of a shared-prefix delta against the
-/// previous key. This bounds how many deltas must be re-applied to recover
-/// any one key (never more than `restartInterval - 1`) and, more
-/// importantly here, gives block expansion a cheap, structural corruption
-/// check: a real restart offset must always land on a shared == 0 record.
 const restartInterval: usize = 16;
 
 fn commonPrefixLen(a: []const u8, b: []const u8) usize {
@@ -125,10 +119,6 @@ pub const Builder = struct {
     fn flushBlock(self: *Builder) !void {
         if (self.blockBuf.items.len == 0) return;
 
-        // The restart-offset trailer rides inside the same logical block
-        // bytes as the records themselves, so it survives compression and
-        // is immediately available to `expandBlock` on the read side
-        // without a separate on-disk section or footer entry.
         const trailerWriter = encode.ByteWriter.init(&self.blockBuf);
         for (self.blockRestarts.items) |restartOffset| try trailerWriter.putU32(restartOffset);
         try trailerWriter.putU32(@intCast(self.blockRestarts.items.len));
@@ -206,12 +196,6 @@ const IndexEntry = struct {
     offset: u64,
     blockLen: u32,
     firstKey: []const u8,
-    // Offsets (relative to this block's own bytes, i.e. usable directly
-    // against the slice `blockBytes()` returns) of every restart record in
-    // the flattened block, in ascending order. restarts[0] is always 0.
-    // Lets point lookups binary-search straight to the <= restartInterval
-    // records that could hold the key instead of linear-scanning the whole
-    // block from position 0.
     restarts: []u32,
 };
 
@@ -469,14 +453,6 @@ pub const Reader = struct {
         return ans;
     }
 
-    /// Binary-searches `restarts` (each entry the flat-block offset of a
-    /// restart record, ascending by key since keys are sorted within a
-    /// block) for the rightmost restart whose key is <= `key`, and returns
-    /// its offset. Callers then linear-scan forward from there instead of
-    /// from position 0, bounding the scan to at most `restartInterval`
-    /// records regardless of how many records the block holds. Returns 0
-    /// (restarts[0], always the block's first record) when `key` sorts
-    /// before every restart.
     fn seekInBlock(block: []const u8, restarts: []const u32, key: []const u8) usize {
         if (restarts.len == 0) return 0;
         var lo: usize = 0;
@@ -614,34 +590,9 @@ const Decoded = struct {
 
 const ExpandedBlock = struct {
     bytes: []u8,
-    // Flat-block offsets (into `bytes`) of every restart record, ascending.
-    // Consumed by `Reader.seekInBlock` for binary-search point lookups.
     restarts: []u32,
 };
 
-/// Reconstructs a physical block (prefix-compressed records plus its
-/// restart-offset trailer, as written by `Builder`) back into the flat
-/// every-record-carries-its-full-key layout that `decodeRecord` and every
-/// cursor in this file expect. Expansion happens once, right after
-/// decompression in `Reader.open`, so `dataBuf`/the block cache keep
-/// storing fully materialized blocks and the rest of the reader never has
-/// to know keys were delta-encoded on disk - in particular this preserves
-/// the invariant `db.zig`'s k-way merge relies on, that a cursor's current
-/// key slice stays valid until that same cursor is advanced again.
-///
-/// Also validates the restart trailer against the record stream: every
-/// declared restart offset must land exactly on a record whose `shared`
-/// field is 0, and every record with `shared` 0 at that exact interval
-/// must have a matching restart entry. This catches a truncated or
-/// shifted restart table that a whole-block CRC would not (the CRC only
-/// proves the compressed bytes were not corrupted in transit/on disk, not
-/// that this structural relationship inside them still holds).
-///
-/// Also re-derives, in the *flattened* block's own coordinates, the offset
-/// of each restart record (`ExpandedBlock.restarts`) so the read side can
-/// still binary-search to a restart-sized (<= restartInterval records)
-/// linear-scan window even though the on-disk shared/unshared deltas are
-/// gone post-expansion.
 fn expandBlock(allocator: Allocator, physical: []const u8) !ExpandedBlock {
     if (physical.len < 4) return error.CorruptSstable;
     const numRestarts = readU32(physical, physical.len - 4);
@@ -674,13 +625,6 @@ fn expandBlock(allocator: Allocator, physical: []const u8) !ExpandedBlock {
         if (shared > prevKey.items.len) return error.CorruptSstable;
         if (keyStart + @as(usize, unshared) + @as(usize, valLen) > recordsEnd) return error.CorruptSstable;
 
-        // A genuine block (as `Builder` writes it) marks exactly every
-        // `restartInterval`-th record (by position within the block) as a
-        // restart, in order, with shared == 0. Checking both directions -
-        // a restart-interval position must be declared, and a declared
-        // offset must fall on a restart-interval position - catches a
-        // restart table that is present but shifted, truncated, or
-        // fabricated, not just one that is structurally impossible.
         const shouldBeRestart = recordIdx % restartInterval == 0;
         const isDeclaredRestart = restartIdx < numRestarts and readU32(restartTable, restartIdx * 4) == pos;
         if (shouldBeRestart != isDeclaredRestart) return error.CorruptSstable;
@@ -813,10 +757,6 @@ test "restart index lets point lookups skip straight past earlier records in a b
     var reader = try Reader.open(allocator, tmp.dir, "test.sst", 1);
     defer reader.deinit();
 
-    // Every block must have carried its restart offsets through expansion:
-    // the first is always the block's own first record, and multi-restart
-    // blocks (any block with more than restartInterval records) must have
-    // strictly increasing keys at each restart, matching overall key order.
     var sawMultiRestartBlock = false;
     var blockIdx: usize = 0;
     while (blockIdx < reader.index.len) : (blockIdx += 1) {
@@ -833,15 +773,8 @@ test "restart index lets point lookups skip straight past earlier records in a b
             prevKey = rec.record.key;
         }
     }
-    // 500 records at ~87/block (blockTarget 4096 / ~47 bytes/record) and
-    // restartInterval 16 guarantees at least one block with several
-    // restarts - if this ever goes false the fixture stopped exercising
-    // the multi-restart path the rest of this test relies on.
     try std.testing.expect(sawMultiRestartBlock);
 
-    // A probe exactly equal to a later restart's key must land on that
-    // restart's own offset (the binary search must not undershoot to an
-    // earlier restart when there is an exact match).
     const entry0 = reader.index[0];
     try std.testing.expect(entry0.restarts.len > 2);
     const block0 = reader.blockBytes(0);
@@ -849,24 +782,19 @@ test "restart index lets point lookups skip straight past earlier records in a b
     const secondRestartKey = decodeRecord(block0, secondRestartOffset).record.key;
     try std.testing.expectEqual(secondRestartOffset, Reader.seekInBlock(block0, entry0.restarts, secondRestartKey));
 
-    // A probe strictly between the first and second restart's keys must
-    // stay on the first restart (must not overshoot to the second).
     const firstRestartKey = decodeRecord(block0, entry0.restarts[0]).record.key;
     var midBuf: [16]u8 = undefined;
     @memcpy(midBuf[0..firstRestartKey.len], firstRestartKey);
-    midBuf[firstRestartKey.len - 1] += 1; // one key past first restart's key
+    midBuf[firstRestartKey.len - 1] += 1;
     try std.testing.expect(order(midBuf[0..firstRestartKey.len], secondRestartKey) == .lt);
     try std.testing.expectEqual(entry0.restarts[0], Reader.seekInBlock(block0, entry0.restarts, midBuf[0..firstRestartKey.len]));
 
-    // A probe past every restart's key must resolve to the last restart.
     const lastRestartKey = decodeRecord(block0, entry0.restarts[entry0.restarts.len - 1]).record.key;
     var pastBuf: [16]u8 = undefined;
     @memcpy(pastBuf[0..lastRestartKey.len], lastRestartKey);
     pastBuf[lastRestartKey.len - 1] += 1;
     try std.testing.expectEqual(entry0.restarts[entry0.restarts.len - 1], Reader.seekInBlock(block0, entry0.restarts, pastBuf[0..lastRestartKey.len]));
 
-    // End to end: lookups still resolve correctly for keys sitting right at
-    // and around restart boundaries, now that the scan starts mid-block.
     try std.testing.expectEqualStrings("payload-value", reader.find(firstRestartKey).?.value);
     try std.testing.expectEqualStrings("payload-value", reader.find(secondRestartKey).?.value);
 }
@@ -933,9 +861,9 @@ test "expandBlock reconstructs prefix-compressed records" {
     const w = encode.ByteWriter.init(&buf);
 
     try writeRawRecord(w, .value, 1, 0, "apple", "1");
-    try writeRawRecord(w, .value, 2, 3, "ly", "2"); // "app" + "ly" = "apply"
-    try writeRawRecord(w, .tombstone, 3, 2, "ricot", ""); // "ap" + "ricot" = "apricot"
-    try w.putU32(0); // one restart, at offset 0
+    try writeRawRecord(w, .value, 2, 3, "ly", "2");
+    try writeRawRecord(w, .tombstone, 3, 2, "ricot", "");
+    try w.putU32(0);
     try w.putU32(1);
 
     const expanded = try expandBlock(allocator, buf.items);
@@ -956,8 +884,6 @@ test "expandBlock reconstructs prefix-compressed records" {
     try std.testing.expectEqual(Kind.tombstone, d2.record.kind);
     try std.testing.expectEqual(d2.next, expanded.bytes.len);
 
-    // Only the first record is a restart in this fixture (interval=16,
-    // 3 records) - `flatRestarts` must record exactly its flat offset (0).
     try std.testing.expectEqualSlices(u32, &.{0}, expanded.restarts);
 }
 
@@ -967,10 +893,10 @@ test "expandBlock rejects a restart declared at the wrong record" {
     defer buf.deinit();
     const w = encode.ByteWriter.init(&buf);
 
-    const record0End = 1 + 8 + 4 + 4 + 4 + 5 + 1; // header + "apple" + "1"
+    const record0End = 1 + 8 + 4 + 4 + 4 + 5 + 1;
     try writeRawRecord(w, .value, 1, 0, "apple", "1");
     try writeRawRecord(w, .value, 2, 3, "ly", "2");
-    try w.putU32(@intCast(record0End)); // restart claims record 1's offset, not record 0's
+    try w.putU32(@intCast(record0End));
     try w.putU32(1);
 
     try std.testing.expectError(error.CorruptSstable, expandBlock(allocator, buf.items));
@@ -983,7 +909,7 @@ test "expandBlock rejects a missing restart declaration" {
     const w = encode.ByteWriter.init(&buf);
 
     try writeRawRecord(w, .value, 1, 0, "apple", "1");
-    try w.putU32(0); // trailer present but claims zero restarts
+    try w.putU32(0);
 
     try std.testing.expectError(error.CorruptSstable, expandBlock(allocator, buf.items));
 }
@@ -994,8 +920,8 @@ test "expandBlock rejects shared length exceeding the previous key" {
     defer buf.deinit();
     const w = encode.ByteWriter.init(&buf);
 
-    try writeRawRecord(w, .value, 1, 0, "ab", "1"); // prevKey becomes "ab", len 2
-    try writeRawRecord(w, .value, 2, 5, "xyz", "2"); // shared=5 > len("ab")
+    try writeRawRecord(w, .value, 1, 0, "ab", "1");
+    try writeRawRecord(w, .value, 2, 5, "xyz", "2");
     try w.putU32(0);
     try w.putU32(1);
 
@@ -1011,7 +937,7 @@ test "expandBlock rejects a record stream that overruns its declared lengths" {
     try w.byte(@intFromEnum(Kind.value));
     try w.putU64(1);
     try w.putU32(0);
-    try w.putU32(100); // claims 100 unshared key bytes that are never written
+    try w.putU32(100);
     try w.putU32(0);
     try w.putU32(0);
     try w.putU32(1);
@@ -1026,7 +952,7 @@ test "expandBlock rejects trailing bytes that do not form a full record" {
     const w = encode.ByteWriter.init(&buf);
 
     try writeRawRecord(w, .value, 1, 0, "apple", "1");
-    try w.byte(0xff); // stray byte before the restart trailer
+    try w.byte(0xff);
     try w.putU32(0);
     try w.putU32(1);
 
@@ -1044,7 +970,6 @@ test "Reader.open rejects an sstable written by an unsupported format version" {
         var file = try tmp.dir.openFile("test.sst", .{ .mode = .read_write });
         defer file.close();
         const size = try file.getEndPos();
-        // version u32 sits right after the magic u32 at the footer's start.
         try file.seekTo(size - footerLen + 4);
         var bogus: [4]u8 = undefined;
         std.mem.writeInt(u32, &bogus, version + 1, encode.endian);
@@ -1078,11 +1003,6 @@ test "prefix compression measurably shrinks sstables with a shared key prefix" {
         var buf: [64]u8 = undefined;
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            // Same value payload and roughly the same key length as above,
-            // but scrambled so consecutive keys share no meaningful prefix -
-            // isolates the saving to prefix compression rather than the
-            // block-level RLE codec, which would compress a repeated value
-            // just as well in both files.
             const scrambled = i *% 2654435761;
             const key = try std.fmt.bufPrint(&buf, "{d:0>20}", .{scrambled});
             try builder.add(.{ .key = key, .value = "v", .seq = i + 1, .kind = .value });
@@ -1097,14 +1017,8 @@ test "prefix compression measurably shrinks sstables with a shared key prefix" {
 
     try std.testing.expectEqual(@as(u64, count), sharedReader.numEntries);
     try std.testing.expectEqual(@as(u64, count), distinctReader.numEntries);
-    // Prefix compression must shrink the file meaningfully below the
-    // no-shared-prefix baseline (measured ~25% smaller at this fixture
-    // size), not just avoid growing it. Bloom filter and index overhead
-    // is identical in both files, so the margin here comes entirely from
-    // smaller data blocks.
     try std.testing.expect(sharedReader.physicalBytes * 5 < distinctReader.physicalBytes * 4);
 
-    // Correctness survives the smaller on-disk encoding.
     try std.testing.expectEqualStrings("v", sharedReader.find("users\x00city\x00warsaw\x00pk00000000").?.value);
     try std.testing.expectEqualStrings("v", sharedReader.find("users\x00city\x00warsaw\x00pk00000150").?.value);
     try std.testing.expectEqualStrings("v", sharedReader.find("users\x00city\x00warsaw\x00pk00000299").?.value);

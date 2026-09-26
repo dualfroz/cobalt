@@ -17,10 +17,6 @@ const ForeignKeySet = idx.ForeignKeySet;
 const CheckConstraintSet = idx.CheckConstraintSet;
 const ReferencedBySet = idx.ReferencedBySet;
 
-/// Reserved field name a Table stores the primary key under, so a decoded
-/// Row is self-sufficient for callers that only have the Row (e.g. results
-/// of a full table scan) without needing to separately decode it from the
-/// row key's escaped ordered bytes.
 pub const pkField = "__pk";
 
 pub const Condition = struct {
@@ -28,37 +24,16 @@ pub const Condition = struct {
     value: Value,
 };
 
-/// Paging window for `Table.selectPage`: skip the first `offset` matches,
-/// return at most `limit` of them (0 = unlimited).
 pub const Page = struct {
     offset: usize = 0,
     limit: usize = 0,
 };
 
-/// One column of a `Table.selectPageOrdered` sort key: order matched rows
-/// by `field` (via `rowmod.compare`'s total order across value types). A
-/// row missing `field` entirely sorts as `Value.none`, which `compare`
-/// places before every other tag - so rows lacking the sort column
-/// consistently group at the front (ascending) or back (descending)
-/// instead of erroring. `selectPageOrdered` takes a `[]const OrderBy`
-/// (empty = unsorted): columns after the first only break ties left by
-/// the ones before them, the same lexicographic rule SQL's `ORDER BY a, b`
-/// follows - the sort is stable, so a `[]const OrderBy` with a single
-/// entry that leaves ties unresolved behaves exactly as before this type
-/// gained multi-column support (rows keep their relative scan order:
-/// ascending pk for a full scan, index order for an indexed lookup).
 pub const OrderBy = struct {
     field: []const u8,
     descending: bool = false,
 };
 
-/// Which access strategy `Table.selectPage` would take for a given
-/// predicate, as reported by `Table.explain`. Mirrors the three real
-/// branches of `selectPage`'s decision ladder: an unindexed full scan, a
-/// single-field index (`eq` narrows to one key, `lt`/`lte`/`gt`/`gte`
-/// narrow to a range), or a composite index matched on a leftmost prefix
-/// of its columns (`_eq` when the prefix is the whole match, `_range` when
-/// the column right after the prefix also had a range bound).
 pub const PlanKind = enum(u8) {
     full_scan,
     index_eq,
@@ -67,15 +42,6 @@ pub const PlanKind = enum(u8) {
     composite_range,
 };
 
-/// `indexName` is an owned copy the caller must free with `Plan.deinit` -
-/// null (and `matchedFields`/`totalFields` both 0) for `.full_scan`, which
-/// names no index. For `.index_eq`/`.index_range` it is the single indexed
-/// field name and `matchedFields == totalFields == 1`. For
-/// `.composite_eq`/`.composite_range` it is the composite index's name and
-/// `matchedFields` counts how many of the index's `totalFields` leading
-/// columns the query actually pinned down (a strict prefix match still
-/// narrows the scan, same leftmost-prefix rule a real multi-column B-tree
-/// index gives you).
 pub const Plan = struct {
     kind: PlanKind,
     indexName: ?[]const u8 = null,
@@ -88,11 +54,6 @@ pub const Plan = struct {
     }
 };
 
-/// Predicate AST evaluated against a decoded Row. Leaves compare a named
-/// field to a literal Value; And/Or/Not compose leaves and other predicates.
-/// Predicate does not own the memory of any Value or field-name slice it
-/// references - callers must keep those alive for as long as the predicate
-/// tree is used.
 pub const Predicate = union(enum) {
     eq: Condition,
     ne: Condition,
@@ -101,10 +62,6 @@ pub const Predicate = union(enum) {
     gt: Condition,
     gte: Condition,
     like: Condition,
-    /// True when `field` is absent from the row entirely, or present but
-    /// holding an explicit `Value.none` - a sparse row's "never set" and a
-    /// row that set the field to none are indistinguishable to a caller
-    /// asking "does this row have a real value here", same as SQL NULL.
     is_null: []const u8,
     is_not_null: []const u8,
     and_: []const Predicate,
@@ -148,16 +105,6 @@ pub const Predicate = union(enum) {
     }
 };
 
-/// SQL-style LIKE matching: `%` matches any run of characters (including
-/// none), `_` matches exactly one character, every other byte in `pattern`
-/// must match `text` literally. No escape character - a pattern that needs a
-/// literal `%`/`_` cannot express it, same simplification `expr.zig`'s other
-/// operators already make (no escaping in the predicate language at all).
-/// Iterative two-pointer wildcard matcher (not recursive backtracking) so a
-/// pattern like "a%a%a%a%a%a%b" against a long non-matching text stays
-/// linear-ish instead of exponential: on mismatch after a `%`, only the
-/// text pointer rewinds-and-retries, the pattern never re-walks from
-/// scratch.
 fn matchLike(pattern: []const u8, text: []const u8) bool {
     var pIdx: usize = 0;
     var tIdx: usize = 0;
@@ -204,14 +151,6 @@ test "matchLike handles literal, wildcard, and single-char patterns" {
     try std.testing.expect(matchLike("a%%a", "aXYZa"));
 }
 
-/// A table is a named partition of a single Db's keyspace (see index.zig for
-/// the exact key layout) plus a set of secondary indexes maintained on
-/// write. Rows are whole-row replace semantics: `put` fully overwrites
-/// whatever was stored at `pk`, syncing every registered index against the
-/// old and new field values in the same call.
-/// Composite indexes are capped at this many columns: generous for any
-/// realistic multi-column index while keeping the planner's per-spec match
-/// buffer (see `findCompositeMatch`) a fixed-size stack array.
 pub const maxCompositeFields = 8;
 
 pub const Table = struct {
@@ -251,8 +190,6 @@ pub const Table = struct {
         if (!idx.validIdentifier(field)) return error.InvalidIdentifier;
         if (self.indexes.has(field)) return;
 
-        // Backfill: every existing row's current value for `field` becomes
-        // an index entry before the index is advertised as usable.
         const rows = try self.scanAll();
         defer freeRows(self.allocator, rows);
         for (rows) |*r| {
@@ -265,11 +202,6 @@ pub const Table = struct {
         try self.indexes.save(self.db, self.name);
     }
 
-    /// Dropping an index also drops any UNIQUE constraint riding on it -
-    /// `Table.put`'s constraint check relies on the field's index entries
-    /// existing (see `createUniqueIndex`), so a unique field with no
-    /// index left behind would silently stop being enforced instead of
-    /// erroring, which is worse than making the drop explicit here.
     pub fn dropIndex(self: *Table, field: []const u8) !void {
         if (!self.indexes.remove(field)) return;
         try idx.dropAllEntries(self.db, self.allocator, self.name, field);
@@ -285,16 +217,6 @@ pub const Table = struct {
         return self.unique.has(field);
     }
 
-    /// Installs a UNIQUE constraint on `field` - SQL's `CREATE UNIQUE
-    /// INDEX`. Refuses outright if the table already holds two rows with
-    /// the same (non-null) value for `field`: existing data always wins
-    /// over a constraint that could never have held for it, exactly like
-    /// a real database refusing to add a unique index over dirty data.
-    /// Backfills the plain secondary index too when it is not already
-    /// present, since `put`'s duplicate check below is a `scanEq` against
-    /// those very index entries rather than a full table scan - a unique
-    /// field with no backing index would make every write pay for a full
-    /// scan just to enforce the constraint.
     pub fn createUniqueIndex(self: *Table, field: []const u8) !void {
         if (!idx.validIdentifier(field)) return error.InvalidIdentifier;
         if (self.unique.has(field)) return;
@@ -339,15 +261,6 @@ pub const Table = struct {
         return self.foreignKeys.has(field);
     }
 
-    /// Whether `value` names an existing row of `spec.refTable` under
-    /// `spec.refField` - `query.pkField` is checked via a plain `get`
-    /// (the primary key is inherently unique, no secondary index needed),
-    /// anything else via `idx.scanEq` against `spec.refTable`'s own index
-    /// entries (required to carry a UNIQUE constraint by
-    /// `Table.createForeignKey`, so at most one owner is expected here -
-    /// this only asks "does at least one exist", not "is it exactly one",
-    /// since a constraint installed correctly can only ever produce zero or
-    /// one).
     fn foreignKeyTargetExists(self: *Table, refTableName: []const u8, refField: []const u8, value: Value) !bool {
         if (std.mem.eql(u8, refField, pkField)) {
             var refTable = try Table.open(self.db, self.allocator, refTableName);
@@ -364,48 +277,6 @@ pub const Table = struct {
         return owners.len > 0;
     }
 
-    /// Installs a FOREIGN KEY constraint: every row's (non-null) `field`
-    /// value must, from this point on, name a value that exists as
-    /// `refField` on `refTable` - SQL's `FOREIGN KEY (field) REFERENCES
-    /// refTable(refField)`. `refField` must be either `pkField` or a field
-    /// already carrying `refTable`'s own UNIQUE constraint (see
-    /// `foreignKeyTargetExists`'s doc comment for why); anything else is
-    /// refused with `error.ForeignKeyRequiresUniqueTarget` before touching
-    /// any row, the same "refuse before mutating" shape `createUniqueIndex`
-    /// uses for dirty data. Existing rows are checked against the target
-    /// before the constraint is recorded - a row whose current `field`
-    /// value has no matching parent aborts the whole install with
-    /// `error.ForeignKeyViolation`, leaving nothing installed.
-    ///
-    /// Registers the reverse relationship in `refTable`'s own
-    /// `ReferencedBySet` (see its doc comment) so `Table.delete` can later
-    /// enforce `onDelete` against it (SQL's `ON DELETE RESTRICT` or `ON
-    /// DELETE CASCADE`, see `idx.OnDelete`'s doc comment) - this used to be
-    /// a documented, unfixed gap ("no registry of dependent tables exists,
-    /// since tables are opened ad hoc by name and never catalogued
-    /// anywhere") before `ReferencedBySet` closed it.
-    ///
-    /// `onDelete` only governs `Table.delete`/`Table.deleteWhere`'s plain
-    /// (non-transactional) path - `txn_table.zig`'s `TableTxn.delete` reads
-    /// the same `ReferencedBySet` but does not look at this field at all,
-    /// so it continues to unconditionally restrict any delete that would
-    /// orphan a reference even for a `cascade` constraint. That is a
-    /// deliberately conservative gap, not an oversight: refusing is always
-    /// a safe fallback for a feature that has not been built yet, whereas
-    /// silently NOT cascading inside a transaction would leave a dangling
-    /// reference behind. Only `Table.put`'s `updateRestrictedByForeignKey`
-    /// check is unaffected by `onDelete` in EITHER path - there is no `ON
-    /// UPDATE CASCADE` here, so a value change under a live reference is
-    /// always restricted regardless of the FK's delete mode.
-    ///
-    /// Known gap that registry does NOT close, same documented-rather-
-    /// than-fixed shape as `TableTxn`'s missing composite/unique
-    /// enforcement: nothing here stops a later `refTable.dropIndex
-    /// (refField)` from removing the UNIQUE constraint this foreign key
-    /// depends on - doing so leaves the constraint silently checking
-    /// against an unconstrained (possibly duplicate-holding) column via
-    /// `scanEq`, which still answers "does at least one owner exist"
-    /// correctly but no longer guarantees at most one.
     pub fn createForeignKey(self: *Table, field: []const u8, refTable: []const u8, refField: []const u8, onDelete: idx.OnDelete) !void {
         if (!idx.validIdentifier(field)) return error.InvalidIdentifier;
         if (!idx.validIdentifier(refTable)) return error.InvalidIdentifier;
@@ -429,35 +300,12 @@ pub const Table = struct {
         try self.foreignKeys.add(field, refTable, refField, onDelete);
         try self.foreignKeys.save(self.db, self.name);
 
-        // Records the reverse relationship on `refTable` so a later delete
-        // against it (see `Table.delete`'s RESTRICT check) can discover
-        // this constraint without a global table catalog - see
-        // `ReferencedBySet`'s doc comment. Loaded, mutated, and saved
-        // transiently rather than cached on a `Table` field: unlike
-        // `foreignKeys`/`unique`/`checks` (always mutated through the same
-        // handle that holds them), `referencedBy` is mutated as a side
-        // effect of some OTHER table's `createForeignKey`/`dropForeignKey`
-        // call - a `refTable` handle the CALLER already has open (the
-        // ordinary "open customers, open orders, wire up the FK between
-        // them" shape) would otherwise go stale the moment this runs,
-        // silently under-enforcing every delete against it thereafter.
-        // Works unchanged for a self-referencing FK (`refTable ==
-        // self.name`) too, since it never touches `self`'s own cached
-        // sets at all - it only ever reads/writes `refTable`'s on-disk
-        // entry by name.
         var revSet = try ReferencedBySet.load(self.allocator, self.db, refTable);
         defer revSet.deinit();
         try revSet.add(self.name, field, refField, onDelete);
         try revSet.save(self.db, refTable);
     }
 
-    /// Lifts a FOREIGN KEY and its reverse `ReferencedBySet` entry on
-    /// whichever table it pointed at, symmetric with `createForeignKey`
-    /// installing both. The target's name is copied out before
-    /// `self.foreignKeys.remove` frees the spec's own strings, since the
-    /// reverse cleanup below still needs it afterwards. See
-    /// `createForeignKey`'s doc comment on why the reverse entry is always
-    /// loaded/saved transiently rather than through a cached `Table` field.
     pub fn dropForeignKey(self: *Table, field: []const u8) !void {
         const existing = self.foreignKeys.find(field) orelse return;
         const refTable = try self.allocator.dupe(u8, existing.refTable);
@@ -476,17 +324,6 @@ pub const Table = struct {
         return self.checks.has(name);
     }
 
-    /// Installs a named CHECK constraint - SQL's `CHECK (source)` - built on
-    /// the exact same predicate language `table select`/`table join` already
-    /// use (`expr.zig`'s recursive-descent parser over `Predicate`). `source`
-    /// is parsed once up front so a typo is rejected before anything is
-    /// persisted (`error.InvalidCheckExpression` wraps any `expr.ParseError`,
-    /// since a caller that only sees this constraint's name/source has no use
-    /// for which specific parse error fired), then evaluated against every
-    /// existing row - the same "refuse before mutating, existing data always
-    /// wins" shape `createUniqueIndex`/`createForeignKey` use, so installing
-    /// a CHECK that current data already violates fails outright rather than
-    /// silently starting to enforce only from the next write on.
     pub fn createCheckConstraint(self: *Table, name: []const u8, source: []const u8) !void {
         if (!idx.validIdentifier(name)) return error.InvalidIdentifier;
         if (self.checks.has(name)) return;
@@ -509,12 +346,6 @@ pub const Table = struct {
         try self.checks.save(self.db, self.name);
     }
 
-    /// Creates a multi-column secondary index named `name` over `fields`, in
-    /// order - order matters, since only a leading ("leftmost") prefix of it
-    /// can be used to narrow a query (see `findCompositeMatch`). Rows
-    /// missing any of the fields are skipped entirely, both here and when
-    /// staying in sync on `put`/`delete`, since a composite entry with a
-    /// missing column would not be a well-formed tuple.
     pub fn createCompositeIndex(self: *Table, name: []const u8, fields: []const []const u8) !void {
         if (!idx.validIdentifier(name)) return error.InvalidIdentifier;
         if (fields.len < 2 or fields.len > maxCompositeFields) return error.InvalidCompositeIndex;
@@ -551,8 +382,6 @@ pub const Table = struct {
         return self.composite.has(name);
     }
 
-    /// Fully replaces the row stored at `pk` with `fields`, syncing every
-    /// registered secondary index against whatever the row held before.
     pub fn put(self: *Table, pk: Value, fields: []const Field) !void {
         var old = try self.get(pk);
         defer if (old) |*o| o.deinit();
@@ -567,27 +396,12 @@ pub const Table = struct {
         const key = try idx.rowKey(self.allocator, self.name, pk);
         defer self.allocator.free(key);
 
-        // CHECK constraints run first, ahead of UNIQUE/FOREIGN KEY and any
-        // index or row mutation - a row that fails a CHECK never gets far
-        // enough to matter whether it would also have violated UNIQUE, same
-        // "cheapest, purely-local check first" ordering a real database
-        // uses. Re-parsed from source on every put (no cached Predicate is
-        // kept on Table), the same cost `table select`/`table join` already
-        // pay for their own expr text on every call.
         for (self.checks.specs.items) |spec| {
             var parsed = exprmod.parse(self.allocator, spec.source) catch return error.InvalidCheckExpression;
             defer parsed.deinit();
             if (!parsed.predicate.evaluate(&newRow)) return error.CheckViolation;
         }
 
-        // UNIQUE constraint check runs before any index or row mutation
-        // below, so a violation leaves everything untouched - the same
-        // all-or-nothing shape callers already get from a plain `put`
-        // either succeeding outright or failing outright. A field that
-        // did not change value from the row's own previous value is
-        // exempt (it already legitimately owns that value), which is why
-        // updating unrelated fields on a row that already holds a unique
-        // value never spuriously conflicts with itself.
         for (self.unique.fields.items) |field| {
             const newValue = newRow.get(field) orelse continue;
             const oldValue = if (old) |*o| o.get(field) else null;
@@ -602,24 +416,12 @@ pub const Table = struct {
             }
         }
 
-        // FOREIGN KEY check, same "before any mutation" placement as UNIQUE
-        // above. Unlike UNIQUE, an unchanged value is NOT exempt: nothing in
-        // this codebase stops the referenced row from having been deleted
-        // out from under an already-valid reference since the last write
-        // (no catalog of dependent tables exists to block that delete - see
-        // `Table.createForeignKey`'s doc comment), so every put re-checks
-        // every constrained field's current target rather than trusting a
-        // value that merely did not change this time.
         for (self.foreignKeys.specs.items) |spec| {
             const newValue = newRow.get(spec.field) orelse continue;
             if (newValue == .none) continue;
             if (!try self.foreignKeyTargetExists(spec.refTable, spec.refField, newValue)) return error.ForeignKeyViolation;
         }
 
-        // ON DELETE RESTRICT's update-side counterpart, see
-        // `updateRestrictedByForeignKey`'s doc comment - must run before any
-        // index or row mutation below, same all-or-nothing placement as
-        // every other constraint check in this function.
         if (try self.updateRestrictedByForeignKey(pk, if (old) |*o| o else null, &newRow)) return error.ForeignKeyInUse;
 
         for (self.indexes.fields.items) |indexedField| {
@@ -671,12 +473,6 @@ pub const Table = struct {
         return try Row.decode(self.allocator, raw);
     }
 
-    /// One (table, pk) a cascading delete has decided to remove, in the
-    /// order `planCascade` discovered it - deepest dependents first, the
-    /// row that was actually asked for last. Owns copies of both fields
-    /// independently of whatever `Row`/`Table` produced them, since the
-    /// scan that found them is long gone (and possibly a different
-    /// `Table` handle entirely) by the time `delete` executes the plan.
     const CascadeAction = struct {
         table: []u8,
         pk: Value,
@@ -687,13 +483,6 @@ pub const Table = struct {
         }
     };
 
-    /// Cycle guard for `planCascade`: every (table, pk) already visited
-    /// this call, so a cascade that loops back on itself (two tables
-    /// `ON DELETE CASCADE`-ing at each other, or a longer cycle through
-    /// three or more) terminates instead of recursing forever. Linear
-    /// scan is fine here - a cascading delete's fan-out is bounded by how
-    /// much data actually exists, and this runs once per row touched, not
-    /// once per row scanned.
     const CascadeVisited = struct {
         allocator: Allocator,
         entries: std.ArrayList(CascadeAction),
@@ -722,32 +511,6 @@ pub const Table = struct {
         }
     };
 
-    /// Recursively works out everything a delete of `pk` must remove,
-    /// WITHOUT deleting anything yet, appending each decision to `plan` in
-    /// dependent-before-dependency order (see `CascadeAction`'s doc
-    /// comment) so `delete` can execute it leaves-first. This two-phase
-    /// plan/execute split is what keeps a cascading delete all-or-nothing:
-    /// a `restrict`-mode violation discovered three levels deep must abort
-    /// with NOTHING mutated, exactly like the single-table check this
-    /// replaced - if planning and deleting were interleaved, an earlier
-    /// sibling subtree could already be gone by the time a later one fails.
-    ///
-    /// For every `ReferencedBySet` entry naming a table with a live row
-    /// pointing at `old`'s value for the referenced field (see the
-    /// previous version of this function for why the child is opened and
-    /// scanned in full rather than through `idx.scanEq`, and why a
-    /// self-referencing FK excludes `pk` itself from matching): `restrict`
-    /// aborts the whole plan with `error.ForeignKeyInUse`; `cascade`
-    /// recurses into that child row first, so it lands in `plan` ahead of
-    /// `self` (a child must be gone before its parent is, or the delete
-    /// order would itself violate the very constraint being enforced).
-    ///
-    /// `visited` is checked (and updated) BEFORE any of that per-row work,
-    /// so a cycle (`planCascade(A)` reaching `planCascade(B)` reaching
-    /// `planCascade(A)` again) short-circuits the re-entrant call instead
-    /// of looping - the ORIGINAL call for that (table, pk) is still the one
-    /// that appends it to `plan`, once its own scan finishes, so nothing is
-    /// silently dropped from the plan by the cycle.
     fn planCascade(self: *Table, pk: Value, visited: *CascadeVisited, plan: *std.ArrayList(CascadeAction)) !void {
         if (visited.contains(self.name, pk)) return;
         var old = try self.get(pk) orelse return;
@@ -788,16 +551,6 @@ pub const Table = struct {
         try plan.append(.{ .table = try self.allocator.dupe(u8, self.name), .pk = try pk.dupe(self.allocator) });
     }
 
-    /// The actual row/index removal `delete` used to do inline before
-    /// cascading existed - no FOREIGN KEY check here at all, since by the
-    /// time this runs `planCascade` has already proven the entire plan is
-    /// safe to execute in order. Takes `pk` rather than a decoded row
-    /// because `CascadeAction` only carries the two, and re-fetching here
-    /// (rather than threading the `Row` `planCascade` already read) is
-    /// what lets `delete` stay tolerant of a row that no longer exists by
-    /// execution time - unreachable in practice (nothing between planning
-    /// and executing can delete a row out from under this single-threaded
-    /// call), but cheap to make robust to rather than to assume away.
     fn executeDelete(self: *Table, pk: Value) !void {
         var old = try self.get(pk) orelse return;
         defer old.deinit();
@@ -825,25 +578,6 @@ pub const Table = struct {
         try self.db.delete(key);
     }
 
-    /// SQL's `ON DELETE RESTRICT`/`CASCADE` (see `planCascade` above) has an
-    /// easy-to-miss counterpart: this codebase never leaves a child dangling
-    /// when its parent ROW disappears, but until now nothing stopped a `put`
-    /// from changing the parent's *value* out from under a still-live child -
-    /// `refTable.dropIndex(refField)` and `updateWhere`/direct `put` changing
-    /// a `refField` are exactly the "carpet pulled from under the child"
-    /// cases `createForeignKey`'s own doc comment already named as open
-    /// gaps. Reuses the identical scan and self-reference exclusion as
-    /// `planCascade` (a value that stops existing under this pk is exactly
-    /// as dangerous to a live reference as a row that stops existing
-    /// entirely), but the trigger is "this pk's value for `refField` is
-    /// about to change", not "this pk is about to be deleted" - so `old` may
-    /// be null (a fresh insert has nothing to pull out from under anyone)
-    /// and a field whose new value equals its old value is exempt, the same
-    /// "unchanged is always safe" exemption `put`'s own UNIQUE check makes.
-    /// Unlike `planCascade`, this ALWAYS restricts regardless of the
-    /// constraint's `onDelete` mode - there is no `ON UPDATE CASCADE` here,
-    /// only `ON DELETE CASCADE`, so even a `cascade`-mode FK still blocks a
-    /// value change under a live reference.
     fn updateRestrictedByForeignKey(self: *Table, pk: Value, old: ?*const Row, newRow: *const Row) !bool {
         var referencedBy = try ReferencedBySet.load(self.allocator, self.db, self.name);
         defer referencedBy.deinit();
@@ -872,17 +606,6 @@ pub const Table = struct {
         return false;
     }
 
-    /// Deletes `pk`, honoring every `ON DELETE` mode registered against
-    /// this table by some OTHER table's `createForeignKey` (see
-    /// `idx.OnDelete`'s doc comment): a `restrict`-mode reference still
-    /// pointing at this row aborts the whole call with
-    /// `error.ForeignKeyInUse` and nothing is mutated; a `cascade`-mode
-    /// one instead removes the referencing rows too, recursively, before
-    /// this row itself goes - see `planCascade`'s doc comment for why
-    /// that has to happen in two passes (plan every removal first, then
-    /// execute the plan) rather than deleting as it discovers each one.
-    /// A `pk` that does not exist is a silent no-op, same as before
-    /// cascading existed.
     pub fn delete(self: *Table, pk: Value) !void {
         var visited = CascadeVisited.init(self.allocator);
         defer visited.deinit();
@@ -901,18 +624,6 @@ pub const Table = struct {
         }
     }
 
-    /// Applies `sets` on top of every row matching `pred` (or every row, if
-    /// null) - SQL's `UPDATE <table> SET ... WHERE pred`. Deliberately not a
-    /// bespoke in-place mutation path: each match is merged with `sets`
-    /// (a `set` entry overrides a same-named existing field, or is appended
-    /// if the row does not have that field yet) and written back through
-    /// `put`, the exact same call an external caller doing `get` then `put`
-    /// by hand would make - so every secondary/composite index touched by a
-    /// changed field is maintained exactly like any other write, with zero
-    /// special-casing here. Uses `selectAllMatches` rather than `selectPage`
-    /// because every match must be visited regardless of any page window -
-    /// there is no `LIMIT` on an `UPDATE`. Returns the number of rows
-    /// updated.
     pub fn updateWhere(self: *Table, pred: ?Predicate, sets: []const Field) !usize {
         const matches = try self.selectAllMatches(pred);
         defer freeRows(self.allocator, matches);
@@ -933,14 +644,6 @@ pub const Table = struct {
         return matches.len;
     }
 
-    /// Deletes every row matching `pred` (or every row, if null) - SQL's
-    /// `DELETE FROM <table> WHERE pred`. Mirrors `updateWhere`: materializes
-    /// the full match set with `selectAllMatches` (a `DELETE` has no
-    /// `LIMIT` either, so partial-scan short-circuiting is wrong here same
-    /// as for update) then removes each match through the existing single-row
-    /// `delete`, so every secondary/composite index touched by the deleted
-    /// row is maintained exactly like a caller doing `get` then `delete` by
-    /// hand would - zero special-casing. Returns the number of rows deleted.
     pub fn deleteWhere(self: *Table, pred: ?Predicate) !usize {
         const matches = try self.selectAllMatches(pred);
         defer freeRows(self.allocator, matches);
@@ -952,8 +655,6 @@ pub const Table = struct {
         return matches.len;
     }
 
-    /// Full table scan decoding every row, oldest key order. Callers own the
-    /// returned slice and each Row in it (see freeRows).
     pub fn scanAll(self: *Table) ![]Row {
         const prefix = try idx.rowPrefix(self.allocator, self.name);
         defer self.allocator.free(prefix);
@@ -973,23 +674,10 @@ pub const Table = struct {
         return results.toOwnedSlice();
     }
 
-    /// Selects rows matching `pred` (or every row, if null). When `pred` is
-    /// a single indexed condition, or an And containing one, the matching
-    /// index is used to build a narrowed candidate set before the full
-    /// predicate is re-checked against each candidate row - so results are
-    /// always correct even though the optimization only ever inspects one
-    /// conjunct's index.
     pub fn select(self: *Table, pred: ?Predicate) ![]Row {
         return self.selectPage(pred, .{});
     }
 
-    /// Same as `select`, but skips the first `page.offset` matches and stops
-    /// once `page.limit` matches have been collected (0 = unlimited, the
-    /// same convention `protocol.ScanArgs` uses). Both the full-scan and
-    /// index-narrowed paths stop iterating as soon as the limit is met
-    /// instead of materializing the whole match set first - a real
-    /// efficiency win for `LIMIT`-bounded queries against large tables, not
-    /// just a post-hoc slice of an already-full result.
     pub fn selectPage(self: *Table, pred: ?Predicate, page: Page) ![]Row {
         if (pred) |p| {
             if (self.findCompositeMatch(p)) |match| {
@@ -1004,19 +692,6 @@ pub const Table = struct {
         return self.scanFilteredPage(pred, page);
     }
 
-    /// Same as `selectPage`, but sorts the matches by `orderBy` (when
-    /// non-empty, one or more columns applied left to right - see
-    /// `OrderBy`'s doc comment) before applying `page`'s offset/limit
-    /// window. `selectPage`'s early-stop optimization (dropping a full scan
-    /// or index cursor the moment `page.limit` matches are collected) is
-    /// only correct when results come out in the strategy's natural order -
-    /// sorting requires the full match set first, so an `orderBy` request
-    /// materializes every match via `selectAllMatches` (still using
-    /// whichever index `explain` would report, just without the early
-    /// stop), sorts it, then slices the requested window with
-    /// `applyRowPage`. An empty `orderBy` falls straight through to
-    /// `selectPage`, keeping the early-stop behavior unchanged for the
-    /// common unordered case.
     pub fn selectPageOrdered(self: *Table, pred: ?Predicate, page: Page, orderBy: []const OrderBy) ![]Row {
         if (orderBy.len == 0) return self.selectPage(pred, page);
         const all = try self.selectAllMatches(pred);
@@ -1025,9 +700,6 @@ pub const Table = struct {
         return applyRowPage(self.allocator, all, page);
     }
 
-    /// Collects every row matching `pred`, unpaged - the same
-    /// index-vs-full-scan strategy choice `selectPage`/`explain` make,
-    /// just always run to completion instead of stopping at a page limit.
     fn selectAllMatches(self: *Table, pred: ?Predicate) ![]Row {
         if (pred) |p| {
             if (self.findCompositeMatch(p)) |match| {
@@ -1042,13 +714,6 @@ pub const Table = struct {
         return self.scanFilteredPage(pred, .{});
     }
 
-    /// Reports which strategy `selectPage` would pick for `pred` without
-    /// running it - the exact same decision ladder (composite match first,
-    /// then a single-field indexable leaf, then a full scan), just stopping
-    /// one step short of building a cursor. Exists so a caller (the CLI's
-    /// `table explain`, its network/repl mirrors) can answer "would this
-    /// query use an index" without materializing rows or mutating anything,
-    /// which is why this takes `*const Table` unlike `selectPage`.
     pub fn explain(self: *const Table, allocator: Allocator, pred: ?Predicate) !Plan {
         if (pred) |p| {
             if (self.findCompositeMatch(p)) |match| {
@@ -1112,13 +777,6 @@ pub const Table = struct {
         return results.toOwnedSlice();
     }
 
-    /// Streams primary keys straight from the index cursor instead of first
-    /// materializing the whole candidate list (see `idx.EqCursor`/
-    /// `idx.RangeCursor`): once `page.limit` rows are collected the
-    /// underlying `Db` scan is simply dropped without decoding or even
-    /// reading whatever index entries would have come after it, which
-    /// matters when the indexed value has far more matches than the page
-    /// being asked for.
     fn selectByIndexPage(self: *Table, p: Predicate, cursorIn: IndexCursor, page: Page) ![]Row {
         var cursor = cursorIn;
         defer cursor.deinit();
@@ -1163,10 +821,6 @@ pub const Table = struct {
         }
     }
 
-    /// Streaming counterpart of the old `pksForLeaf` (which returned a fully
-    /// materialized `[]Value`): wraps whichever `idx` cursor constructor
-    /// matches the leaf's comparison so `selectByIndexPage` can decode and
-    /// discard candidates one at a time.
     const IndexCursor = union(enum) {
         eq: idx.EqCursor,
         range: idx.RangeCursor,
@@ -1207,29 +861,10 @@ pub const Table = struct {
         specIdx: usize,
         values: [maxCompositeFields]Value,
         matchedLen: usize,
-        // A range condition on the column immediately after the matched
-        // eq prefix (spec.fields[matchedLen]), if the predicate has one -
-        // same leftmost-prefix rule a real multi-column B-tree range scan
-        // follows: only the column right after the pinned prefix can be
-        // range-bound by the index, anything further is unconstrained.
         rangeLow: ?idx.Bound = null,
         rangeHigh: ?idx.Bound = null,
     };
 
-    /// Looks for a composite index whose leading ("leftmost") columns are
-    /// all pinned down by a top-level `eq` conjunct somewhere in `p` (an
-    /// `and_`, in any order - unlike a real SQL planner this does not
-    /// recurse into nested and_/or_, matching `findIndexableLeaf`'s scope).
-    /// The match may cover a strict prefix of the index's columns, not
-    /// necessarily all of them: a query naming only the first K of N
-    /// indexed fields still gets a narrowed lookup, same leftmost-prefix
-    /// rule a multi-column B-tree index gives you. When the column right
-    /// after the matched prefix also has a top-level lt/lte/gt/gte conjunct
-    /// on it, that becomes a range bound narrowing the scan further instead
-    /// of leaving it unconstrained. `selectByIndexPage` re-evaluates the
-    /// full predicate against every candidate row regardless, so an
-    /// unmatched suffix of columns (or any other conjunct entirely) never
-    /// affects correctness, only how much the index narrows the scan.
     fn findCompositeMatch(self: *const Table, p: Predicate) ?CompositeMatch {
         const preds = switch (p) {
             .and_ => |ps| ps,
@@ -1298,15 +933,6 @@ pub fn freeRows(allocator: Allocator, rows: []Row) void {
     allocator.free(rows);
 }
 
-/// Stable in-place sort of `rows` by `order`, using `rowmod.compare`'s
-/// total order across value types (see `OrderBy`'s doc comment for how a
-/// missing field sorts). Columns are compared left to right: the first
-/// entry decides unless it ties (`.eq`), in which case the next entry
-/// breaks the tie, and so on - a plain lexicographic comparator chain, the
-/// same rule SQL's `ORDER BY a, b, c` follows. `std.sort.block` rather than
-/// the faster unstable `std.sort.pdq` specifically so ties that survive
-/// every column preserve scan order, matching what `OrderBy`'s doc comment
-/// promises callers.
 fn sortRowsBy(rows: []Row, order: []const OrderBy) void {
     const Ctx = struct {
         order: []const OrderBy,
@@ -1325,12 +951,6 @@ fn sortRowsBy(rows: []Row, order: []const OrderBy) void {
     std.sort.block(Row, rows, Ctx{ .order = order }, Ctx.lessThan);
 }
 
-/// Slices an already-materialized, unpaged match set (as `selectAllMatches`
-/// returns) down to `page`'s offset/limit window, freeing every row that
-/// falls outside it and the original backing allocation - the ordered
-/// counterpart of the early-stop windowing `selectByIndexPage`/
-/// `scanFilteredPage` do inline while scanning. `rows` must not be used
-/// after this call regardless of error (see `errdefer` at the call site).
 fn applyRowPage(allocator: Allocator, rows: []Row, page: Page) ![]Row {
     const start = @min(page.offset, rows.len);
     const end = if (page.limit == 0) rows.len else @min(rows.len, start + page.limit);
@@ -1429,9 +1049,6 @@ test "like predicate filters by pattern and never uses an index on that field" {
 
     var table = try Table.open(&db, allocator, "users");
     defer table.deinit();
-    // Index the very field the like-predicate targets: `like` must still
-    // fall back to a full scan (`Value.compare`-based index entries have no
-    // notion of substring matching), never mistake this for an eq lookup.
     try table.createIndex("name");
 
     try table.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "Ada Lovelace" } }});
@@ -1481,10 +1098,6 @@ test "like combines with an indexed eq leaf inside and_ without breaking the ind
     };
     const pred = Predicate{ .and_ = &preds };
 
-    // findIndexableLeaf must still pick the `eq` leaf on `city` for the
-    // index scan even though `like` sits right next to it in the same and_;
-    // selectByIndexPage then re-evaluates the whole predicate (including
-    // `like`) against every index candidate.
     var plan = try table.explain(allocator, pred);
     defer plan.deinit(allocator);
     try std.testing.expectEqual(PlanKind.index_eq, plan.kind);
@@ -1514,7 +1127,6 @@ test "index stays in sync across update and delete" {
         try std.testing.expectEqual(@as(usize, 1), warsaw.len);
     }
 
-    // Move the row to a different city: the old index entry must disappear.
     try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "krakow" } }});
     {
         const warsaw = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
@@ -1548,7 +1160,6 @@ test "dropIndex removes entries and falls back to full scan" {
     try table.dropIndex("city");
     try std.testing.expect(!table.hasIndex("city"));
 
-    // Still correct without the index, just via full scan.
     const results = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
     defer freeRows(allocator, results);
     try std.testing.expectEqual(@as(usize, 1), results.len);
@@ -1684,8 +1295,6 @@ test "is_null selects only sparse rows missing the field, over a full scan" {
     defer freeRows(allocator, present);
     try std.testing.expectEqual(@as(usize, 1), present.len);
 
-    // is_null on an indexed field still falls back to full_scan (not
-    // indexable), but the result is unaffected by the index's presence.
     try table.createIndex("age");
     const stillMissing = try table.select(.{ .is_null = "city" });
     defer freeRows(allocator, stillMissing);
@@ -1716,8 +1325,6 @@ test "selectPage skips offset and stops at limit on a full scan" {
     var table = try Table.open(&db, allocator, "users");
     defer table.deinit();
 
-    // Row keys are the pk's order-preserving encoding, so full-scan order
-    // is ascending pk regardless of insertion order.
     var pk: i64 = 10;
     while (pk >= 1) : (pk -= 1) {
         try table.put(.{ .int = pk }, &.{});
@@ -1784,8 +1391,6 @@ test "selectPage paginates through an index-narrowed predicate in pk order" {
     while (pk <= 6) : (pk += 1) {
         try table.put(.{ .int = pk }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
     }
-    // Noise row indexed under a different value - must never leak into the
-    // paginated "warsaw" result regardless of offset/limit.
     try table.put(.{ .int = 99 }, &.{.{ .name = "city", .value = .{ .text = "krakow" } }});
 
     const pred = Predicate{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } };
@@ -1810,14 +1415,6 @@ test "selectPage paginates through an index-narrowed predicate in pk order" {
 }
 
 test "selectPage against a large indexed bucket stays correct with a small limit" {
-    // Exercises the streaming `cursorForLeaf` path (see index.zig's
-    // EqCursor) against a bucket far larger than the requested page: a
-    // regression that only materialized the first `limit` matches would
-    // silently pass this test too, but a regression that went back to
-    // materializing the whole 500-row match set first would still pass on
-    // correctness alone - the point of the streaming rewrite is that this
-    // scan touches roughly `offset + limit` index entries, not 500, which is
-    // asserted structurally in index.zig's cursor tests via early deinit.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1852,9 +1449,6 @@ test "selectPageOrdered sorts a full scan ascending and descending by an int fie
 
     var table = try Table.open(&db, allocator, "users");
     defer table.deinit();
-    // Insert pks out of score order so ascending pk (the natural full-scan
-    // order) is NOT already sorted by `score` - a regression that forgot to
-    // sort and just returned scan order would fail both assertions below.
     const scores = [_]i64{ 30, 10, 50, 20, 40 };
     for (scores, 1..) |score, pk| {
         try table.put(.{ .int = @intCast(pk) }, &.{.{ .name = "score", .value = .{ .int = score } }});
@@ -1883,9 +1477,6 @@ test "selectPageOrdered applies offset/limit after sorting, not before" {
     defer table.deinit();
     var pk: i64 = 1;
     while (pk <= 10) : (pk += 1) {
-        // Descending score as pk increases, so "top 3 by score desc" is the
-        // FIRST 3 pks, not the last 3 - a page-then-sort bug (paging the
-        // natural scan order before sorting) would return the wrong rows.
         try table.put(.{ .int = pk }, &.{.{ .name = "score", .value = .{ .int = 100 - pk } }});
     }
 
@@ -1911,11 +1502,6 @@ test "selectPageOrdered sorts text fields lexically and is stable on ties" {
 
     var table = try Table.open(&db, allocator, "users");
     defer table.deinit();
-    // Two "warsaw" rows (pk 1 and 3) tie on `city` - a stable sort must keep
-    // them in scan order (1 before 3) relative to each other even though
-    // "krakow" (pk 2) sorts between them lexically... except it doesn't,
-    // "krakow" < "warsaw", so both warsaw rows land after it, still in
-    // their original relative order (1 then 3).
     try table.put(.{ .int = 1 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
     try table.put(.{ .int = 2 }, &.{.{ .name = "city", .value = .{ .text = "krakow" } }});
     try table.put(.{ .int = 3 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
@@ -1971,9 +1557,6 @@ test "selectPageOrdered on an indexed predicate still uses the index, not a full
     }
     const pred = Predicate{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } };
 
-    // Cross-check against `explain` (same predicate shape it already tests
-    // elsewhere): `selectAllMatches` must still pick the `city` index, only
-    // skipping the early-stop, not falling back to a full scan.
     var plan = try table.explain(allocator, pred);
     defer plan.deinit(allocator);
     try std.testing.expectEqual(PlanKind.index_eq, plan.kind);
@@ -1999,10 +1582,6 @@ test "selectPageOrdered with two columns sorts by the first, breaking ties with 
 
     var table = try Table.open(&db, allocator, "people");
     defer table.deinit();
-    // Two cities, each with scores NOT already grouped or sorted by pk -
-    // a single-column sort on `city` alone would leave each city's rows in
-    // scan order (which happens to already be reverse-score here), so
-    // this only passes if `score` is truly applied as a tiebreaker.
     try table.put(.{ .int = 1 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "score", .value = .{ .int = 30 } } });
     try table.put(.{ .int = 2 }, &.{ .{ .name = "city", .value = .{ .text = "krakow" } }, .{ .name = "score", .value = .{ .int = 20 } } });
     try table.put(.{ .int = 3 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "score", .value = .{ .int = 10 } } });
@@ -2011,8 +1590,6 @@ test "selectPageOrdered with two columns sorts by the first, breaking ties with 
     const rows = try table.selectPageOrdered(null, .{}, &.{ .{ .field = "city" }, .{ .field = "score" } });
     defer freeRows(allocator, rows);
     try std.testing.expectEqual(@as(usize, 4), rows.len);
-    // krakow (score 20, 40) before warsaw (score 10, 30), each group
-    // internally ascending by score regardless of pk/insertion order.
     try std.testing.expectEqual(@as(i64, 2), rows[0].get(pkField).?.int);
     try std.testing.expectEqual(@as(i64, 4), rows[1].get(pkField).?.int);
     try std.testing.expectEqual(@as(i64, 3), rows[2].get(pkField).?.int);
@@ -2032,15 +1609,11 @@ test "selectPageOrdered with two columns honors independent directions per colum
     try table.put(.{ .int = 2 }, &.{ .{ .name = "city", .value = .{ .text = "warsaw" } }, .{ .name = "score", .value = .{ .int = 20 } } });
     try table.put(.{ .int = 3 }, &.{ .{ .name = "city", .value = .{ .text = "krakow" } }, .{ .name = "score", .value = .{ .int = 5 } } });
 
-    // city ascending, score DESCENDING - a comparator that only flips the
-    // whole tuple's sign (instead of applying `descending` per column)
-    // would get the city order right but the within-city score order
-    // backwards.
     const rows = try table.selectPageOrdered(null, .{}, &.{ .{ .field = "city" }, .{ .field = "score", .descending = true } });
     defer freeRows(allocator, rows);
-    try std.testing.expectEqual(@as(i64, 3), rows[0].get(pkField).?.int); // krakow
-    try std.testing.expectEqual(@as(i64, 2), rows[1].get(pkField).?.int); // warsaw score 20
-    try std.testing.expectEqual(@as(i64, 1), rows[2].get(pkField).?.int); // warsaw score 10
+    try std.testing.expectEqual(@as(i64, 3), rows[0].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 2), rows[1].get(pkField).?.int);
+    try std.testing.expectEqual(@as(i64, 1), rows[2].get(pkField).?.int);
 }
 
 test "selectPageOrdered with an empty order-by falls through to selectPage's early-stop behavior" {
@@ -2125,9 +1698,6 @@ test "composite index leftmost prefix narrows without constraining every column"
         .{ .name = "age", .value = .{ .int = 50 } },
     });
 
-    // Only the leading column is constrained - the composite index must
-    // still narrow the scan to the two warsaw rows via its leftmost prefix,
-    // and the (unindexed-alone) age column is unconstrained here.
     const results = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
     defer freeRows(allocator, results);
     try std.testing.expectEqual(@as(usize, 2), results.len);
@@ -2156,9 +1726,6 @@ test "composite index uses a range bound on the column after the matched prefix"
         });
     }
 
-    // city == "warsaw" and 23 <= age < 27: must stay inside the warsaw
-    // bucket of the composite index even though krakow rows overlap the
-    // same age range byte-for-byte.
     const preds = [_]Predicate{
         .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
         .{ .gte = .{ .field = "age", .value = .{ .int = 23 } } },
@@ -2172,7 +1739,6 @@ test "composite index uses a range bound on the column after the matched prefix"
         try std.testing.expect(r.get("age").?.int >= 23 and r.get("age").?.int < 27);
     }
 
-    // A one-sided range (age > 27) narrows the same way.
     const openPreds = [_]Predicate{
         .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
         .{ .gt = .{ .field = "age", .value = .{ .int = 27 } } },
@@ -2213,7 +1779,6 @@ test "composite index stays in sync across update and delete" {
         try std.testing.expectEqual(@as(usize, 1), found.len);
     }
 
-    // Moving age away from 30 must drop the old composite entry.
     try table.put(.{ .int = 1 }, &.{
         .{ .name = "city", .value = .{ .text = "warsaw" } },
         .{ .name = "age", .value = .{ .int = 31 } },
@@ -2224,10 +1789,6 @@ test "composite index stays in sync across update and delete" {
         try std.testing.expectEqual(@as(usize, 0), stale.len);
     }
 
-    // A row missing one of the composite columns entirely must not produce
-    // a (partial, ill-formed) entry: the put must still succeed, and the
-    // row must never surface as a false match on any age value including
-    // its own current (missing) one.
     try table.put(.{ .int = 2 }, &.{.{ .name = "city", .value = .{ .text = "warsaw" } }});
     {
         const wholeTable = try table.select(null);
@@ -2389,12 +1950,6 @@ test "explain reports composite_eq and composite_range with matched/total field 
         .{ .name = "age", .value = .{ .int = 30 } },
     });
 
-    // Only the leading column pinned -> composite_eq over a strict prefix
-    // (matchedFields 1 of 2). `findCompositeMatch` only looks inside a
-    // top-level `and_` (see its doc comment), so a bare single `eq` outside
-    // one does not reach the composite index at all - wrapping in `and_`
-    // with itself as the sole conjunct is what actually exercises the
-    // leftmost-prefix match here.
     const prefixPreds = [_]Predicate{
         .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
     };
@@ -2405,7 +1960,6 @@ test "explain reports composite_eq and composite_range with matched/total field 
     try std.testing.expectEqual(@as(usize, 1), prefixOnly.matchedFields);
     try std.testing.expectEqual(@as(usize, 2), prefixOnly.totalFields);
 
-    // Both columns pinned by equality -> composite_eq, fully matched.
     const eqPreds = [_]Predicate{
         .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
         .{ .eq = .{ .field = "age", .value = .{ .int = 30 } } },
@@ -2415,7 +1969,6 @@ test "explain reports composite_eq and composite_range with matched/total field 
     try std.testing.expectEqual(PlanKind.composite_eq, fullEq.kind);
     try std.testing.expectEqual(@as(usize, 2), fullEq.matchedFields);
 
-    // Leading column pinned by equality, next column range-bound -> composite_range.
     const rangePreds = [_]Predicate{
         .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
         .{ .gte = .{ .field = "age", .value = .{ .int = 18 } } },
@@ -2445,7 +1998,6 @@ test "explain never mutates the table (const receiver, no rows touched)" {
     defer plan.deinit(allocator);
     try std.testing.expectEqual(PlanKind.index_eq, plan.kind);
 
-    // The row explain() was asked about is still there afterwards.
     const rows = try table.select(pred);
     defer freeRows(allocator, rows);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
@@ -2496,7 +2048,6 @@ test "updateWhere with a null predicate touches every row" {
     var row1 = (try table.get(.{ .int = 1 })).?;
     defer row1.deinit();
     try std.testing.expectEqualStrings("seen", row1.get("flag").?.text);
-    // Untouched fields survive the merge.
     try std.testing.expectEqual(Value{ .int = 5 }, row1.get("n").?);
 }
 
@@ -2537,8 +2088,6 @@ test "updateWhere keeps a secondary index in sync when the indexed field changes
     );
     try std.testing.expectEqual(@as(usize, 1), updated);
 
-    // The stale index entry is gone, a fresh one under the new value works,
-    // and explain() confirms the index (not a full scan) still serves it.
     const stale = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
     defer freeRows(allocator, stale);
     try std.testing.expectEqual(@as(usize, 0), stale.len);
@@ -2585,9 +2134,6 @@ test "updateWhere keeps a composite index in sync across leading and trailing co
         .{ .name = "name", .value = .{ .text = "dave" } },
     });
 
-    // updateWhere matched through the composite index (both columns pinned
-    // by equality) moves the TRAILING column (age). The old composite entry
-    // for row 1 must vanish and a fresh one under the new age must serve it.
     {
         const preds = [_]Predicate{
             .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
@@ -2625,9 +2171,6 @@ test "updateWhere keeps a composite index in sync across leading and trailing co
         try std.testing.expectEqual(@as(usize, 2), plan.matchedFields);
     }
 
-    // Same check but moving the LEADING column (city) instead of the
-    // trailing one - a different code path in the composite key encoding
-    // (the prefix itself shifts, not just the suffix).
     {
         const preds = [_]Predicate{
             .{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } },
@@ -2658,10 +2201,6 @@ test "updateWhere keeps a composite index in sync across leading and trailing co
         try std.testing.expectEqual(@as(i64, 2), fresh[0].get(pkField).?.int);
     }
 
-    // updateWhere reached through composite_range (leading column pinned by
-    // equality, trailing column range-bound) must update every row the
-    // range covers, and leave the composite index able to keep serving
-    // both afterwards even though only the unindexed "name" field changed.
     {
         const rangePreds = [_]Predicate{
             .{ .eq = .{ .field = "city", .value = .{ .text = "krakow" } } },
@@ -2680,9 +2219,6 @@ test "updateWhere keeps a composite index in sync across leading and trailing co
         try std.testing.expectEqual(@as(usize, 2), updated);
     }
 
-    // Final sanity sweep: every row is still reachable through the
-    // composite index under exactly its current (city, age), nothing was
-    // lost, duplicated, or left under a stale key.
     const expectations = [_]struct { pk: i64, city: []const u8, age: i64, name: []const u8 }{
         .{ .pk = 1, .city = "warsaw", .age = 45, .name = "alice" },
         .{ .pk = 2, .city = "gdansk", .age = 31, .name = "bob" },
@@ -2785,9 +2321,6 @@ test "deleteWhere removes stale secondary index entries so a fresh row can reuse
     const deleted = try table.deleteWhere(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
     try std.testing.expectEqual(@as(usize, 1), deleted);
 
-    // The old index entry for pk 1 under "warsaw" must be gone, not just the
-    // row - otherwise a later put of a *different* pk under the same "warsaw"
-    // value would find a phantom sibling in the index.
     const stale = try table.select(.{ .eq = .{ .field = "city", .value = .{ .text = "warsaw" } } });
     defer freeRows(allocator, stale);
     try std.testing.expectEqual(@as(usize, 0), stale.len);
@@ -2839,9 +2372,6 @@ test "deleteWhere removes stale composite index entries across matched equality 
     defer freeRows(allocator, gone);
     try std.testing.expectEqual(@as(usize, 0), gone.len);
 
-    // The composite index must still correctly serve the two untouched rows,
-    // proving the deleted row's entry was surgically removed, not the whole
-    // (city="warsaw") or (age=30) bucket.
     const survivors = [_]struct { pk: i64, city: []const u8, age: i64 }{
         .{ .pk = 2, .city = "warsaw", .age = 31 },
         .{ .pk = 3, .city = "krakow", .age = 30 },
@@ -2902,7 +2432,6 @@ test "createUniqueIndex refuses to install over data that already has a duplicat
 
     try std.testing.expectError(error.UniqueViolation, table.createUniqueIndex("email"));
     try std.testing.expect(!table.hasUniqueIndex("email"));
-    // Refused install must not have left a half-installed plain index either.
     try std.testing.expect(!table.hasIndex("email"));
 }
 
@@ -2946,7 +2475,6 @@ test "unique constraint does not block updating a row's own value or an unrelate
     });
     try table.createUniqueIndex("email");
 
-    // Re-writing the same email on the same row must not conflict with itself.
     try table.put(.{ .int = 1 }, &.{
         .{ .name = "email", .value = .{ .text = "a@x.com" } },
         .{ .name = "age", .value = .{ .int = 31 } },
@@ -2996,7 +2524,6 @@ test "dropIndex on a unique field also drops the unique constraint" {
     try std.testing.expect(!table.hasUniqueIndex("email"));
     try std.testing.expect(!table.hasIndex("email"));
 
-    // With no constraint left, a colliding value must now be accepted.
     try table.put(.{ .int = 2 }, &.{.{ .name = "email", .value = .{ .text = "a@x.com" } }});
     const rows = try table.scanAll();
     defer freeRows(allocator, rows);
@@ -3093,7 +2620,6 @@ test "createForeignKey against a UNIQUE non-pk field works, and refuses a target
     var lineItems = try Table.open(&db, allocator, "line_items");
     defer lineItems.deinit();
 
-    // "sku" has no unique constraint on products yet.
     try std.testing.expectError(error.ForeignKeyRequiresUniqueTarget, lineItems.createForeignKey("product_sku", "products", "sku", .restrict));
 
     try products.createUniqueIndex("sku");
@@ -3137,7 +2663,6 @@ test "a row with no value for the foreign key field is exempt from the constrain
     defer orders.deinit();
     try orders.createForeignKey("customer_id", "customers", pkField, .restrict);
 
-    // No "customer_id" field at all - a nullable foreign key, not a violation.
     try orders.put(.{ .int = 1 }, &.{.{ .name = "note", .value = .{ .text = "guest checkout" } }});
     var row = (try orders.get(.{ .int = 1 })).?;
     defer row.deinit();
@@ -3184,11 +2709,9 @@ test "deleting a parent row is restricted while a child still references it via 
     try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
 
     try std.testing.expectError(error.ForeignKeyInUse, customers.delete(.{ .int = 1 }));
-    // Restricted, not silently ignored: the row is still there afterwards.
     var stillThere = (try customers.get(.{ .int = 1 })).?;
     stillThere.deinit();
 
-    // Once the referencing child row is gone, the parent can be deleted.
     try orders.delete(.{ .int = 100 });
     try customers.delete(.{ .int = 1 });
     try std.testing.expect((try customers.get(.{ .int = 1 })) == null);
@@ -3212,10 +2735,6 @@ test "deleteWhere on a parent table stops at the first row a child still referen
     try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 2 } }});
 
     try std.testing.expectError(error.ForeignKeyInUse, customers.deleteWhere(null));
-    // customer 1 had no children and was already removed by the time
-    // deleteWhere hit customer 2's violation - deleteWhere has no
-    // per-batch atomicity (see its own doc comment), so a partial effect
-    // here is expected, not a bug this test is trying to hide.
     try std.testing.expect((try customers.get(.{ .int = 1 })) == null);
     var stillThere = (try customers.get(.{ .int = 2 })).?;
     stillThere.deinit();
@@ -3284,8 +2803,6 @@ test "a self-referencing foreign key restricts deleting a manager with reports, 
     });
 
     try std.testing.expectError(error.ForeignKeyInUse, employees.delete(.{ .int = 1 }));
-    // The leaf (no reports) deletes cleanly - and does not restrict its
-    // own deletion against itself despite scanning the same table.
     try employees.delete(.{ .int = 2 });
     try employees.delete(.{ .int = 1 });
     try std.testing.expect((try employees.get(.{ .int = 1 })) == null);
@@ -3340,9 +2857,7 @@ test "a self-referencing foreign key enforces a tree structure against the table
     try employees.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "CEO" } }});
     try employees.createForeignKey("manager_id", "employees", pkField, .restrict);
 
-    // A row with no manager (the root of the tree) is exempt.
     try employees.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "CEO" } }});
-    // A report naming an existing manager is fine.
     try employees.put(.{ .int = 2 }, &.{
         .{ .name = "name", .value = .{ .text = "VP" } },
         .{ .name = "manager_id", .value = .{ .int = 1 } },
@@ -3369,19 +2884,8 @@ test "deleting a referenced parent is blocked before it can leave a child's fore
     try orders.createForeignKey("customer_id", "customers", pkField, .restrict);
     try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
 
-    // This used to be the one gap `updateWhere`'s own per-row FK re-check
-    // existed to catch after the fact: a bare `customers.delete` leaving
-    // orders#100's reference dangling even though it was valid when first
-    // written (see createForeignKey's OLD doc comment). `Table.delete`'s
-    // ON DELETE RESTRICT check (backed by `ReferencedBySet`) now closes it
-    // at the source instead - the dangling state this test used to
-    // construct is no longer reachable through delete at all.
     try std.testing.expectError(error.ForeignKeyInUse, customers.delete(.{ .int = 1 }));
 
-    // updateWhere re-writes the row through put with every field carried
-    // over unchanged, including "customer_id" - it has nothing to catch,
-    // because the reference was never allowed to go dangling in the first
-    // place.
     try std.testing.expectEqual(@as(usize, 1), try orders.updateWhere(null, &.{
         .{ .name = "note", .value = .{ .text = "touch" } },
     }));
@@ -3404,8 +2908,6 @@ test "put is restricted from changing a UNIQUE foreign key target still referenc
     try lineItems.createForeignKey("product_sku", "products", "sku", .restrict);
     try lineItems.put(.{ .int = 1 }, &.{.{ .name = "product_sku", .value = .{ .text = "WIDGET-1" } }});
 
-    // Renaming the sku out from under the still-live line item must not
-    // silently strand it - the same RESTRICT a delete would get.
     try std.testing.expectError(error.ForeignKeyInUse, products.put(.{ .int = 1 }, &.{
         .{ .name = "sku", .value = .{ .text = "WIDGET-2" } },
     }));
@@ -3413,12 +2915,8 @@ test "put is restricted from changing a UNIQUE foreign key target still referenc
     defer stillThere.deinit();
     try std.testing.expectEqualStrings("WIDGET-1", stillThere.get("sku").?.text);
 
-    // Rewriting the same value back (or any other unrelated field) is not
-    // a change and is always exempt, mirroring the UNIQUE check's own
-    // "unchanged is safe" exemption.
     try products.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "WIDGET-1" } }});
 
-    // Once the reference is gone, the rename goes through.
     try lineItems.delete(.{ .int = 1 });
     try products.put(.{ .int = 1 }, &.{.{ .name = "sku", .value = .{ .text = "WIDGET-2" } }});
     var renamed = (try products.get(.{ .int = 1 })).?;
@@ -3447,8 +2945,6 @@ test "updateWhere is restricted from pulling a UNIQUE foreign key target out fro
         .{ .name = "sku", .value = .{ .text = "WIDGET-2" } },
     }));
 
-    // A bulk update that leaves the referenced field untouched has
-    // nothing to restrict.
     try std.testing.expectEqual(@as(usize, 1), try products.updateWhere(null, &.{
         .{ .name = "note", .value = .{ .text = "touch" } },
     }));
@@ -3471,24 +2967,15 @@ test "a self-referencing foreign key restricts renaming a UNIQUE field still tar
         .{ .name = "manager_badge", .value = .{ .text = "B1" } },
     });
 
-    // Employee 2 still points at "B1" - renaming employee 1's own badge
-    // must be restricted.
     try std.testing.expectError(error.ForeignKeyInUse, employees.put(.{ .int = 1 }, &.{
         .{ .name = "badge", .value = .{ .text = "B1-NEW" } },
     }));
 
-    // Employee 2 renaming its OWN badge (not the field being referenced by
-    // anyone) is unaffected - and does not restrict against itself despite
-    // the scan covering the same table.
     try employees.put(.{ .int = 2 }, &.{
         .{ .name = "badge", .value = .{ .text = "B2-NEW" } },
         .{ .name = "manager_badge", .value = .{ .text = "B1" } },
     });
 
-    // Once the report's manager_badge field is dropped (a row with no
-    // value for the FK field is exempt from the constraint, so this is a
-    // valid way to stop referencing anything), the manager's badge can be
-    // renamed.
     try employees.put(.{ .int = 2 }, &.{
         .{ .name = "badge", .value = .{ .text = "B2-NEW" } },
     });
@@ -3629,8 +3116,6 @@ test "ON DELETE CASCADE removes referencing rows instead of restricting the pare
     try std.testing.expect((try orders.get(.{ .int = 100 })) == null);
     try std.testing.expect((try orders.get(.{ .int = 101 })) == null);
 
-    // Untouched: customer 2 and its own order were never in the cascade's
-    // path.
     var otherCustomer = (try customers.get(.{ .int = 2 })).?;
     otherCustomer.deinit();
     var otherOrder = (try orders.get(.{ .int = 200 })).?;
@@ -3663,10 +3148,6 @@ test "ON DELETE CASCADE keeps secondary indexes on the cascaded rows in sync" {
 
     try customers.delete(.{ .int = 1 });
 
-    // The cascaded delete went through `executeDelete`, which maintains
-    // secondary indexes exactly like a direct `orders.delete` would - a
-    // stale index entry pointing at a now-gone row would otherwise poison
-    // every future `status = "open"` scan.
     const after = try idx.scanEq(&db, allocator, "orders", "status", .{ .text = "open" });
     defer allocator.free(after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
@@ -3694,8 +3175,6 @@ test "ON DELETE CASCADE recurses transitively across more than one hop" {
     try lineItems.put(.{ .int = 1000 }, &.{.{ .name = "order_id", .value = .{ .int = 100 } }});
     try lineItems.put(.{ .int = 1001 }, &.{.{ .name = "order_id", .value = .{ .int = 100 } }});
 
-    // Deleting the customer must cascade into orders, and from there into
-    // line_items - two hops, not just one.
     try customers.delete(.{ .int = 1 });
 
     try std.testing.expect((try customers.get(.{ .int = 1 })) == null);
@@ -3720,10 +3199,6 @@ test "ON DELETE CASCADE is all-or-nothing: a RESTRICT hit anywhere in the fan-ou
     try orders.createForeignKey("customer_id", "customers", pkField, .cascade);
     try orders.put(.{ .int = 100 }, &.{.{ .name = "customer_id", .value = .{ .int = 1 } }});
 
-    // A shipment row RESTRICTs deleting the order it points at - deleting
-    // the customer would need to cascade into this order, but the order
-    // itself cannot legally go while its own restrict-mode reference is
-    // still live.
     var shipments = try Table.open(&db, allocator, "shipments");
     defer shipments.deinit();
     try shipments.createForeignKey("order_id", "orders", pkField, .restrict);
@@ -3731,10 +3206,6 @@ test "ON DELETE CASCADE is all-or-nothing: a RESTRICT hit anywhere in the fan-ou
 
     try std.testing.expectError(error.ForeignKeyInUse, customers.delete(.{ .int = 1 }));
 
-    // Two-phase plan-then-execute means the customer AND the order (which
-    // had already been planned for cascade removal before the restrict
-    // hit further down was discovered) are both still there - not just
-    // the customer.
     var stillCustomer = (try customers.get(.{ .int = 1 })).?;
     stillCustomer.deinit();
     var stillOrder = (try orders.get(.{ .int = 100 })).?;
@@ -3750,9 +3221,6 @@ test "ON DELETE CASCADE terminates on a two-table delete cycle instead of recurs
     var db = try openTemp(&tmp, allocator);
     defer db.close();
 
-    // `a` and `b` each carry a nullable FK at the other, both ON DELETE
-    // CASCADE - a delete starting from either side must not infinite-loop
-    // bouncing back and forth between the two tables.
     var a = try Table.open(&db, allocator, "a");
     defer a.deinit();
     var b = try Table.open(&db, allocator, "b");
@@ -3781,7 +3249,6 @@ test "ON DELETE CASCADE on a self-referencing foreign key removes an entire subt
     defer employees.deinit();
     try employees.createForeignKey("manager_id", "employees", pkField, .cascade);
 
-    // 1 (CEO) -> 2 (VP) -> 3 and 4 (reports of the VP).
     try employees.put(.{ .int = 1 }, &.{.{ .name = "name", .value = .{ .text = "CEO" } }});
     try employees.put(.{ .int = 2 }, &.{
         .{ .name = "name", .value = .{ .text = "VP" } },
@@ -3796,8 +3263,6 @@ test "ON DELETE CASCADE on a self-referencing foreign key removes an entire subt
         .{ .name = "manager_id", .value = .{ .int = 2 } },
     });
 
-    // Deleting the VP must cascade to both reports, but must not touch the
-    // CEO (an ancestor, not a dependent).
     try employees.delete(.{ .int = 2 });
 
     var ceo = (try employees.get(.{ .int = 1 })).?;
@@ -3861,8 +3326,6 @@ test "dropForeignKey lifts a CASCADE constraint the same as a RESTRICT one" {
     try customers.delete(.{ .int = 1 });
 
     try std.testing.expect((try customers.get(.{ .int = 1 })) == null);
-    // No FK left at all, so the order is untouched by the parent's delete -
-    // not restricted, not cascaded, simply irrelevant now.
     var stillOrder = (try orders.get(.{ .int = 100 })).?;
     stillOrder.deinit();
 }

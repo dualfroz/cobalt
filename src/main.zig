@@ -11,23 +11,30 @@ const usage =
     \\
     \\commands:
     \\  put <key> <value> [--ttl <seconds>]
-    \\                            store a value, optionally set to expire
+    \\                            store a value, optionally set to expire; without
+    \\                            --ttl any earlier ttl is dropped in the same write
     \\  get <key>                print a value or (nil); a key past its ttl
     \\                            reads as (nil) and is deleted lazily on this read
     \\  del <key>                delete a key
     \\  expire <key> <seconds>   set/replace a key's ttl; error if the key does
-    \\                            not currently exist (nonexistent keys have no ttl to set)
+    \\                            not currently exist or its ttl already passed
     \\  persist <key>            remove a key's ttl, making it immortal again
     \\  ttl <key>                print seconds left, -1 if no ttl, -2 if no such key
+    \\                            or its ttl already passed
     \\  expire-sweep              actively delete every key whose ttl is due,
     \\                            not just the next one someone happens to read;
     \\                            prints how many were reaped
-    \\  scan [start] [end]       forward range scan, start inclusive, end exclusive
-    \\  rscan [start] [end]      reverse range scan
-    \\  prefix <prefix>          scan every key under a prefix
+    \\  scan [start] [end]       forward range scan over user keys, start inclusive,
+    \\                            end exclusive; internal entries (first byte 0xF5-0xFF:
+    \\                            tables, collections, ttl markers, users) are never listed,
+    \\                            and neither is a key past its ttl
+    \\  rscan [start] [end]      reverse range scan over user keys
+    \\  prefix <prefix>          scan every user key under a prefix
     \\  compact                  run full leveled compaction
     \\  stats [--prom]           print database statistics (optionally as Prometheus text)
-    \\  verify <n>               write n keys, reopen, check durability and scan order
+    \\  verify <n>               write n keys, reopen, check durability and scan order;
+    \\                            runs in a fresh scratch directory under $TMPDIR (or /tmp)
+    \\                            that is removed afterwards, <dir> is never touched
     \\  serve [host:port] [--rate-limit <capacity> <per-second>]
     \\                     [--per-conn-rate-limit <capacity> <per-second>] [--auth]
     \\                     [--session-ttl <seconds>] [--session-sweep-interval <seconds>]
@@ -581,153 +588,119 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, command, "verify")) {
         const count = if (rest.len >= 1) std.fmt.parseInt(usize, rest[0], 10) catch 1000 else 1000;
-        try runVerify(allocator, stdout, dir, count);
+        const scratchParent = std.posix.getenv("TMPDIR") orelse "/tmp";
+        if (!try cobalt.verify.run(allocator, stdout, scratchParent, count)) std.process.exit(1);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-select")) {
-        // Reuses the <dir> slot as a host:port to connect to, exactly like
-        // `verify` reuses it as the directory under test - `remote-select`
-        // never opens a local Db at all.
         try runRemoteSelect(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-join")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-select` - never opens a local Db.
         try runRemoteJoin(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-aggregate")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-select` - never opens a local Db.
         try runRemoteAggregate(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-window")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-select` - never opens a local Db.
         try runRemoteWindow(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-publish")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-select` - never opens a local Db.
         try runRemotePublish(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-subscribe")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-select` - never opens a local Db.
         try runRemoteSubscribe(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-unsubscribe")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-select` - never opens a local Db.
         try runRemoteUnsubscribe(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-explain")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-select` - never opens a local Db.
         try runRemoteExplain(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-update")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-select` - never opens a local Db.
         try runRemoteUpdate(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-delete")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-select` - never opens a local Db.
         try runRemoteDelete(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-export")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-select` - never opens a local Db.
         try runRemoteExport(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-import")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-select` - never opens a local Db.
         try runRemoteImport(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-user")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-select` - never opens a local Db.
         try runRemoteUser(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-stats")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-select`/`remote-user` - never opens a local Db.
         try runRemoteStats(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-ttl")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-select`/`remote-user`/`remote-stats` - never opens a
-        // local Db.
         try runRemoteTtl(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-coll-ttl")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-ttl` - never opens a local Db.
         try runRemoteCollTtl(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-coll")) {
-        // Same "<dir> slot is really host:port" convention as
-        // `remote-coll-ttl` - never opens a local Db.
         try runRemoteColl(allocator, stdout, stderr, dir, rest);
         return;
     }
 
     if (std.mem.eql(u8, command, "remote-txn")) {
-        // Same "<dir> slot is really host:port" convention as every other
-        // remote-* command - never opens a local Db.
         try runRemoteTxn(allocator, stdout, stderr, dir, rest);
         return;
     }
 
-    var db = try cobalt.Db.open(allocator, dir, .{});
+    var db = try openOrExit(allocator, stderr, dir, command);
     defer db.close();
 
     if (std.mem.eql(u8, command, "put")) {
         if (rest.len < 2) return fail(stderr, "put needs <key> <value>");
-        try db.put(rest[0], rest[1]);
-        if (rest.len >= 4 and std.mem.eql(u8, rest[2], "--ttl")) {
+        try requireUserKey(stderr, rest[0]);
+        if (rest.len == 4 and std.mem.eql(u8, rest[2], "--ttl")) {
             const seconds = std.fmt.parseInt(u64, rest[3], 10) catch return fail(stderr, "--ttl needs a whole number of seconds");
-            try cobalt.ttl.setExpireSeconds(&db, allocator, rest[0], std.time.nanoTimestamp(), seconds);
-        } else if (rest.len > 2) {
+            try cobalt.ttl.putWithTtl(&db, allocator, rest[0], rest[1], std.time.nanoTimestamp(), seconds);
+        } else if (rest.len == 2) {
+            try cobalt.ttl.putPersistent(&db, allocator, rest[0], rest[1]);
+        } else {
             return fail(stderr, "put takes <key> <value> [--ttl <seconds>]");
         }
         try db.maybeCompact();
     } else if (std.mem.eql(u8, command, "get")) {
         if (rest.len < 1) return fail(stderr, "get needs <key>");
+        try requireUserKey(stderr, rest[0]);
         if (try cobalt.ttl.getLive(&db, allocator, rest[0], std.time.nanoTimestamp())) |value| {
             defer allocator.free(value);
             try stdout.print("{s}\n", .{value});
@@ -736,20 +709,21 @@ pub fn main() !void {
         }
     } else if (std.mem.eql(u8, command, "del")) {
         if (rest.len < 1) return fail(stderr, "del needs <key>");
-        try db.delete(rest[0]);
-        try cobalt.ttl.clearExpire(&db, allocator, rest[0]);
+        try requireUserKey(stderr, rest[0]);
+        try cobalt.ttl.deleteKey(&db, allocator, rest[0]);
         try db.maybeCompact();
     } else if (std.mem.eql(u8, command, "expire")) {
         if (rest.len < 2) return fail(stderr, "expire needs <key> <seconds>");
+        try requireUserKey(stderr, rest[0]);
         const seconds = std.fmt.parseInt(u64, rest[1], 10) catch return fail(stderr, "expire needs a whole number of seconds");
-        const existing = try db.get(allocator, rest[0]) orelse return fail(stderr, "no such key");
-        allocator.free(existing);
-        try cobalt.ttl.setExpireSeconds(&db, allocator, rest[0], std.time.nanoTimestamp(), seconds);
+        if (!try cobalt.ttl.expireLive(&db, allocator, rest[0], std.time.nanoTimestamp(), seconds)) return fail(stderr, "no such key");
     } else if (std.mem.eql(u8, command, "persist")) {
         if (rest.len < 1) return fail(stderr, "persist needs <key>");
+        try requireUserKey(stderr, rest[0]);
         try cobalt.ttl.clearExpire(&db, allocator, rest[0]);
     } else if (std.mem.eql(u8, command, "ttl")) {
         if (rest.len < 1) return fail(stderr, "ttl needs <key>");
+        try requireUserKey(stderr, rest[0]);
         switch (try cobalt.ttl.remaining(&db, allocator, rest[0], std.time.nanoTimestamp())) {
             .noKey => try stdout.writeAll("-2\n"),
             .noExpiry => try stdout.writeAll("-1\n"),
@@ -761,18 +735,18 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, command, "scan")) {
         const start: ?[]const u8 = if (rest.len >= 1) rest[0] else null;
         const end: ?[]const u8 = if (rest.len >= 2) rest[1] else null;
-        var iter = try db.scan(allocator, start, end);
+        var iter = try cobalt.keyspace.scanUser(&db, allocator, .{ .start = start, .end = end }, std.time.nanoTimestamp());
         defer iter.deinit();
         while (try iter.next()) |entry| try stdout.print("{s}\t{s}\n", .{ entry.key, entry.value });
     } else if (std.mem.eql(u8, command, "rscan")) {
         const start: ?[]const u8 = if (rest.len >= 1) rest[0] else null;
         const end: ?[]const u8 = if (rest.len >= 2) rest[1] else null;
-        var iter = try db.scanReverse(allocator, .{ .start = start, .end = end });
+        var iter = try cobalt.keyspace.scanUserReverse(&db, allocator, .{ .start = start, .end = end }, std.time.nanoTimestamp());
         defer iter.deinit();
         while (try iter.next()) |entry| try stdout.print("{s}\t{s}\n", .{ entry.key, entry.value });
     } else if (std.mem.eql(u8, command, "prefix")) {
         if (rest.len < 1) return fail(stderr, "prefix needs <prefix>");
-        var iter = try db.scanPrefix(allocator, rest[0]);
+        var iter = try cobalt.keyspace.scanUserPrefix(&db, allocator, rest[0], std.time.nanoTimestamp());
         defer iter.deinit();
         while (try iter.next()) |entry| try stdout.print("{s}\t{s}\n", .{ entry.key, entry.value });
     } else if (std.mem.eql(u8, command, "compact")) {
@@ -810,7 +784,7 @@ pub fn main() !void {
         try runTxn(allocator, stdout, stderr, &db, rest);
     } else if (std.mem.eql(u8, command, "replicate")) {
         if (rest.len < 1) return fail(stderr, "replicate needs <replica-dir>");
-        try runReplicate(allocator, stdout, &db, rest[0], rest[1..]);
+        try runReplicate(allocator, stdout, stderr, &db, rest[0], rest[1..]);
     } else if (std.mem.eql(u8, command, "repl")) {
         try runRepl(allocator, stdout, stderr, &db, rest);
     } else if (std.mem.eql(u8, command, "backup-info")) {
@@ -832,13 +806,27 @@ fn fail(stderr: anytype, message: []const u8) !void {
     std.process.exit(2);
 }
 
+fn requireUserKey(stderr: anytype, key: []const u8) !void {
+    cobalt.keyspace.checkUserKey(key) catch return fail(stderr, "key is in the reserved internal namespace (first byte 0xF5-0xFF)");
+}
+
+fn openOrExit(allocator: std.mem.Allocator, stderr: anytype, dir: []const u8, command: []const u8) !cobalt.Db {
+    return cobalt.Db.open(allocator, dir, .{}) catch |err| switch (err) {
+        cobalt.OpenError.DataDirLocked => {
+            try stderr.print("error: data directory '{s}' is locked by another process (a running serve, replicate or other command holds its LOCK file)\n", .{dir});
+            if (std.mem.eql(u8, command, "replicate")) {
+                try stderr.writeAll("replicate opens the primary directory itself and does not connect to a running server; stop the server first or embed Replicator in the serving process\n");
+            }
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+}
+
 fn boolFlag(v: bool) u8 {
     return if (v) 1 else 0;
 }
 
-/// Dispatches `coll <kind> <op> [args...]` onto the Redis-like typed
-/// collections in collections.zig (Counter/Hash/Set/List/ZSet), which until
-/// now were only reachable through the library API, never a CLI.
 fn runColl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: *cobalt.Db, rest: []const []const u8) !void {
     if (rest.len >= 1 and std.mem.eql(u8, rest[0], "expire-sweep")) {
         const reaped = try cobalt.collttl.sweepExpired(db, allocator, std.time.nanoTimestamp());
@@ -855,12 +843,6 @@ fn runColl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: *
         return runCollTtl(allocator, stdout, stderr, db, k, op, args);
     }
 
-    // Lazy expiry on the read/write path: every remaining op below takes the
-    // collection name as args[0], so this is what keeps a bare
-    // `coll hash get <name> ...` from ever reading a collection that is
-    // logically already gone. `set inter|union|diff` accept further names
-    // past args[0] - those get their own expireIfDueMany call right before
-    // dispatch, so this single-name check only needs to cover args[0].
     if (args.len >= 1) {
         if (cobalt.CollectionKind.parse(kind)) |k| {
             _ = try cobalt.collttl.expireIfDue(db, allocator, k, args[0], std.time.nanoTimestamp());
@@ -944,8 +926,6 @@ fn runColl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: *
             for (ms) |m| try stdout.print("{s}\n", .{m});
         } else if (std.mem.eql(u8, op, "inter")) {
             if (args.len < 1) return fail(stderr, "set inter needs at least one <name>");
-            // The blanket lazy check above only covered args[0]; args[1..]
-            // are additional set names this multi-set op reads directly.
             _ = try cobalt.collttl.expireIfDueMany(db, allocator, .set, args[1..], std.time.nanoTimestamp());
             const ms = try cobalt.Set.intersect(db, allocator, args);
             defer {
@@ -1077,11 +1057,6 @@ fn runColl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: *
     }
 }
 
-/// Dispatches `coll <kind> expire|ttl|persist <name> [seconds]` onto
-/// collttl.zig - the whole-collection counterpart of the flat-key
-/// `expire`/`ttl`/`persist` commands above. `expire` mirrors Redis-strict
-/// EXPIRE by checking the collection currently exists first (same shape as
-/// the flat-key `expire` handler checking db.get first).
 fn runCollTtl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: *cobalt.Db, k: cobalt.CollectionKind, op: []const u8, args: []const []const u8) !void {
     if (std.mem.eql(u8, op, "expire")) {
         if (args.len < 2) return fail(stderr, "coll <kind> expire needs <name> <seconds>");
@@ -1105,16 +1080,10 @@ fn runCollTtl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db
     }
 }
 
-/// Parses a CLI-supplied scalar into a typed row Value. `i:`/`f:`/`b:`/`s:`
-/// prefixes pick int/float/bool/text explicitly; unprefixed text defaults to
-/// `.text`. The returned Value borrows `text` directly (no allocation), so it
-/// is only valid for as long as the argv slice (or script line) it came from.
 fn parseValue(text: []const u8) !Value {
     return cobalt.row.Value.parseCli(text);
 }
 
-/// Splits `name=value` into a Field, validating the name with the same
-/// identifier rule tables and indexes already enforce.
 fn parseField(text: []const u8) !Field {
     const eq = std.mem.indexOfScalar(u8, text, '=') orelse return error.InvalidField;
     const name = text[0..eq];
@@ -1125,10 +1094,6 @@ fn parseField(text: []const u8) !Field {
 
 const PageFlags = struct { limit: u32 = 0, offset: u32 = 0 };
 
-/// Pulls `--limit N` / `--offset N` out of a `table select`/`remote-select`
-/// argument list wherever they appear, returning the remaining tokens
-/// (destined to be joined into the expr text) alongside the parsed page
-/// window. Caller owns and frees `rest`.
 fn extractPageFlags(allocator: std.mem.Allocator, args: []const []const u8) !struct { page: PageFlags, rest: [][]const u8 } {
     var page = PageFlags{};
     var rest = std.ArrayList([]const u8).init(allocator);
@@ -1150,15 +1115,6 @@ fn extractPageFlags(allocator: std.mem.Allocator, args: []const []const u8) !str
     return .{ .page = page, .rest = try rest.toOwnedSlice() };
 }
 
-/// Pulls a lone `--range` flag (no value) out of `table window`'s/
-/// `remote-window`'s trailing args, requesting `window.FrameMode.range`
-/// (SQL's actual `RANGE` frame default for running aggregates) instead of
-/// this CLI's `.rows` default - see `window.zig`'s `compute` doc comment
-/// for the semantic difference. Kept separate from `extractPageFlags`
-/// (same reason `extractSelectFlags`'s `--order-by` is kept separate:
-/// `extractPageFlags` is also shared by `table join`/`table aggregate`,
-/// neither of which has a frame concept to silently swallow the flag into).
-/// Caller owns and frees `rest`.
 fn extractRangeFlag(allocator: std.mem.Allocator, args: []const []const u8) !struct { range: bool, rest: [][]const u8 } {
     var range = false;
     var rest = std.ArrayList([]const u8).init(allocator);
@@ -1175,19 +1131,6 @@ fn extractRangeFlag(allocator: std.mem.Allocator, args: []const []const u8) !str
 
 const SelectFlags = struct { page: PageFlags = .{}, orderBy: []const cobalt.query.OrderBy = &.{} };
 
-/// `table select`/`remote-select`-only counterpart of `extractPageFlags`:
-/// same `--limit`/`--offset` handling plus `--order-by
-/// field[:desc][,field[:desc]...]` (one or more comma-separated columns,
-/// applied left to right - later columns only break ties left by earlier
-/// ones, same as SQL's `ORDER BY a, b`), kept as a SEPARATE function (not
-/// folded into `extractPageFlags` itself) because `extractPageFlags` is
-/// also shared by `table join`/`table aggregate` (and their remote
-/// mirrors) - if `--order-by` were recognized there too, it would be
-/// silently consumed and have no effect, since neither join nor aggregate
-/// sorts its result. Better a flag those two commands don't recognize at
-/// all than one they swallow without honoring. Caller owns and frees
-/// `rest` AND `flags.orderBy` (empty slice when the flag was never given,
-/// still safe to free).
 fn extractSelectFlags(allocator: std.mem.Allocator, args: []const []const u8) !struct { flags: SelectFlags, rest: [][]const u8 } {
     var flags = SelectFlags{};
     var rest = std.ArrayList([]const u8).init(allocator);
@@ -1215,13 +1158,6 @@ fn extractSelectFlags(allocator: std.mem.Allocator, args: []const []const u8) !s
     return .{ .flags = flags, .rest = try rest.toOwnedSlice() };
 }
 
-/// Parses `--order-by`'s `field[:desc]` value, shared by `parseOrderByList`
-/// (both `table select` and `remote-select` route through it) and
-/// repl.zig's identically-shaped copy of the same flag. The suffix after
-/// the colon must be exactly `desc` or `asc` - anything else (a typo'd
-/// `:dsc`) is rejected rather than silently defaulting to ascending,
-/// matching the CLI's usual "malformed input is an error, not a guess"
-/// convention.
 fn parseOrderByFlag(text: []const u8) !cobalt.query.OrderBy {
     if (std.mem.indexOfScalar(u8, text, ':')) |colon| {
         const field = text[0..colon];
@@ -1235,13 +1171,6 @@ fn parseOrderByFlag(text: []const u8) !cobalt.query.OrderBy {
     return .{ .field = text };
 }
 
-/// Splits `--order-by`'s comma-separated value into one or more columns,
-/// each parsed by `parseOrderByFlag` - `city,age:desc` sorts by `city`
-/// ascending, breaking ties by `age` descending. A leading, trailing, or
-/// doubled comma yields an empty segment, rejected the same way a
-/// malformed direction suffix is (not silently skipped), so `city,,age` is
-/// an error rather than a silently-collapsed two-column sort. Caller owns
-/// and frees the returned slice.
 fn parseOrderByList(allocator: std.mem.Allocator, text: []const u8) ![]cobalt.query.OrderBy {
     var list = std.ArrayList(cobalt.query.OrderBy).init(allocator);
     errdefer list.deinit();
@@ -1252,12 +1181,6 @@ fn parseOrderByList(allocator: std.mem.Allocator, text: []const u8) ![]cobalt.qu
     return list.toOwnedSlice();
 }
 
-/// Splits `--set`'s comma-separated `name=value[,name=value...]` value into
-/// a list of Fields, each parsed by `parseField` - the `table update`/
-/// `remote-update` counterpart of `parseOrderByList`. A leading, trailing,
-/// or doubled comma yields an empty segment, which `parseField`'s missing
-/// `=` check rejects the same way a malformed order-by suffix is (not
-/// silently skipped). Caller owns and frees the returned slice.
 fn parseSetList(allocator: std.mem.Allocator, text: []const u8) ![]Field {
     var list = std.ArrayList(Field).init(allocator);
     errdefer list.deinit();
@@ -1268,14 +1191,6 @@ fn parseSetList(allocator: std.mem.Allocator, text: []const u8) ![]Field {
     return list.toOwnedSlice();
 }
 
-/// Pulls a single required `--set name=value[,name=value...]` flag out of a
-/// `table update`/`remote-update` argument list, returning the parsed field
-/// list alongside the remaining tokens (destined to be joined into the expr
-/// text) - the update counterpart of `extractSelectFlags`. A missing
-/// `--set` is `error.MissingSetFlag`: unlike a `WHERE` predicate (optional,
-/// empty text means every row), a `SET`-less `UPDATE` names nothing to
-/// change and is rejected rather than silently accepted as a no-op. Caller
-/// owns and frees `rest` and the returned `sets` slice.
 fn extractSetFlag(allocator: std.mem.Allocator, args: []const []const u8) !struct { sets: []Field, rest: [][]const u8 } {
     var sets: []Field = &.{};
     errdefer allocator.free(sets);
@@ -1317,9 +1232,6 @@ fn printRow(stdout: anytype, row: cobalt.row.Row) !void {
     try stdout.writeAll("\n");
 }
 
-/// Prints a `query.Plan` in the same human-readable shape for `table
-/// explain`, `remote-explain`, and the repl's `table explain` - one line
-/// naming the strategy `selectPage` would actually take, not a guess.
 fn printPlan(stdout: anytype, plan: cobalt.query.Plan) !void {
     switch (plan.kind) {
         .full_scan => try stdout.writeAll("full scan (no usable index)\n"),
@@ -1340,13 +1252,6 @@ fn parseAggKind(name: []const u8) ?cobalt.AggKind {
     return null;
 }
 
-/// Parses a comma-separated `table aggregate` spec list (e.g.
-/// `count,sum:score,max:score,distinct:city`) into `AggSpec`s. Every kind
-/// but bare `count` (COUNT(*)) requires a `:field` suffix, validated with
-/// the same identifier rule tables/indexes already enforce. Returned
-/// `field` slices borrow from `text` (itself a CLI arg living for the
-/// process), so callers only need to free the returned slice itself, not
-/// each field.
 fn parseAggSpecs(allocator: std.mem.Allocator, text: []const u8) ![]cobalt.AggSpec {
     var specs = std.ArrayList(cobalt.AggSpec).init(allocator);
     errdefer specs.deinit();
@@ -1375,21 +1280,6 @@ fn findLiteralToken(args: []const []const u8, token: []const u8) ?usize {
     return null;
 }
 
-/// Splits the trailing free-text args of `table aggregate`/`remote-aggregate`
-/// (after the spec list and any `--limit`/`--offset`/auth flags have already
-/// been pulled out) on literal `having` and `order` tokens, in that clause
-/// order (mirroring SQL's `WHERE ... GROUP BY ... HAVING ... ORDER BY ...`):
-/// everything before `having` (or `order`, if `having` is absent) is the
-/// WHERE-style expr filtering rows BEFORE aggregation (unchanged behavior);
-/// everything between `having` and `order` (or to the end, if `order` is
-/// absent) is the HAVING expr filtering result groups AFTER aggregation;
-/// everything after `order` is the ORDER BY field list - a single token like
-/// `--order-by`'s value (`parseOrderByList` splits it further), not a
-/// free-text expr, so unlike `havingArgs` a well-formed `orderArgs` is
-/// always exactly one element. Neither `having` nor `order` is a keyword
-/// `expr.zig` itself understands - they only have meaning as this
-/// CLI-level separator. Either or both tokens absent means "no HAVING"/"no
-/// ORDER BY", the same as before ORDER BY existed for `table aggregate`.
 fn splitAggFilterArgs(args: []const []const u8) struct { whereArgs: []const []const u8, havingArgs: ?[]const []const u8, orderArgs: ?[]const []const u8 } {
     if (findLiteralToken(args, "having")) |hi| {
         const whereArgs = args[0..hi];
@@ -1431,24 +1321,6 @@ fn parseWindowKind(name: []const u8) ?cobalt.WindowKind {
     return null;
 }
 
-/// Parses a single `table window` spec token: `<kind>`, `<kind>:<field>`,
-/// - `lag`/`lead` only - `<kind>:<field>[:<offset>[:<default>]]`, or -
-/// `nth_value` only - `<kind>:<field>:<n>[:<default>]`. `row_number`/
-/// `rank`/`dense_rank` never take a `:field` suffix (there is nothing to
-/// point them at); `count` may omit one (`COUNT(*)`) or take one;
-/// `sum`/`avg`/`min`/`max`/`first_value`/`last_value`/`count_distinct`
-/// always require exactly one - `count_distinct` has no `COUNT(*)`-style
-/// bare form since "distinct values of nothing" is not meaningful. `lag`/`lead`
-/// always require a field and additionally accept an optional integer
-/// `offset` (SQL's default of 1 if omitted) and, only alongside an
-/// explicit offset, an optional `default` literal in the same `i:`/`f:`/
-/// `b:`/`s:`-prefixed grammar `parseValue` already uses for `put`
-/// (`WindowSpec`'s SQL NULL default if omitted). `nth_value` always requires
-/// a field AND a positive integer `n` (unlike `lag`/`lead`'s offset, SQL's
-/// `NTH_VALUE` has no default position to fall back to) plus, optionally,
-/// the same `default` literal grammar for when `n` falls outside the
-/// current frame. Returned `field`/`default` text borrows from `text` (a
-/// CLI arg living for the process).
 fn parseWindowSpec(text: []const u8) !cobalt.WindowSpec {
     var it = std.mem.splitScalar(u8, text, ':');
     const kind = parseWindowKind(it.next().?) orelse return error.InvalidWindowSpec;
@@ -1463,9 +1335,6 @@ fn parseWindowSpec(text: []const u8) !cobalt.WindowSpec {
         var spec = cobalt.WindowSpec{ .field = field, .kind = kind };
         if (it.next()) |offsetText| {
             spec.offset = std.fmt.parseInt(u64, offsetText, 10) catch return error.InvalidWindowSpec;
-            // `it.rest()`, NOT another `it.next()`: a typed default literal
-            // (`i:-1`, `s:foo:bar`) can itself contain colons, which would
-            // get wrongly re-split by a further `splitScalar` step.
             const rest = it.rest();
             if (rest.len > 0) spec.default = parseValue(rest) catch return error.InvalidWindowSpec;
         }
@@ -1492,13 +1361,6 @@ fn parseWindowSpec(text: []const u8) !cobalt.WindowSpec {
     return .{ .field = field, .kind = kind };
 }
 
-/// Parses `table window`'s comma-separated spec list (`sum:total,avg:total,
-/// row_number` - same comma-joined shape as `parseAggSpecs`, so a `table
-/// window` call can now annotate every matching row with MULTIPLE computed
-/// columns sharing one `PARTITION BY`/`ORDER BY`/frame, mirroring
-/// `window.computeMany`) into `WindowSpec`s via `parseWindowSpec` per token.
-/// Returned `field` slices borrow from `text`, same convention as
-/// `parseAggSpecs`; caller owns and frees the returned slice.
 fn parseWindowSpecs(allocator: std.mem.Allocator, text: []const u8) ![]cobalt.WindowSpec {
     var specs = std.ArrayList(cobalt.WindowSpec).init(allocator);
     errdefer specs.deinit();
@@ -1519,18 +1381,6 @@ fn printWindowLabel(stdout: anytype, spec: cobalt.WindowSpec) !void {
     }
 }
 
-/// Splits the trailing free-text args of `table window` (after the spec
-/// token and any `--limit`/`--offset` flags have already been pulled out)
-/// on literal `partition` and `order` tokens, in that clause order
-/// (mirroring SQL's `OVER (PARTITION BY ... ORDER BY ...)`) - the `table
-/// window` counterpart of `splitAggFilterArgs`. Everything before
-/// `partition` (or `order`, if `partition` is absent) is the WHERE-style
-/// expr filtering rows before annotation; everything between `partition`
-/// and `order` (or to the end) is the partition field list (a single
-/// comma-separated token, parsed by the caller); everything after `order`
-/// is the ORDER BY field list, same shape as `splitAggFilterArgs`'s
-/// `orderArgs`. Either or both tokens absent means "one implicit partition"
-/// / "no ORDER BY".
 fn splitWindowArgs(args: []const []const u8) struct { whereArgs: []const []const u8, partitionArgs: ?[]const []const u8, orderArgs: ?[]const []const u8 } {
     if (findLiteralToken(args, "partition")) |pi| {
         const whereArgs = args[0..pi];
@@ -1546,12 +1396,6 @@ fn splitWindowArgs(args: []const []const u8) struct { whereArgs: []const []const
     return .{ .whereArgs = args, .partitionArgs = null, .orderArgs = null };
 }
 
-/// Parses `table window`'s `partition <field>[,field...]` value into a
-/// borrowed field-name list (same non-owning convention `parseWindowSpec`
-/// uses) - a leading/trailing/doubled comma yields an empty segment,
-/// rejected by `index.validIdentifier` the same way a malformed order-by
-/// suffix is elsewhere, not silently skipped. Caller owns and frees the
-/// returned slice (not each field - they borrow from `text`).
 fn parsePartitionList(allocator: std.mem.Allocator, text: []const u8) ![][]const u8 {
     var list = std.ArrayList([]const u8).init(allocator);
     errdefer list.deinit();
@@ -1563,11 +1407,6 @@ fn parsePartitionList(allocator: std.mem.Allocator, text: []const u8) ![][]const
     return list.toOwnedSlice();
 }
 
-/// Dispatches `user <op> ...` onto auth.zig's Store: username/password/role
-/// management for `serve --auth`, always operating on the local Db file
-/// directly (never over the wire - creating the first admin has to work
-/// even before any server is running, and there is no bootstrap way to
-/// AUTH your way into creating the first account).
 fn runUser(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: *cobalt.Db, rest: []const []const u8) !void {
     if (rest.len < 1) return fail(stderr, "user needs a subcommand (add/passwd/role/del/list)");
     const op = rest[0];
@@ -1609,10 +1448,6 @@ fn runUser(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: *
     }
 }
 
-/// Dispatches `table <op> <table> ...` onto query.zig's Table: schemaless
-/// rows with secondary indexes, until now only reachable through the library
-/// API. Opens a fresh Table view per invocation (indexes are loaded from
-/// their persisted metadata, so this is consistent across process restarts).
 fn runTable(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: *cobalt.Db, rest: []const []const u8) !void {
     if (rest.len < 1) return fail(stderr, "table needs a subcommand (put/get/del/delete/scan/select/index/join/aggregate/export/import)");
     const sub = rest[0];
@@ -2041,9 +1876,6 @@ fn runTable(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: 
         const results = cobalt.window.computeMany(allocator, rows, partitionBy, orderBy, specs, frame) catch |err| return fail(stderr, @errorName(err));
         defer cobalt.window.freeManyResults(allocator, results);
 
-        // Display/page in the SAME partition-then-order walk `computeMany`
-        // used internally, not raw scan order - see `table window`'s help
-        // text and `window.orderedIndices`'s doc comment for why.
         const displayOrder = cobalt.window.orderedIndices(allocator, rows, partitionBy, orderBy) catch |err| return fail(stderr, @errorName(err));
         defer allocator.free(displayOrder);
 
@@ -2094,19 +1926,6 @@ fn runTable(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: 
     }
 }
 
-/// Runs a script of `put|del <table> <pk> [field=value ...]` lines as one
-/// atomic Transaction via TableTxn: every row/index mutation across every
-/// line becomes visible together on commit, or none of it does. This is the
-/// only place in the CLI multi-row atomicity is reachable at all - `table
-/// put` above writes one row directly to the Db per call, with no atomicity
-/// across rows.
-/// `repl [--script <file>]`: keeps `db` open across many commands instead
-/// of the usual one-process-per-command CLI shape, so `begin`/`commit`/
-/// `rollback` can bracket an interactive `cobalt.Repl` transaction - see
-/// `repl.zig` for the command grammar and why that is more than `txn
-/// <script-file>` with extra steps. With `--script <file>` reads from the
-/// file non-interactively (no prompt, same as `txn`); otherwise reads from
-/// stdin with a `cobalt>`/`cobalt(txn)>` prompt.
 fn runRepl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: *cobalt.Db, rest: []const []const u8) !void {
     var session = cobalt.Repl.init(allocator, db);
     defer session.deinit();
@@ -2213,11 +2032,7 @@ fn runTxn(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: *c
     try stdout.print("OK: {d} operation(s) committed atomically\n", .{applied});
 }
 
-/// Dispatches `replicate <replica-dir> [--once] [--interval-ms <n>]`: opens
-/// (or creates) a second Db at <replica-dir> and keeps it mirroring `db` by
-/// physically tailing `db`'s wal.log (replicate.zig), recovering via a full
-/// snapshot resync whenever the tailer falls behind a primary flush.
-fn runReplicate(allocator: std.mem.Allocator, stdout: anytype, db: *cobalt.Db, replicaDir: []const u8, rest: []const []const u8) !void {
+fn runReplicate(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, db: *cobalt.Db, replicaDir: []const u8, rest: []const []const u8) !void {
     var once = false;
     var intervalMs: u64 = 200;
     var i: usize = 0;
@@ -2240,7 +2055,7 @@ fn runReplicate(allocator: std.mem.Allocator, stdout: anytype, db: *cobalt.Db, r
         }
     }
 
-    var replica = try cobalt.Db.open(allocator, replicaDir, .{});
+    var replica = try openOrExit(allocator, stderr, replicaDir, "");
     defer replica.close();
 
     const resumeState = cobalt.replicate.loadOffset(allocator, replicaDir, db.dirPath) catch |err| switch (err) {
@@ -2270,11 +2085,6 @@ fn runReplicate(allocator: std.mem.Allocator, stdout: anytype, db: *cobalt.Db, r
             cobalt.ReplicateError.WalTruncatedAheadOfTailer, cobalt.ReplicateError.WalGenerationChanged => blk: {
                 const recovered = try rep.fullResync(db, 500);
                 try stdout.print("resync after truncation: {d} entries\n", .{recovered});
-                // fullResync always re-bases the tailer to offset 0 and the
-                // primary's current generation, which must be persisted
-                // immediately even if nothing new was applied afterwards -
-                // otherwise a later process would resume from the stale
-                // pre-truncation offset/generation instead of the fresh one.
                 try cobalt.replicate.saveState(allocator, replicaDir, db.dirPath, rep.offset(), rep.generation());
                 break :blk @as(usize, 0);
             },
@@ -2289,10 +2099,6 @@ fn runReplicate(allocator: std.mem.Allocator, stdout: anytype, db: *cobalt.Db, r
     }
 }
 
-/// Parses a `host:port` string as used by both `serve` (bind address) and
-/// `remote-select` (address to connect to). Exits with usage code 2 on a
-/// malformed address rather than propagating a parse error, matching every
-/// other CLI argument validation in this file.
 fn parseHostPort(stdout: anytype, spec: []const u8) !std.net.Address {
     const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse {
         try stdout.print("error: address must be host:port, got '{s}'\n", .{spec});
@@ -2308,12 +2114,6 @@ fn parseHostPort(stdout: anytype, spec: []const u8) !std.net.Address {
 
 const AuthFlags = struct { username: ?[]const u8 = null, password: ?[]const u8 = null, token: ?[]const u8 = null };
 
-/// Pulls `--user NAME` / `--pass PASS` / `--token TOKEN` out of a
-/// `remote-select`/`remote-user` argument list, same shape and same "strip
-/// recognized flags, keep the rest" idea as `extractPageFlags`. `--token`
-/// is the CLI counterpart of `client.authenticateWithToken` - a previously
-/// issued session token (see `serve --session-ttl`) used in place of a
-/// username/password pair. Caller owns and frees `rest`.
 fn extractAuthFlags(allocator: std.mem.Allocator, args: []const []const u8) !struct { auth: AuthFlags, rest: [][]const u8 } {
     var authFlags = AuthFlags{};
     var rest = std.ArrayList([]const u8).init(allocator);
@@ -2335,19 +2135,6 @@ fn extractAuthFlags(allocator: std.mem.Allocator, args: []const []const u8) !str
     return .{ .auth = authFlags, .rest = try rest.toOwnedSlice() };
 }
 
-/// Shared by `runRemoteSelect` and `runRemoteUser`: authenticates the
-/// just-connected `client` using whichever credential `authFlags` carried
-/// (a session token takes priority over a username/password pair - a
-/// caller passing both almost certainly means "use the token, the
-/// user/pass was left over from a script template"), or does nothing if
-/// neither was given (server has no --auth enabled, or the op needs none).
-/// A fresh password login against a server with sessions enabled gets a
-/// brand new token back (`client.sessionToken()`) - printed to stderr (kept
-/// out of stdout so scripts piping row/user output are not polluted) so the
-/// caller can pass it to a later invocation via `--token` instead of
-/// re-sending the password. Logging in with `--token` itself never mints a
-/// new one (see `server.zig`'s `handleAuthToken`), so nothing is printed
-/// in that branch.
 fn authenticateIfRequested(client: *cobalt.Client, stderr: anytype, authFlags: AuthFlags) !void {
     if (authFlags.token) |token| {
         client.authenticateWithToken(token) catch |err| {
@@ -2365,12 +2152,6 @@ fn authenticateIfRequested(client: *cobalt.Client, stderr: anytype, authFlags: A
     }
 }
 
-/// Connects to a remote `cobalt serve` instance and runs `table select`
-/// there instead of against a local Db - the client-side counterpart of
-/// `server.zig`'s `table_select` opcode, so a query engine that was
-/// previously CLI-local-only is now reachable over the wire with the exact
-/// same expression grammar as `table select`. `--user`/`--pass` authenticate
-/// first, needed only against a server started with `serve --auth`.
 fn runRemoteSelect(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 1) return fail(stderr, "remote-select needs <table> [expr...] [--limit N] [--offset N] [--order-by field[:desc][,field[:desc]...]]");
     const address = try parseHostPort(stdout, addressSpec);
@@ -2401,12 +2182,6 @@ fn runRemoteSelect(allocator: std.mem.Allocator, stdout: anytype, stderr: anytyp
     for (rows) |r| try printRow(stdout, r);
 }
 
-/// Connects to a remote `cobalt serve` instance and runs `table explain`
-/// there instead of against a local Db - the client-side counterpart of
-/// `server.zig`'s `table_explain` opcode, same shape as `runRemoteSelect`
-/// but reporting a `query.Plan` instead of rows. `--user`/`--pass`/
-/// `--token` authenticate first, needed only against a server started with
-/// `serve --auth`.
 fn runRemoteExplain(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 1) return fail(stderr, "remote-explain needs <table> [expr...]");
     const address = try parseHostPort(stdout, addressSpec);
@@ -2433,12 +2208,6 @@ fn runRemoteExplain(allocator: std.mem.Allocator, stdout: anytype, stderr: anyty
     try printPlan(stdout, plan);
 }
 
-/// Connects to a remote `cobalt serve` instance and runs `table update`
-/// there instead of against a local Db - the client-side counterpart of
-/// `server.zig`'s `table_update` opcode, same shape as `runRemoteExplain`
-/// but taking a `--set` field list and printing the number of rows updated
-/// instead of a plan. `--user`/`--pass`/`--token` authenticate first,
-/// needed only against a server started with `serve --auth`.
 fn runRemoteUpdate(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 1) return fail(stderr, "remote-update needs <table> --set field=value[,field=value...] [expr...]");
     const address = try parseHostPort(stdout, addressSpec);
@@ -2471,13 +2240,6 @@ fn runRemoteUpdate(allocator: std.mem.Allocator, stdout: anytype, stderr: anytyp
     try stdout.print("{d}\n", .{updated});
 }
 
-/// Connects to a remote `cobalt serve` instance and runs `table delete`
-/// there instead of against a local Db - the client-side counterpart of
-/// `server.zig`'s `table_delete` opcode, same shape as `runRemoteExplain`
-/// (no `--set` flag, since a delete has no `SET` clause) but printing the
-/// number of rows deleted instead of a plan. `--user`/`--pass`/`--token`
-/// authenticate first, needed only against a server started with
-/// `serve --auth`.
 fn runRemoteDelete(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 1) return fail(stderr, "remote-delete needs <table> [expr...]");
     const address = try parseHostPort(stdout, addressSpec);
@@ -2510,17 +2272,6 @@ fn parseDumpFormat(stderr: anytype, text: []const u8) !cobalt.protocol.DumpForma
     unreachable;
 }
 
-/// Connects to a remote `cobalt serve` instance and runs `table export`
-/// there instead of against a local Db - the client-side counterpart of
-/// `server.zig`'s `table_export` opcode. Unlike every other remote-* op,
-/// the destination `<path>` names a file on THIS machine, not the server:
-/// the server renders the whole table into memory and sends the bytes
-/// back in one frame, and this function is the one that actually creates
-/// `<path>` and writes them - the local `table export` writes straight to
-/// disk itself since it already has a `*Db` handle in-process, but a
-/// remote client only ever gets bytes over the wire. `--user`/`--pass`/
-/// `--token` authenticate first, needed only against a server started
-/// with `serve --auth`.
 fn runRemoteExport(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 1) return fail(stderr, "remote-export needs <table> csv|json <path>");
     const address = try parseHostPort(stdout, addressSpec);
@@ -2556,13 +2307,6 @@ fn runRemoteExport(allocator: std.mem.Allocator, stdout: anytype, stderr: anytyp
     try stdout.print("{d}\n", .{result.rowCount});
 }
 
-/// Connects to a remote `cobalt serve` instance and runs `table import`
-/// there instead of against a local Db - the client-side counterpart of
-/// `server.zig`'s `table_import` opcode. Mirrors `runRemoteExport`: the
-/// source `<path>` is read from THIS machine (the same way `runTxn` reads
-/// a local script file), and its bytes are sent to the server in one
-/// frame. `--user`/`--pass`/`--token` authenticate first, needed only
-/// against a server started with `serve --auth`.
 fn runRemoteImport(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 1) return fail(stderr, "remote-import needs <table> csv|json <path>");
     const address = try parseHostPort(stdout, addressSpec);
@@ -2597,14 +2341,6 @@ fn runRemoteImport(allocator: std.mem.Allocator, stdout: anytype, stderr: anytyp
 
 const JoinCliMode = enum { inner, left, right, full };
 
-/// Pulls `--left`/`--right`/`--full` (mutually exclusive, last one wins,
-/// same as local `table join`'s parsing loop) and `--left-expr E`/
-/// `--right-expr E` out of a `remote-join` argument list, same "strip
-/// recognized flags, keep the rest" shape as `extractPageFlags`/
-/// `extractAuthFlags`. An expr not given defaults to the empty string,
-/// meaning "select every row on that side" - the same convention
-/// `tableSelect`'s empty `exprText` already uses. Caller owns and frees
-/// `rest`.
 fn extractJoinFlags(allocator: std.mem.Allocator, args: []const []const u8) !struct {
     mode: JoinCliMode,
     leftExpr: []const u8,
@@ -2640,14 +2376,6 @@ fn extractJoinFlags(allocator: std.mem.Allocator, args: []const []const u8) !str
     return .{ .mode = mode, .leftExpr = leftExpr, .rightExpr = rightExpr, .rest = try rest.toOwnedSlice() };
 }
 
-/// Connects to a remote `cobalt serve` instance and runs `table join`
-/// there instead of against a local Db - the client-side counterpart of
-/// `server.zig`'s `table_join` opcode, mirroring `runRemoteSelect`'s shape
-/// but for all four of `join.zig`'s equi-join variants instead of a plain
-/// select. `--user`/`--pass`/`--token` authenticate first, needed only
-/// against a server started with `serve --auth`; printing is identical to
-/// the local `table join` command (`L <row>` / `R <row>`, or `L (nil)` /
-/// `R (nil)` for the unmatched side of an outer join).
 fn runRemoteJoin(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     const address = try parseHostPort(stdout, addressSpec);
 
@@ -2699,25 +2427,6 @@ fn runRemoteJoin(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype,
     }
 }
 
-/// Connects to a remote `cobalt serve` instance and runs `table aggregate`
-/// there instead of against a local Db - the client-side counterpart of
-/// `server.zig`'s `table_aggregate` opcode, mirroring `runRemoteSelect`'s
-/// shape. Same `*` sentinel as local `table aggregate` for "no GROUP BY"
-/// (dispatches to `client.tableAggregateGlobal` instead of
-/// `tableAggregateGroups`), same comma-separated spec grammar
-/// (`parseAggSpecs`), and the same output format as the local command
-/// (`printAggLabel`/`printValue`). `--limit`/`--offset` window the result
-/// groups server-side (ignored for the `*` global path, same as local
-/// `table aggregate`), same convention as `remote-join`.
-/// `--user`/`--pass`/`--token` authenticate first, needed only against a
-/// server started with `serve --auth`. An optional literal `having <expr>`
-/// after the WHERE-style expr (split out by `splitAggFilterArgs`, the same
-/// helper the local `table aggregate` handler uses) filters the result
-/// groups server-side after aggregation, before `--limit`/`--offset` window
-/// them. An optional literal `order <field[:desc]>[,field...]` after that
-/// sorts the (HAVING-narrowed) result groups server-side before that same
-/// window, ignored for the `*` global path exactly like `--limit`/`--offset`
-/// already are - see `Client.tableAggregateGroups`/`tableAggregateGlobal`.
 fn runRemoteAggregate(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 3) return fail(stderr, "remote-aggregate needs <table> <groupField|*> <spec>[,<spec>...] [expr...] [having <expr>] [order <field[:desc]>[,field...]] [--limit N] [--offset N]");
     const address = try parseHostPort(stdout, addressSpec);
@@ -2763,10 +2472,6 @@ fn runRemoteAggregate(allocator: std.mem.Allocator, stdout: anytype, stderr: any
             std.process.exit(1);
         };
         defer cobalt.protocol.freeAggValues(allocator, values);
-        // `values.len == 0` means the server's HAVING excluded the only
-        // global result (see `Client.tableAggregateGlobal`'s doc) - print
-        // nothing rather than indexing `specs` against a shorter `values`,
-        // which a naive `for (specs, values, ...)` would panic on.
         if (values.len > 0) {
             for (specs, values, 0..) |spec, v, i| {
                 if (i > 0) try stdout.writeAll("\t");
@@ -2796,25 +2501,6 @@ fn runRemoteAggregate(allocator: std.mem.Allocator, stdout: anytype, stderr: any
     }
 }
 
-/// Connects to a remote `cobalt serve` instance and runs `table window`
-/// there instead of against a local Db - the client-side counterpart of
-/// `server.zig`'s `table_window` opcode, mirroring `runRemoteAggregate`'s
-/// shape. Same comma-separated spec-list grammar as local `table window`
-/// (`parseWindowSpecs`), same `partition <field>[,field...]`/`order
-/// <field[:desc]>[,field...]` clause split (`splitWindowArgs`), and the same
-/// per-row output format as the local command (row fields, then
-/// `<label>=<value>`). Unlike `runRemoteAggregate`, there is no `*`
-/// sentinel or global/grouped branch - a window annotation never collapses
-/// rows, so there is exactly one request/response shape
-/// (`Client.tableWindow`). `--limit`/`--offset` window which rows come back
-/// (server-side, in `window.orderedIndices`' partition-then-order display
-/// sequence, not raw scan order - see `Client.tableWindow`'s doc).
-/// `--user`/`--pass`/`--token` authenticate first, needed only against a
-/// server started with `serve --auth`.
-/// Splits `text` on commas into channel names for `remote-subscribe` - no
-/// identifier validation, unlike `parsePartitionList`, since a pub/sub
-/// channel is an arbitrary string (`pubsub.zig`'s `Hub` keys purely on
-/// byte equality), not a table field name.
 fn parseChannelList(allocator: std.mem.Allocator, text: []const u8) ![][]const u8 {
     var list = std.ArrayList([]const u8).init(allocator);
     errdefer list.deinit();
@@ -2826,13 +2512,6 @@ fn parseChannelList(allocator: std.mem.Allocator, text: []const u8) ![][]const u
     return list.toOwnedSlice();
 }
 
-/// Connects to a running `cobalt serve` and delivers a message to every
-/// connection currently subscribed to `<channel>` - the client-side
-/// counterpart of `server.zig`'s `publish` opcode. `<message...>` is every
-/// remaining non-flag argument joined with single spaces, the same
-/// "trailing free text" convention `runRemoteWindow`'s `exprText` uses, so a
-/// multi-word message does not need manual quoting tricks beyond the
-/// shell's own.
 fn runRemotePublish(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 2) return fail(stderr, "remote-publish needs <channel> <message...> [--user NAME --pass PASS] [--token TOKEN]");
     const address = try parseHostPort(stdout, addressSpec);
@@ -2861,16 +2540,6 @@ fn runRemotePublish(allocator: std.mem.Allocator, stdout: anytype, stderr: anyty
     try stdout.print("{d}\n", .{count});
 }
 
-/// Connects to a running `cobalt serve`, subscribes to every channel in the
-/// comma-separated `<channel>[,channel...]` list, and blocks printing
-/// `<channel>: <message>` for each message that arrives until the
-/// connection ends - the client-side counterpart of `server.zig`'s
-/// `subscribe` opcode and `Client.nextMessage`'s doc comment on why this
-/// connection never sends another request afterward. Prints "subscribed as
-/// <id>" first (the id `remote-unsubscribe`, run from a different terminal
-/// against a different connection, needs to ever name this subscription
-/// again) - closing this process (or the connection) still ends the whole
-/// subscription outright, same as before `remote-unsubscribe` existed.
 fn runRemoteSubscribe(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 1) return fail(stderr, "remote-subscribe needs <channel>[,channel...] [--user NAME --pass PASS] [--token TOKEN]");
     const address = try parseHostPort(stdout, addressSpec);
@@ -2901,15 +2570,6 @@ fn runRemoteSubscribe(allocator: std.mem.Allocator, stdout: anytype, stderr: any
     }
 }
 
-/// Connects to a running `cobalt serve` and drops the listed channels from
-/// an already-subscribed connection's set, identified by the
-/// `<subscriber-id>` its `remote-subscribe` printed - the client-side
-/// counterpart of `server.zig`'s `unsubscribe` opcode. Unlike
-/// `remote-subscribe`, this connection is an ordinary request/response
-/// round trip: it prints how many channels were actually removed and
-/// exits, never blocking. `<subscriber-id>` must parse as a `u64` - a
-/// malformed one is reported the same way a malformed `--limit` is
-/// elsewhere in this file, before ever reaching for the network.
 fn runRemoteUnsubscribe(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 2) return fail(stderr, "remote-unsubscribe needs <subscriber-id> <channel>[,channel...] [--user NAME --pass PASS] [--token TOKEN]");
     const address = try parseHostPort(stdout, addressSpec);
@@ -3005,13 +2665,6 @@ fn runRemoteWindow(allocator: std.mem.Allocator, stdout: anytype, stderr: anytyp
     }
 }
 
-/// The network counterpart of `runTxn`: parses the exact same
-/// `put|del <table> <pk> [field=value ...]` script format as the local
-/// `txn <script-file>` command, but builds a list of
-/// `protocol.TxnOpEntry` and commits it in one round trip through
-/// `client.zig`'s `txnOp` (the `txn_op` opcode) instead of staging against
-/// a local `TableTxn` directly - so a script that used to require a
-/// process holding the `Db` can now run against a remote `cobalt serve`.
 fn runRemoteTxn(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 1) return fail(stderr, "remote-txn needs <script-file> [--user NAME --pass PASS] [--token TOKEN]");
     const address = try parseHostPort(stdout, addressSpec);
@@ -3089,12 +2742,6 @@ fn runRemoteTxn(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, 
     try stdout.print("OK: {d} operation(s) committed atomically\n", .{applied});
 }
 
-/// The network counterpart of `runUser`: dispatches `remote-user <op> ...`
-/// onto `client.zig`'s `admin*` methods (which wire-encode the
-/// `user_admin` opcode) instead of a local `auth.Store`. Bootstrapping the
-/// very first admin account still has to happen locally via `user add`
-/// (see the module doc on `runUser`), but every subsequent user management
-/// operation can go over the wire once that first admin can authenticate.
 fn runRemoteUser(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 1) return fail(stderr, "remote-user needs a subcommand (add/passwd/role/del/list)");
     const address = try parseHostPort(stdout, addressSpec);
@@ -3155,11 +2802,6 @@ fn runRemoteUser(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype,
     }
 }
 
-/// The network counterpart of `runTtl`-shaped local commands (`expire`,
-/// `persist`, `ttl`, `expire-sweep`): dispatches `remote-ttl <op> ...` onto
-/// `client.zig`'s `ttl*` methods (which wire-encode the `ttl_op` opcode)
-/// instead of calling `ttl.zig` directly against a local Db, the same
-/// "reuse client.zig, keep the arg parsing local" shape as `runRemoteUser`.
 fn runRemoteTtl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 1) return fail(stderr, "remote-ttl needs a subcommand (expire/persist/ttl/sweep)");
     const address = try parseHostPort(stdout, addressSpec);
@@ -3214,14 +2856,6 @@ fn runRemoteTtl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, 
     }
 }
 
-/// The network counterpart of `runCollTtl`-shaped local commands (`coll
-/// <kind> expire|ttl|persist`, `coll expire-sweep`): dispatches
-/// `remote-coll-ttl sweep` or `remote-coll-ttl <kind> <op> ...` onto
-/// `client.zig`'s `collTtl*` methods (which wire-encode the `coll_ttl_op`
-/// opcode), same "reuse client.zig, keep the arg parsing local" shape as
-/// `runRemoteTtl`. `sweep` has no `<kind>` (it reaps every kind at once,
-/// same as local `coll expire-sweep`), so it is checked before trying to
-/// parse `rest[0]` as a kind.
 fn runRemoteCollTtl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 1) return fail(stderr, "remote-coll-ttl needs sweep or <kind> expire|ttl|persist <name>");
     const address = try parseHostPort(stdout, addressSpec);
@@ -3286,12 +2920,6 @@ fn runRemoteCollTtl(allocator: std.mem.Allocator, stdout: anytype, stderr: anyty
     }
 }
 
-/// Prints an `OwnedCollReply` the same way `runColl`'s local dispatch
-/// prints each op's own return value - one shape per reply variant, not
-/// one shape per op, since `client.collOp`'s reply already carries enough
-/// structure to tell them apart (an int reply from `set_ismember` prints
-/// exactly like one from `hash_del`, both booleans-as-0/1, matching
-/// `runColl`'s own `boolFlag` convention).
 fn printCollReply(stdout: anytype, reply: cobalt.protocol.OwnedCollReply) !void {
     switch (reply) {
         .nil => try stdout.writeAll("(nil)\n"),
@@ -3305,17 +2933,6 @@ fn printCollReply(stdout: anytype, reply: cobalt.protocol.OwnedCollReply) !void 
     }
 }
 
-/// The network counterpart of `runColl`'s local `coll <kind> <op> ...`
-/// (backed by `collections.zig`): parses the exact same
-/// `<kind> <op> [args...]` shape `runColl` does, translates it to a
-/// `protocol.CollAction` plus a name and string-arg list, and sends it
-/// through `client.collOp` instead of calling `collections.zig` directly -
-/// the network counterpart `remote-coll-ttl` already is for `coll <kind>
-/// expire|ttl|persist`. There is no `remote-coll expire-sweep` counterpart:
-/// unlike TTL sweeping (a background maintenance action against the whole
-/// store), the read/write collection operations here always target one
-/// named collection, so there is nothing store-wide to bundle behind this
-/// opcode the way `coll_ttl_op`'s `sweep` action does.
 fn runRemoteColl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     if (rest.len < 2) return fail(stderr, "remote-coll needs <kind> <op> ...");
     const address = try parseHostPort(stdout, addressSpec);
@@ -3454,14 +3071,6 @@ fn runRemoteColl(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype,
     try printCollReply(stdout, reply);
 }
 
-/// The network counterpart of local `stats --prom`: connects to a running
-/// `cobalt serve`, authenticates if credentials were given (same
-/// `--user`/`--pass`/`--token` convention as `remote-select`/`remote-user`),
-/// and prints `client.metricsText` verbatim. Unlike `stats --prom` locally
-/// (which only ever has a `Db` to render, never a `*Server`), this also
-/// carries the server's own request/rate-limit/auth/session counters from
-/// `Server.registerMetrics` - the only way to observe those from outside
-/// the serving process at all.
 fn runRemoteStats(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, addressSpec: []const u8, rest: []const []const u8) !void {
     const address = try parseHostPort(stdout, addressSpec);
 
@@ -3638,94 +3247,40 @@ fn runServe(allocator: std.mem.Allocator, stdout: anytype, db: *cobalt.Db, bind:
     server.wait();
 }
 
-fn runVerify(allocator: std.mem.Allocator, stdout: anytype, dir: []const u8, count: usize) !void {
-    std.fs.cwd().deleteTree(dir) catch {};
+fn expectCli(allocator: std.mem.Allocator, dir: []const u8, args: []const []const u8, expectedStdout: []const u8, expectedExit: u8) !void {
+    var argv = std.ArrayList([]const u8).init(allocator);
+    defer argv.deinit();
+    try argv.appendSlice(&.{ @import("cliPaths").cobaltExe, dir });
+    try argv.appendSlice(args);
+    const run = try std.process.Child.run(.{ .allocator = allocator, .argv = argv.items });
+    defer allocator.free(run.stdout);
+    defer allocator.free(run.stderr);
+    try std.testing.expectEqualStrings(expectedStdout, run.stdout);
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = expectedExit }, run.term);
+}
 
-    var reference = std.ArrayList([]u8).init(allocator);
-    defer {
-        for (reference.items) |value| allocator.free(value);
-        reference.deinit();
-    }
+test "cli put drops any ttl, and expire and ttl treat an expired unswept key as missing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const dir = try std.fs.path.join(allocator, &.{ base, "store" });
+    defer allocator.free(dir);
 
-    {
-        var db = try cobalt.Db.open(allocator, dir, .{ .flushThreshold = 16 * 1024, .sstableTargetBytes = 8 * 1024 });
-        defer db.close();
-        var keyBuf: [24]u8 = undefined;
-        var valBuf: [32]u8 = undefined;
-        var i: usize = 0;
-        while (i < count) : (i += 1) {
-            const key = try std.fmt.bufPrint(&keyBuf, "key:{d:0>10}", .{i});
-            const value = try std.fmt.bufPrint(&valBuf, "value-{d:0>10}-payload", .{i});
-            try db.put(key, value);
-            try reference.append(try allocator.dupe(u8, value));
-        }
-        try db.maybeCompact();
-        try stdout.print("wrote {d} keys, sstables on disk: {d}\n", .{ count, db.sstables.items.len });
-    }
+    try expectCli(allocator, dir, &.{ "put", "dead", "old", "--ttl", "0" }, "", 0);
+    try expectCli(allocator, dir, &.{ "put", "live", "old", "--ttl", "600" }, "", 0);
+    try expectCli(allocator, dir, &.{ "ttl", "dead" }, "-2\n", 0);
+    try expectCli(allocator, dir, &.{ "expire", "dead", "600" }, "", 2);
+    try expectCli(allocator, dir, &.{ "ttl", "dead" }, "-2\n", 0);
+    try expectCli(allocator, dir, &.{ "get", "dead" }, "(nil)\n", 0);
 
-    try stdout.writeAll("process state dropped, reopening from disk...\n");
+    try expectCli(allocator, dir, &.{ "put", "rewritten", "old", "--ttl", "0" }, "", 0);
+    try expectCli(allocator, dir, &.{ "put", "rewritten", "new" }, "", 0);
+    try expectCli(allocator, dir, &.{ "get", "rewritten" }, "new\n", 0);
+    try expectCli(allocator, dir, &.{ "ttl", "rewritten" }, "-1\n", 0);
 
-    var db = try cobalt.Db.open(allocator, dir, .{ .flushThreshold = 16 * 1024, .sstableTargetBytes = 8 * 1024 });
-    defer db.close();
-
-    var readOk: usize = 0;
-    var keyBuf: [24]u8 = undefined;
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        const key = try std.fmt.bufPrint(&keyBuf, "key:{d:0>10}", .{i});
-        const got = (try db.get(allocator, key)) orelse {
-            try stdout.print("FAIL: missing key {s} after restart\n", .{key});
-            std.process.exit(1);
-        };
-        defer allocator.free(got);
-        if (!std.mem.eql(u8, got, reference.items[i])) {
-            try stdout.print("FAIL: value mismatch for {s}\n", .{key});
-            std.process.exit(1);
-        }
-        readOk += 1;
-    }
-
-    var scanned: usize = 0;
-    var prev: [24]u8 = undefined;
-    var prevLen: usize = 0;
-    var ordered = true;
-    var iter = try db.scan(allocator, null, null);
-    defer iter.deinit();
-    while (try iter.next()) |entry| {
-        if (prevLen > 0 and !std.mem.lessThan(u8, prev[0..prevLen], entry.key)) ordered = false;
-        @memcpy(prev[0..entry.key.len], entry.key);
-        prevLen = entry.key.len;
-        scanned += 1;
-    }
-
-    var rev = try db.scanReverse(allocator, .{});
-    defer rev.deinit();
-    var reverseCount: usize = 0;
-    var revPrevLen: usize = 0;
-    var revPrev: [24]u8 = undefined;
-    var reverseOrdered = true;
-    while (try rev.next()) |entry| {
-        if (revPrevLen > 0 and !std.mem.lessThan(u8, entry.key, revPrev[0..revPrevLen])) reverseOrdered = false;
-        @memcpy(revPrev[0..entry.key.len], entry.key);
-        revPrevLen = entry.key.len;
-        reverseCount += 1;
-    }
-
-    const rangeLow = "key:0000000100";
-    const rangeHigh = "key:0000000110";
-    var rangeCount: usize = 0;
-    if (count > 110) {
-        var range = try db.scan(allocator, rangeLow, rangeHigh);
-        defer range.deinit();
-        while (try range.next()) |_| rangeCount += 1;
-    }
-
-    try stdout.print("point reads ok:   {d}/{d}\n", .{ readOk, count });
-    try stdout.print("forward scan:     {d} entries, sortedOrder={}\n", .{ scanned, ordered });
-    try stdout.print("reverse scan:     {d} entries, descendingOrder={}\n", .{ reverseCount, reverseOrdered });
-    if (count > 110) try stdout.print("range [100,110):  {d} entries (expected 10)\n", .{rangeCount});
-
-    const pass = readOk == count and scanned == count and reverseCount == count and ordered and reverseOrdered and (count <= 110 or rangeCount == 10);
-    try stdout.print("\nRESULT: {s}\n", .{if (pass) "PASS - all keys durable, scans consistent with reference" else "FAIL"});
-    if (!pass) std.process.exit(1);
+    try expectCli(allocator, dir, &.{ "put", "live", "new" }, "", 0);
+    try expectCli(allocator, dir, &.{ "ttl", "live" }, "-1\n", 0);
+    try expectCli(allocator, dir, &.{"expire-sweep"}, "reaped: 0\n", 0);
 }

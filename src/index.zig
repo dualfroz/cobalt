@@ -6,36 +6,10 @@ const Allocator = std.mem.Allocator;
 const Db = dbmod.Db;
 const Value = row.Value;
 
-/// Keyspace layout shared by every table and index living inside a single
-/// Db instance:
-///   "R\x00" table "\x00" orderedPk                 -> encoded Row
-///   "I\x00" table "\x00" field "\x00" orderedValue orderedPk -> encoded pk Value
-///   "J\x00" table "\x00" indexName "\x00" orderedValue1 .. orderedValueN orderedPk -> encoded pk Value
-///   "M\x00INDEXES\x00" table                        -> encoded list of indexed field names
-///   "M\x00CINDEXES\x00" table                       -> encoded list of composite index specs
-///   "M\x00UNIQUE\x00" table                         -> encoded list of UNIQUE-constrained field names
-///   "M\x00FKEYS\x00" table                          -> encoded list of FOREIGN KEY specs (field, refTable, refField)
-///   "M\x00CHECKS\x00" table                         -> encoded list of CHECK constraint specs (name, expr source)
-///   "M\x00REFBY\x00" table                          -> encoded list of reverse FK specs (childTable, childField, refField),
-///                                                       one entry per OTHER table's FOREIGN KEY that names this table+refField
-///
-/// All namespaces share one flat LSM keyspace (there is only one Db), so the
-/// leading tag byte plus NUL separators keep tables, single-field indexes,
-/// composite indexes, and metadata from ever colliding or shadowing each
-/// other during a scan. A composite index entry's value columns are just N
-/// single-column `row.appendOrdered` encodings concatenated in the index's
-/// declared field order ahead of the primary key's - each encoding is
-/// already self-delimiting (fixed width for none/boolean/int/float, a
-/// 0x00 0x00 terminator for text/bytes with 0x00 bytes escaped), so the
-/// concatenation compares byte-for-byte in exactly the same order as
-/// comparing the value tuples component by component. That is what makes a
-/// prefix scan over the leading K of N components ("leftmost prefix" rule,
-/// same as a real multi-column B-tree index) a correct equality lookup on
-/// just those K columns, unconstrained on the rest.
-pub const rowTag: u8 = 'R';
-pub const indexTag: u8 = 'I';
-pub const compositeIndexTag: u8 = 'J';
-pub const metaTag: u8 = 'M';
+pub const rowTag: u8 = 0xF6;
+pub const indexTag: u8 = 0xF7;
+pub const compositeIndexTag: u8 = 0xF8;
+pub const metaTag: u8 = 0xF9;
 const sep: u8 = 0x00;
 
 fn appendSegment(out: *std.ArrayList(u8), segment: []const u8) !void {
@@ -164,11 +138,6 @@ pub fn compositeIndexEntryKey(allocator: Allocator, table: []const u8, indexName
     return out.toOwnedSlice();
 }
 
-/// Bound for a leftmost-prefix scan of a composite index: `values.len` may
-/// be less than the index's full column count, in which case the scan
-/// matches every entry whose leading columns equal `values` regardless of
-/// what the remaining (unconstrained) columns hold - see the module-level
-/// keyspace comment for why the concatenation makes this a correct prefix.
 pub fn compositeIndexValueBound(allocator: Allocator, table: []const u8, indexName: []const u8, values: []const Value) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
@@ -179,13 +148,6 @@ pub fn compositeIndexValueBound(allocator: Allocator, table: []const u8, indexNa
     return out.toOwnedSlice();
 }
 
-/// Bound for a composite index scan that pins `eqValues` as the leading
-/// columns (leftmost prefix, same as `compositeIndexValueBound`) and then
-/// appends one more ordered value for a range condition on the very next
-/// column - the byte-extension argument from the module-level keyspace
-/// comment applies here exactly as it does for a bare `indexValueBound`, so
-/// `scanCompositeRangeCursor` can reuse the same inclusive/exclusive
-/// gap trick `scanRangeCursor` uses for single-field indexes.
 fn compositeIndexRangeBound(allocator: Allocator, table: []const u8, indexName: []const u8, eqValues: []const Value, extra: Value) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
@@ -197,10 +159,6 @@ fn compositeIndexRangeBound(allocator: Allocator, table: []const u8, indexName: 
     return out.toOwnedSlice();
 }
 
-/// Smallest byte string strictly greater than every string with `prefix` as
-/// a prefix, used as the exclusive upper bound of a prefix scan. Returns
-/// null when the prefix is all 0xFF bytes (unbounded above, e.g. empty
-/// table/field names never hit this in practice).
 pub fn prefixUpperBound(allocator: Allocator, prefix: []const u8) !?[]u8 {
     var end = prefix.len;
     while (end > 0 and prefix[end - 1] == 0xff) end -= 1;
@@ -211,9 +169,6 @@ pub fn prefixUpperBound(allocator: Allocator, prefix: []const u8) !?[]u8 {
     return upper;
 }
 
-/// Whether a table name or field name is safe to embed as a NUL-delimited
-/// keyspace segment: table/field identifiers may not themselves contain
-/// NUL bytes or they would corrupt the segment boundaries above.
 pub fn validIdentifier(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name) |c| {
@@ -222,10 +177,6 @@ pub fn validIdentifier(name: []const u8) bool {
     return true;
 }
 
-/// Persisted set of field names that have a secondary index on a table.
-/// Loaded once per Table.open and written back to the Db's metadata
-/// namespace whenever an index is created or dropped, so indexes survive
-/// process restarts without any external schema file.
 pub const IndexSet = struct {
     allocator: Allocator,
     fields: std.ArrayList([]u8),
@@ -288,7 +239,6 @@ pub const IndexSet = struct {
         try self.fields.append(copy);
     }
 
-    /// Returns true if the field was present and has been removed.
     pub fn remove(self: *IndexSet, field: []const u8) bool {
         for (self.fields.items, 0..) |f, i| {
             if (std.mem.eql(u8, f, field)) {
@@ -306,15 +256,6 @@ pub const IndexSet = struct {
     }
 };
 
-/// Persisted set of field names carrying a UNIQUE constraint on a table -
-/// same on-disk shape as `IndexSet` (own meta key, own namespace), kept as
-/// a separate type because the two sets have different invariants: every
-/// member of `UniqueSet` is also required to be a member of the table's
-/// `IndexSet` (enforced by `Table.createUniqueIndex`/`Table.dropIndex`),
-/// since `Table.put` detects a colliding value by reusing the field's
-/// regular index entries via `scanEq` rather than a full table scan - a
-/// unique field with no backing index would make every write pay for a
-/// full scan just to check the constraint.
 pub const UniqueSet = struct {
     allocator: Allocator,
     fields: std.ArrayList([]u8),
@@ -377,7 +318,6 @@ pub const UniqueSet = struct {
         try self.fields.append(copy);
     }
 
-    /// Returns true if the field was present and has been removed.
     pub fn remove(self: *UniqueSet, field: []const u8) bool {
         for (self.fields.items, 0..) |f, i| {
             if (std.mem.eql(u8, f, field)) {
@@ -395,25 +335,6 @@ pub const UniqueSet = struct {
     }
 };
 
-/// One FOREIGN KEY constraint: `field` on the owning table must, on every
-/// row where it is present and non-none, name a value that exists as
-/// `refField` on `refTable` (SQL's `FOREIGN KEY (field) REFERENCES
-/// refTable(refField)`). `refField` is either `query.pkField` (the
-/// referenced table's primary key, checked via a plain `get`) or a field
-/// carrying its own UNIQUE constraint on `refTable` (checked via `scanEq`) -
-/// `Table.createForeignKey` requires one of the two before installing,
-/// exactly like a real database refusing a foreign key against a column
-/// with no unique/primary-key backing, since otherwise "the value exists"
-/// would not pin down a single unambiguous parent row.
-/// SQL's `ON DELETE` clause: what a FOREIGN KEY does when the row it points
-/// at is deleted. `restrict` (the SQL default, and this codebase's only
-/// behavior before cascading deletes existed) refuses the delete outright
-/// while a referencing row still exists; `cascade` instead deletes every
-/// referencing row too, recursively (a cascaded child can itself have
-/// dependents), before the parent row itself is removed. Stored as a plain
-/// byte in `ForeignKeySpec`/`ReferencedBySpec` rather than a bare bool so a
-/// third mode (e.g. `set_null`) can be added later without another format
-/// bump.
 pub const OnDelete = enum(u8) {
     restrict = 0,
     cascade = 1,
@@ -434,11 +355,6 @@ pub const ForeignKeySpec = struct {
     onDelete: OnDelete,
 };
 
-/// Persisted set of FOREIGN KEY constraints on a table, at most one per
-/// owning field - same on-disk shape family as `IndexSet`/`UniqueSet` (own
-/// meta key, own namespace) but each entry carries two extra strings
-/// (`refTable`/`refField`) plus an `onDelete` mode byte instead of being a
-/// bare field name.
 pub const ForeignKeySet = struct {
     allocator: Allocator,
     specs: std.ArrayList(ForeignKeySpec),
@@ -513,8 +429,6 @@ pub const ForeignKeySet = struct {
         try self.specs.append(spec);
     }
 
-    /// Returns true if a constraint on `field` was present and has been
-    /// removed.
     pub fn remove(self: *ForeignKeySet, field: []const u8) bool {
         for (self.specs.items, 0..) |spec, i| {
             if (std.mem.eql(u8, spec.field, field)) {
@@ -538,24 +452,11 @@ pub const ForeignKeySet = struct {
     }
 };
 
-/// One named CHECK constraint: a caller-chosen `name` (used only as the key
-/// under which the constraint can be dropped again, not part of the
-/// keyspace layout - unlike `CompositeIndexSpec.name`, no index entries are
-/// ever written for a CHECK) paired with the raw `expr.zig` predicate source
-/// text it must evaluate true against. Stored as source rather than a parsed
-/// tree because `index.zig` sits below `query.zig`/`expr.zig` in the
-/// dependency graph and knows nothing about `Predicate` - parsing happens
-/// fresh in whichever layer enforces it (`query.zig`'s `Table.put`,
-/// `txn_table.zig`'s `TableTxn.put`), the same "reparse on every use" cost
-/// `table select`/`table join` already pay for their own expr text.
 pub const CheckConstraintSpec = struct {
     name: []u8,
     source: []u8,
 };
 
-/// Persisted set of CHECK constraints on a table, at most one per name -
-/// same on-disk shape family as `ForeignKeySet` (own meta key, own
-/// namespace, two length-prefixed strings per entry).
 pub const CheckConstraintSet = struct {
     allocator: Allocator,
     specs: std.ArrayList(CheckConstraintSpec),
@@ -620,8 +521,6 @@ pub const CheckConstraintSet = struct {
         try self.specs.append(spec);
     }
 
-    /// Returns true if a constraint named `name` was present and has been
-    /// removed.
     pub fn remove(self: *CheckConstraintSet, name: []const u8) bool {
         for (self.specs.items, 0..) |spec, i| {
             if (std.mem.eql(u8, spec.name, name)) {
@@ -643,14 +542,6 @@ pub const CheckConstraintSet = struct {
     }
 };
 
-/// One reverse FOREIGN KEY entry, recorded on the REFERENCED table rather
-/// than the referencing one: some other table `childTable` has a
-/// `FOREIGN KEY (childField) REFERENCES <this table>(refField)`. This is
-/// the registry `Table.createForeignKey`'s doc comment calls out as
-/// missing ("tables are opened ad hoc by name and never catalogued
-/// anywhere") - without it, deleting a parent row has no way to discover
-/// which other tables might still be pointing at it, since `ForeignKeySet`
-/// is only ever stored on the referencing (child) side.
 pub const ReferencedBySpec = struct {
     childTable: []u8,
     childField: []u8,
@@ -658,22 +549,6 @@ pub const ReferencedBySpec = struct {
     onDelete: OnDelete,
 };
 
-/// Persisted set of reverse FK entries on a table - same on-disk shape
-/// family as `ForeignKeySet` (own meta key, own namespace, three
-/// length-prefixed strings plus an `onDelete` mode byte per entry), but
-/// populated by a DIFFERENT table's `createForeignKey`/`dropForeignKey`
-/// call rather than by mutations against this table directly. `onDelete`
-/// is duplicated here rather than looked up from the child's own
-/// `ForeignKeySet` on every delete, so `Table.delete`'s cascade planner
-/// (see `query.zig`'s `planCascade`) can decide restrict-vs-cascade
-/// without opening and loading the child a second time just to answer
-/// that. `add` is keyed by the (childTable, childField) pair - a child
-/// field can only ever carry one FOREIGN KEY (enforced by
-/// `ForeignKeySet.has` at the child), so at most one reverse entry per
-/// pair can ever be correct; re-adding the same pair (only reachable by
-/// first dropping and recreating the child's constraint, possibly with a
-/// different `refField`/`onDelete`) replaces it in place instead of
-/// accumulating a stale duplicate.
 pub const ReferencedBySet = struct {
     allocator: Allocator,
     specs: std.ArrayList(ReferencedBySpec),
@@ -751,8 +626,6 @@ pub const ReferencedBySet = struct {
         try self.specs.append(spec);
     }
 
-    /// Returns true if a reverse entry for (childTable, childField) was
-    /// present and has been removed.
     pub fn remove(self: *ReferencedBySet, childTable: []const u8, childField: []const u8) bool {
         const i = self.indexOf(childTable, childField) orelse return false;
         const spec = self.specs.items[i];
@@ -790,11 +663,6 @@ fn appendLenPrefixed(out: *std.ArrayList(u8), value: []const u8) !void {
     try out.appendSlice(value);
 }
 
-/// One multi-column ("composite") index: a caller-chosen name (used as the
-/// keyspace discriminator, so it must be a `validIdentifier` like a table or
-/// field name) plus the ordered list of fields it indexes. Field order is
-/// significant - it defines both the on-disk key layout and which leading
-/// ("leftmost") prefix of columns a query can use for a narrowed lookup.
 pub const CompositeIndexSpec = struct {
     name: []u8,
     fields: [][]u8,
@@ -806,10 +674,6 @@ pub const CompositeIndexSpec = struct {
     }
 };
 
-/// Persisted set of composite indexes on a table, the multi-column
-/// counterpart to `IndexSet`. Stored under a separate metadata key
-/// ("CINDEXES" vs "INDEXES") so single-field and composite indexes never
-/// share or shadow each other's schema record.
 pub const CompositeIndexSet = struct {
     allocator: Allocator,
     specs: std.ArrayList(CompositeIndexSpec),
@@ -917,8 +781,6 @@ pub const CompositeIndexSet = struct {
         try self.specs.append(.{ .name = nameCopy, .fields = fieldsCopy });
     }
 
-    /// Returns true if a composite index by that name was present and has
-    /// been removed.
     pub fn remove(self: *CompositeIndexSet, name: []const u8) bool {
         for (self.specs.items, 0..) |*s, i| {
             if (std.mem.eql(u8, s.name, name)) {
@@ -936,10 +798,6 @@ pub const CompositeIndexSet = struct {
     }
 };
 
-/// Adds one index entry mapping `value` -> `pk` under `table.field`. The
-/// entry's stored value is the plain (non order-preserving) encoding of the
-/// primary key, so lookups can recover the exact original Value instead of
-/// re-parsing the escaped ordered key bytes.
 pub fn addEntry(db: *Db, allocator: Allocator, table: []const u8, field: []const u8, value: Value, pk: Value) !void {
     const key = try indexEntryKey(allocator, table, field, value, pk);
     defer allocator.free(key);
@@ -954,7 +812,6 @@ pub fn removeEntry(db: *Db, allocator: Allocator, table: []const u8, field: []co
     try db.delete(key);
 }
 
-/// Deletes every index entry for `table.field`, used when dropping an index.
 pub fn dropAllEntries(db: *Db, allocator: Allocator, table: []const u8, field: []const u8) !void {
     const prefix = try indexPrefix(allocator, table, field);
     defer allocator.free(prefix);
@@ -973,9 +830,6 @@ pub fn dropAllEntries(db: *Db, allocator: Allocator, table: []const u8, field: [
     for (keys.items) |k| try db.delete(k);
 }
 
-/// Adds one composite index entry mapping the full `values` tuple -> `pk`
-/// under `table`'s index `indexName`. Same stored-value convention as
-/// `addEntry`: the plain (non order-preserving) pk encoding.
 pub fn addCompositeEntry(db: *Db, allocator: Allocator, table: []const u8, indexName: []const u8, values: []const Value, pk: Value) !void {
     const key = try compositeIndexEntryKey(allocator, table, indexName, values, pk);
     defer allocator.free(key);
@@ -990,7 +844,6 @@ pub fn removeCompositeEntry(db: *Db, allocator: Allocator, table: []const u8, in
     try db.delete(key);
 }
 
-/// Deletes every entry for a composite index, used when dropping it.
 pub fn dropAllCompositeEntries(db: *Db, allocator: Allocator, table: []const u8, indexName: []const u8) !void {
     const prefix = try compositeIndexPrefix(allocator, table, indexName);
     defer allocator.free(prefix);
@@ -1009,9 +862,6 @@ pub fn dropAllCompositeEntries(db: *Db, allocator: Allocator, table: []const u8,
     for (keys.items) |k| try db.delete(k);
 }
 
-/// Lazy cursor over a leftmost-prefix equality lookup on a composite index:
-/// `valuesPrefix` may cover all of the index's columns or just a leading
-/// subset of them. Streaming for the same reason as `EqCursor`.
 pub const CompositeEqCursor = struct {
     it: dbmod.RangeIterator,
 
@@ -1031,7 +881,6 @@ pub fn scanCompositeEqCursor(db: *Db, allocator: Allocator, table: []const u8, i
     return .{ .it = try db.scanPrefix(allocator, prefix) };
 }
 
-/// Eager counterpart of `scanCompositeEqCursor`, all matching primary keys.
 pub fn scanCompositeEq(db: *Db, allocator: Allocator, table: []const u8, indexName: []const u8, valuesPrefix: []const Value) ![]Value {
     var cursor = try scanCompositeEqCursor(db, allocator, table, indexName, valuesPrefix);
     defer cursor.deinit();
@@ -1045,11 +894,6 @@ pub fn scanCompositeEq(db: *Db, allocator: Allocator, table: []const u8, indexNa
     return results.toOwnedSlice();
 }
 
-/// Lazy cursor over a range lookup on the column immediately following a
-/// leftmost-prefix of equality columns on a composite index: `eqValues`
-/// pins the leading columns exactly like `CompositeEqCursor`, `low`/`high`
-/// bound the next column. Columns beyond that one are left unconstrained by
-/// the scan, same leftmost-prefix rule as the equality-only cursor.
 pub const CompositeRangeCursor = struct {
     it: dbmod.RangeIterator,
 
@@ -1080,11 +924,6 @@ pub fn scanCompositeRangeCursor(
     var endBuf: ?[]u8 = null;
     defer if (endBuf) |b| allocator.free(b);
 
-    // Same inclusive/exclusive gap trick as `scanRangeCursor`: a real entry
-    // key is always `compositeIndexRangeBound(eqValues, value) ++ orderedPk`,
-    // a strict byte-extension of the bare per-value bound (pk encodings are
-    // never empty), so a key with value == threshold always sorts after
-    // `compositeIndexRangeBound(eqValues, threshold)` itself.
     const start = if (low) |b| blk: {
         const bound = try compositeIndexRangeBound(allocator, table, indexName, eqValues, b.value);
         if (b.inclusive) {
@@ -1118,11 +957,6 @@ pub fn scanCompositeRangeCursor(
     }) };
 }
 
-/// Lazy cursor over an equality index lookup: decodes one primary key at a
-/// time from the underlying `Db.RangeIterator` instead of materializing the
-/// whole match set up front. This is what lets `Table.selectPage` honour a
-/// small `limit` without reading and decoding every index entry for a value
-/// that may have thousands of matches.
 pub const EqCursor = struct {
     it: dbmod.RangeIterator,
 
@@ -1136,15 +970,12 @@ pub const EqCursor = struct {
     }
 };
 
-/// Point lookup, streaming: opens the underlying scan but decodes nothing
-/// until `EqCursor.next` is called.
 pub fn scanEqCursor(db: *Db, allocator: Allocator, table: []const u8, field: []const u8, value: Value) !EqCursor {
     const prefix = try indexValueBound(allocator, table, field, value);
     defer allocator.free(prefix);
     return .{ .it = try db.scanPrefix(allocator, prefix) };
 }
 
-/// Point lookup: all primary keys currently indexed under `value`.
 pub fn scanEq(db: *Db, allocator: Allocator, table: []const u8, field: []const u8, value: Value) ![]Value {
     var cursor = try scanEqCursor(db, allocator, table, field, value);
     defer cursor.deinit();
@@ -1163,7 +994,6 @@ pub const Bound = struct {
     inclusive: bool,
 };
 
-/// Lazy cursor over a range index lookup, same rationale as `EqCursor`.
 pub const RangeCursor = struct {
     it: dbmod.RangeIterator,
 
@@ -1177,9 +1007,6 @@ pub const RangeCursor = struct {
     }
 };
 
-/// Range lookup over `table.field`'s index, streaming: primary keys whose
-/// indexed value falls within [low, high] (either side may be open/null),
-/// decoded one at a time as the caller consumes the cursor.
 pub fn scanRangeCursor(
     db: *Db,
     allocator: Allocator,
@@ -1196,12 +1023,6 @@ pub fn scanRangeCursor(
     var endBuf: ?[]u8 = null;
     defer if (endBuf) |b| allocator.free(b);
 
-    // Every real index-entry key is `indexValueBound(value) ++ orderedPk`, a
-    // strict byte-extension of the bare value bound (pk encodings are never
-    // empty). So a key with value == threshold always compares greater than
-    // `indexValueBound(threshold)` itself - inclusive/exclusive thresholds
-    // are therefore expressed by choosing which side of that gap to start
-    // or stop the scan at, not by the start/endInclusive flags.
     const start = if (low) |b| blk: {
         const bound = try indexValueBound(allocator, table, field, b.value);
         if (b.inclusive) {
@@ -1235,8 +1056,6 @@ pub fn scanRangeCursor(
     }) };
 }
 
-/// Range lookup over `table.field`'s index: all primary keys whose indexed
-/// value falls within [low, high] (either side may be open/null).
 pub fn scanRange(
     db: *Db,
     allocator: Allocator,
@@ -1264,8 +1083,8 @@ test "rowKey and indexEntryKey stay within their own namespace" {
     const ik = try indexEntryKey(allocator, "users", "email", .{ .text = "a@b.c" }, .{ .int = 1 });
     defer allocator.free(ik);
 
-    try std.testing.expectEqual(@as(u8, 'R'), rk[0]);
-    try std.testing.expectEqual(@as(u8, 'I'), ik[0]);
+    try std.testing.expectEqual(rowTag, rk[0]);
+    try std.testing.expectEqual(indexTag, ik[0]);
 }
 
 test "prefixUpperBound bounds a prefix scan" {
@@ -1369,9 +1188,6 @@ test "UniqueSet and IndexSet on the same table never collide, each keeps its own
     try unique.add("email");
     try unique.save(&db, "users");
 
-    // "city" is indexed but not unique, "email" is both - the two sets
-    // must agree on "email" and disagree on "city" after an independent
-    // reload of each, proving neither save() overwrote the other's key.
     var reloadedIndexes = try IndexSet.load(allocator, &db, "users");
     defer reloadedIndexes.deinit();
     var reloadedUnique = try UniqueSet.load(allocator, &db, "users");
@@ -1409,9 +1225,6 @@ test "ForeignKeySet add remove save load round trip" {
     const spec = reloaded.find("customer_id").?;
     try std.testing.expectEqualStrings("customers", spec.refTable);
     try std.testing.expectEqualStrings("__pk", spec.refField);
-    // First `add` wins (mirrors `has` guard above) - `onDelete` survives the
-    // save/load round trip as the mode from that first call, not the
-    // no-op second one.
     try std.testing.expectEqual(OnDelete.cascade, spec.onDelete);
 
     try std.testing.expect(reloaded.remove("customer_id"));
@@ -1443,10 +1256,6 @@ test "ForeignKeySet.load rejects a corrupted onDelete byte instead of accepting 
     const raw = try db.get(allocator, key) orelse return error.TestUnexpectedResult;
     defer allocator.free(raw);
 
-    // Flip the trailing onDelete byte to a value neither `restrict` (0)
-    // nor `cascade` (1) can ever legitimately be - same "malformed input
-    // is rejected, not silently coerced" contract every other decoder in
-    // this file already gives length-prefixed strings.
     const corrupted = try allocator.dupe(u8, raw);
     defer allocator.free(corrupted);
     corrupted[corrupted.len - 1] = 0xFF;
@@ -1487,9 +1296,6 @@ test "ReferencedBySet add replaces an existing (childTable, childField) pair ins
         }
     }
 
-    // Re-adding the same pair under a different refField AND onDelete mode
-    // replaces both in place rather than accumulating a second, now-stale
-    // entry.
     try reloaded.add("orders", "customer_id", "email", .cascade);
     try std.testing.expectEqual(@as(usize, 2), reloaded.specs.items.len);
     var sawOrders = false;
@@ -1648,10 +1454,6 @@ test "EqCursor streams the same pks as eager scanEq and can stop early" {
     }
     try std.testing.expectEqual(@as(usize, 20), eager.len);
 
-    // Pull only the first three through the cursor, then drop it: this must
-    // neither read nor decode the remaining seventeen entries, and the
-    // testing allocator would flag a leak if the partially-consumed
-    // RangeIterator's resources were not released on an early deinit.
     var cursor = try scanEqCursor(&db, allocator, "users", "city", .{ .text = "warsaw" });
     defer cursor.deinit();
     var pulled = std.ArrayList(Value).init(allocator);
@@ -1693,8 +1495,6 @@ test "RangeCursor streams the same pks as eager scanRange and can stop early" {
     defer second.free(allocator);
     try std.testing.expectEqual(@as(i64, 5), first.int);
     try std.testing.expectEqual(@as(i64, 6), second.int);
-    // cursor and its underlying iterator are dropped by `defer` here without
-    // consuming the other 23 matches.
 }
 
 test "scanRange respects bounds and inclusivity" {
@@ -1760,7 +1560,7 @@ test "CompositeIndexSet add remove save load round trip" {
     try std.testing.expectEqual(@as(usize, 0), set.specs.items.len);
 
     try set.add("city_age", &.{ "city", "age" });
-    try set.add("city_age", &.{ "city", "age" }); // no-op, already present
+    try set.add("city_age", &.{ "city", "age" });
     try std.testing.expectEqual(@as(usize, 1), set.specs.items.len);
     try set.save(&db, "users");
 
@@ -1782,9 +1582,6 @@ test "CompositeIndexSet add remove save load round trip" {
 }
 
 test "single-field and composite index metadata never shadow each other" {
-    // Both live under the "M" tag with table-name-suffixed keys that differ
-    // only in "INDEXES" vs "CINDEXES" - this pins down that they stay two
-    // genuinely distinct Db keys, not one overwriting the other.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1827,7 +1624,6 @@ test "addCompositeEntry scanCompositeEq removeCompositeEntry round trip" {
     try addCompositeEntry(&db, allocator, "users", "city_age", &.{ .{ .text = "warsaw" }, .{ .int = 40 } }, .{ .int = 2 });
     try addCompositeEntry(&db, allocator, "users", "city_age", &.{ .{ .text = "krakow" }, .{ .int = 30 } }, .{ .int = 3 });
 
-    // Full-tuple match: exactly one row.
     const exact = try scanCompositeEq(&db, allocator, "users", "city_age", &.{ .{ .text = "warsaw" }, .{ .int = 30 } });
     defer {
         for (exact) |v| v.free(allocator);
@@ -1836,8 +1632,6 @@ test "addCompositeEntry scanCompositeEq removeCompositeEntry round trip" {
     try std.testing.expectEqual(@as(usize, 1), exact.len);
     try std.testing.expectEqual(@as(i64, 1), exact[0].int);
 
-    // Leftmost-prefix match on just the first column: both warsaw rows,
-    // never the krakow one, even though it wasn't constrained on age at all.
     const prefixMatch = try scanCompositeEq(&db, allocator, "users", "city_age", &.{.{ .text = "warsaw" }});
     defer {
         for (prefixMatch) |v| v.free(allocator);
@@ -1865,15 +1659,12 @@ test "scanCompositeRangeCursor narrows on the column after the matched prefix" {
     var db = try Db.open(allocator, dbPath, .{});
     defer db.close();
 
-    // Two cities, ages 20..29 in each - the composite index is (city, age).
     var age: i64 = 20;
     while (age < 30) : (age += 1) {
         try addCompositeEntry(&db, allocator, "users", "city_age", &.{ .{ .text = "warsaw" }, .{ .int = age } }, .{ .int = age });
         try addCompositeEntry(&db, allocator, "users", "city_age", &.{ .{ .text = "krakow" }, .{ .int = age } }, .{ .int = age + 100 });
     }
 
-    // city == "warsaw" and 23 <= age <= 26: never crosses into krakow's
-    // bucket even though its ages overlap byte-for-byte with warsaw's.
     var midCursor = try scanCompositeRangeCursor(&db, allocator, "users", "city_age", &.{.{ .text = "warsaw" }}, .{ .value = .{ .int = 23 }, .inclusive = true }, .{ .value = .{ .int = 26 }, .inclusive = true });
     var midInclusive = std.ArrayList(Value).init(allocator);
     defer midInclusive.deinit();
@@ -1883,7 +1674,6 @@ test "scanCompositeRangeCursor narrows on the column after the matched prefix" {
     try std.testing.expectEqual(@as(i64, 23), midInclusive.items[0].int);
     try std.testing.expectEqual(@as(i64, 26), midInclusive.items[midInclusive.items.len - 1].int);
 
-    // Exclusive both sides: drops the two endpoints.
     var exclusive = try scanCompositeRangeCursor(&db, allocator, "users", "city_age", &.{.{ .text = "warsaw" }}, .{ .value = .{ .int = 23 }, .inclusive = false }, .{ .value = .{ .int = 26 }, .inclusive = false });
     defer exclusive.deinit();
     const first = (try exclusive.next(allocator)).?;
@@ -1894,7 +1684,6 @@ test "scanCompositeRangeCursor narrows on the column after the matched prefix" {
     try std.testing.expectEqual(@as(i64, 25), second.int);
     try std.testing.expectEqual(@as(?Value, null), try exclusive.next(allocator));
 
-    // Open above: age >= 28 within warsaw only, never touching krakow.
     var openAbove = try scanCompositeRangeCursor(&db, allocator, "users", "city_age", &.{.{ .text = "warsaw" }}, .{ .value = .{ .int = 28 }, .inclusive = true }, null);
     defer openAbove.deinit();
     const a1 = (try openAbove.next(allocator)).?;

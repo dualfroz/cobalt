@@ -8,28 +8,6 @@ const Kind = encode.Kind;
 const Db = dbmod.Db;
 const WriteBatch = dbmod.WriteBatch;
 
-// Physical WAL-tailing replication: reads the primary's on-disk wal.log file
-// directly (same binary frame format as wal.zig: [crc32 u32][seq u64][kind u8]
-// [keyLen u32][valLen u32][key][value], or a batch frame marked by kind byte
-// 0xB0 holding a count then per-op [kind][seq][keyLen][valLen][key][value]),
-// independently of wal.zig's private replay-into-memtable path, and applies
-// newly appended, crc-verified, complete frames onto a separate replica Db.
-//
-// This mirrors real physical log shipping (e.g. Postgres WAL streaming): it
-// only sees what is still in the WAL file. Db.flush() truncates the primary's
-// wal.log to empty once its memtable is durable in an SSTable (see db.zig
-// flush()), so a tailer that has fallen behind a flush can no longer recover
-// the truncated records from the WAL alone - poll() detects that condition
-// (current file size smaller than the tailer's already-consumed offset) and
-// fails loudly with error.WalTruncatedAheadOfTailer instead of silently
-// resuming from zero and dropping data. The caller is expected to recover via
-// fullResync(), which re-bases the replica from a live Snapshot (paying the
-// same "logical snapshot, not a physical replica of on-disk levels/history"
-// cost already documented for backup.zig) and restarts tailing from the
-// (now known-empty) WAL, exactly mirroring a real base-backup-plus-streaming
-// recovery: bulk-copy current state, then resume incremental log shipping
-// from the offset the bulk copy was taken at.
-
 const headerLen = 8 + 1 + 4 + 4;
 const batchMarker: u8 = 0xB0;
 const batchHeader = 8 + 1 + 4;
@@ -39,10 +17,6 @@ const maxTailRead: usize = 256 * 1024 * 1024;
 
 pub const ReplicateError = error{ WalTruncatedAheadOfTailer, WalGenerationChanged };
 
-/// Reads the WAL generation stamp (see wal.zig's currentGeneration) for a
-/// primary directory given only its path, for callers (WalTailer.poll,
-/// Replicator construction from a persisted offset) that do not hold a live
-/// *Db handle to the primary and so cannot reuse its already-open Dir.
 fn readGenerationByPath(primaryDirPath: []const u8) !u64 {
     var dir = try std.fs.cwd().openDir(primaryDirPath, .{});
     defer dir.close();
@@ -66,11 +40,6 @@ fn freeAll(allocator: Allocator, records: []OwnedRecord) void {
     allocator.free(records);
 }
 
-/// Tails a single WAL file from a byte offset, decoding whole, crc-verified
-/// frames appended since the last poll. Never advances past an incomplete or
-/// corrupt tail frame (mirrors wal.zig's own torn-write tolerance), so a
-/// concurrent writer mid-append is simply not observed until its frame is
-/// fully flushed and synced.
 pub const WalTailer = struct {
     allocator: Allocator,
     file: std.fs.File,
@@ -92,14 +61,6 @@ pub const WalTailer = struct {
         self.allocator.free(self.primaryDir);
     }
 
-    /// Returns newly observed records in append order. Caller owns the
-    /// returned slice and each record's key/value (free via freeAll or by
-    /// calling deinit() on each record then freeing the slice). Checks the
-    /// primary's WAL generation stamp before anything else: a changed
-    /// generation means the primary truncated (flushed) since the last poll,
-    /// which the caller must recover from via fullResync() regardless of how
-    /// the raw byte offsets happen to compare (see wal.zig's bumpGeneration
-    /// doc comment for why the byte-size comparison alone is not enough).
     pub fn poll(self: *WalTailer) ![]OwnedRecord {
         const nowGeneration = try readGenerationByPath(self.primaryDir);
         if (nowGeneration != self.generation) return ReplicateError.WalGenerationChanged;
@@ -189,11 +150,6 @@ fn decodeFrame(allocator: Allocator, body: []const u8, out: *std.ArrayList(Owned
     try out.append(.{ .kind = kind, .seq = seq, .key = key, .value = value });
 }
 
-/// Ties a WalTailer to a target Db, applying newly tailed records as a single
-/// WriteBatch per syncOnce(). Replicated writes get FRESH sequence numbers on
-/// the target (Db.apply always assigns from its own nextSeq), so the replica
-/// mirrors primary key/value state but not primary's original seq history -
-/// same documented tradeoff as backup.zig's restore.
 pub const Replicator = struct {
     allocator: Allocator,
     tailer: WalTailer,
@@ -221,11 +177,6 @@ pub const Replicator = struct {
         return self.tailer.generation;
     }
 
-    /// Applies every record newly visible in the primary's WAL since the last
-    /// call. Returns the number of records applied (0 if nothing new).
-    /// Propagates error.WalTruncatedAheadOfTailer if the primary flushed
-    /// (truncating its WAL) before this replicator consumed everything - the
-    /// caller must recover via fullResync().
     pub fn syncOnce(self: *Replicator) !usize {
         const records = try self.tailer.poll();
         defer freeAll(self.allocator, records);
@@ -243,15 +194,6 @@ pub const Replicator = struct {
         return records.len;
     }
 
-    /// Recovers from a fallen-behind tailer (or bootstraps a brand new
-    /// replica) by copying every live key/value from a fresh primary
-    /// Snapshot into the target in chunks, then re-bases the tailer at the
-    /// primary's current WAL offset. Snapshot() flushes the primary first
-    /// (see db.zig), so immediately after this call the primary's wal.log is
-    /// known to be empty - offset 0 is therefore always the correct restart
-    /// point. Requires no concurrent writer on the primary during the call
-    /// (same single-writer assumption as the rest of this project - Db has
-    /// no internal cross-thread synchronization).
     pub fn fullResync(self: *Replicator, primary: *Db, chunkSize: usize) !usize {
         const snap = try primary.snapshot();
         var iter = try snap.scan(self.allocator, null, null);
@@ -275,10 +217,6 @@ pub const Replicator = struct {
         if (staged > 0) try self.target.apply(&batch);
 
         self.tailer.offset = 0;
-        // snapshot() above flushes the primary if it had unflushed writes,
-        // which bumps its WAL generation (see wal.zig) - re-baseline here so
-        // the very next poll() does not immediately see a "changed"
-        // generation caused by this resync itself.
         self.tailer.generation = try walmod.currentGeneration(primary.dir);
         return applied;
     }
@@ -287,11 +225,6 @@ pub const Replicator = struct {
 const stateMagic = "CRPS";
 const stateFormatVersion: u32 = 2;
 
-/// A tail offset paired with the WAL generation it was captured against.
-/// Persisting both (not just the offset) is what lets a brand-new process -
-/// which never saw the in-memory generation check in WalTailer.poll() - tell
-/// whether the primary truncated its WAL while this process was not running
-/// at all, the same blind spot the in-memory check closes for a live one.
 pub const PersistedState = struct {
     offset: u64,
     generation: u64,
@@ -308,16 +241,6 @@ pub const StateError = error{
     PrimaryMismatch,
 };
 
-/// Atomically persists a replicator's tail offset next to the replica's own
-/// data (in replicaDirPath), so a later, brand-new `cobalt replicate --once`
-/// process - which has no in-memory Replicator to resume from - can pick up
-/// tailing exactly where the previous invocation left off instead of paying
-/// for a full snapshot fullResync() every single time it starts. Also stores
-/// primaryDirPath so a mismatched later call (pointed at a different primary
-/// by mistake) is caught by loadOffset() rather than silently tailing the
-/// wrong WAL from a stale offset. Written via tmp-file + rename (same pattern
-/// as version.zig's writeCurrent), so a crash mid-write can never leave a
-/// half-written state file where a good one used to be.
 pub fn saveState(allocator: Allocator, replicaDirPath: []const u8, primaryDirPath: []const u8, offsetValue: u64, generationValue: u64) !void {
     var dir = try std.fs.cwd().openDir(replicaDirPath, .{});
     defer dir.close();
@@ -342,12 +265,6 @@ pub fn saveState(allocator: Allocator, replicaDirPath: []const u8, primaryDirPat
     try dir.rename(stateTmpName, stateFileName);
 }
 
-/// Loads a previously persisted tail offset for a replica directory. Returns
-/// null (not an error) when no state file has ever been written there yet -
-/// callers treat that as "fresh replica, bootstrap via fullResync()" exactly
-/// like before this existed. Returns StateError.PrimaryMismatch if the file
-/// was written while tailing a different primary directory, so a replica
-/// can never silently resume against the wrong primary from a stale offset.
 pub fn loadOffset(allocator: Allocator, replicaDirPath: []const u8, primaryDirPath: []const u8) !?PersistedState {
     var dir = try std.fs.cwd().openDir(replicaDirPath, .{});
     defer dir.close();
@@ -508,18 +425,12 @@ test "replicator poll does not consume a torn tail frame" {
     try primary.put("good", "data");
     try std.testing.expectEqual(@as(usize, 1), try rep.syncOnce());
 
-    // Simulate a writer mid-append: raw bytes appended after the good frame
-    // that never form a complete, crc-verified frame.
     try primary.wal.file.seekFromEnd(0);
     try primary.wal.file.writeAll(&[_]u8{ 0xAA, 0xBB, 0xCC });
     try primary.wal.sync();
 
     try std.testing.expectEqual(@as(usize, 0), try rep.syncOnce());
 
-    // The writer "finishes": a real, complete frame lands after the torn
-    // bytes are naturally never completed (matches wal.zig's own tolerance -
-    // torn tail bytes are simply never a valid prefix of a later frame, so
-    // this models a stalled partial write, not a resumed one).
     var count: usize = 0;
     var iter = try replica.scan(allocator, null, null);
     defer iter.deinit();
@@ -547,16 +458,10 @@ test "replicator surfaces truncation when it falls behind a primary flush" {
 
     var rep = try Replicator.init(allocator, primaryDir, &replica);
     defer rep.deinit();
-    // Advance the tailer's offset without applying, then flush the primary
-    // (truncates wal.log to 0) so the tailer's remembered offset now points
-    // past the end of the (now-empty) file.
     const staleRecords = try rep.tailer.poll();
     freeAll(allocator, staleRecords);
     try primary.flush();
 
-    // The primary's flush() bumped its WAL generation, so the generation
-    // check in poll() fires before the (now also true, but weaker) raw
-    // byte-offset comparison would have.
     try std.testing.expectError(ReplicateError.WalGenerationChanged, rep.syncOnce());
 
     const recovered = try rep.fullResync(&primary, 500);
@@ -567,8 +472,6 @@ test "replicator surfaces truncation when it falls behind a primary flush" {
     defer if (v) |val| allocator.free(val);
     try std.testing.expectEqualStrings("v", v.?);
 
-    // New writes after the resync are picked up normally through the
-    // freshly-restarted tail at offset 0.
     try primary.put("k2", "v2");
     try std.testing.expectEqual(@as(usize, 1), try rep.syncOnce());
     const v2 = try replica.get(allocator, "k2");
@@ -612,7 +515,6 @@ test "replicator fullResync bootstraps a brand new replica" {
     while (try iter.next()) |_| count += 1;
     try std.testing.expectEqual(@as(usize, 50), count);
 
-    // Fresh writes after the bootstrap keep tailing correctly from offset 0.
     try primary.put("late", "arrival");
     try std.testing.expectEqual(@as(usize, 1), try rep.syncOnce());
     const v = try replica.get(allocator, "late");
@@ -769,26 +671,29 @@ test "saveState and loadOffset round-trip through a real replicate directory end
 
     var primary = try Db.open(allocator, primaryDir, .{});
     defer primary.close();
-    var replica = try Db.open(allocator, replicaDir, .{});
-    defer replica.close();
 
     try primary.put("a", "1");
     try primary.put("b", "2");
 
-    var rep = try Replicator.init(allocator, primaryDir, &replica);
-    defer rep.deinit();
-    _ = try rep.syncOnce();
-    try saveState(allocator, replicaDir, primaryDir, rep.offset(), rep.generation());
-    const savedOffset = rep.offset();
+    var savedOffset: u64 = 0;
+    var savedGeneration: u64 = 0;
+    {
+        var replica = try Db.open(allocator, replicaDir, .{});
+        defer replica.close();
+        var rep = try Replicator.init(allocator, primaryDir, &replica);
+        defer rep.deinit();
+        _ = try rep.syncOnce();
+        try saveState(allocator, replicaDir, primaryDir, rep.offset(), rep.generation());
+        savedOffset = rep.offset();
+        savedGeneration = rep.generation();
+    }
     try std.testing.expect(savedOffset > 0);
 
-    // A brand new process would reopen the replica Db and reconstruct a
-    // Replicator from the persisted offset instead of offset 0.
     var replica2 = try Db.open(allocator, replicaDir, .{});
     defer replica2.close();
     const resumed = (try loadOffset(allocator, replicaDir, primaryDir)).?;
     try std.testing.expectEqual(savedOffset, resumed.offset);
-    try std.testing.expectEqual(rep.generation(), resumed.generation);
+    try std.testing.expectEqual(savedGeneration, resumed.generation);
 
     var rep2 = try Replicator.initFromOffset(allocator, primaryDir, &replica2, resumed.offset, resumed.generation);
     defer rep2.deinit();
@@ -799,9 +704,6 @@ test "saveState and loadOffset round-trip through a real replicate directory end
     const c = try replica2.get(allocator, "c");
     defer if (c) |v| allocator.free(v);
     try std.testing.expectEqualStrings("3", c.?);
-    // The earlier keys were never re-applied through rep2 (it resumed past
-    // them), yet they are still visible because replica2 is the same
-    // on-disk replica Db that rep already wrote them into.
     const a = try replica2.get(allocator, "a");
     defer if (a) |v| allocator.free(v);
     try std.testing.expectEqualStrings("1", a.?);

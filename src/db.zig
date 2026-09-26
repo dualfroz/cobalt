@@ -27,6 +27,9 @@ fn order(a: []const u8, b: []const u8) std.math.Order {
 }
 
 const walName = "wal.log";
+pub const lockName = "LOCK";
+
+pub const OpenError = error{DataDirLocked};
 
 pub const Options = struct {
     flushThreshold: usize = 4 * 1024 * 1024,
@@ -46,6 +49,7 @@ pub const Db = struct {
     allocator: Allocator,
     dir: std.fs.Dir,
     dirPath: []u8,
+    lockFile: std.fs.File,
     memtable: Memtable,
     wal: Wal,
     sstables: std.ArrayList(*Reader),
@@ -64,6 +68,11 @@ pub const Db = struct {
         try std.fs.cwd().makePath(dirPath);
         var dir = try std.fs.cwd().openDir(dirPath, .{ .iterate = true });
         errdefer dir.close();
+        const lockFile = dir.createFile(lockName, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true }) catch |err| switch (err) {
+            error.WouldBlock => return OpenError.DataDirLocked,
+            else => return err,
+        };
+        errdefer lockFile.close();
 
         var sstables = std.ArrayList(*Reader).init(allocator);
         errdefer {
@@ -111,15 +120,6 @@ pub const Db = struct {
         const walMaxSeq = try wal.replay(&table);
         if (walMaxSeq > maxSeq) maxSeq = walMaxSeq;
 
-        // The directory scan alone can regress: a leveled compaction that
-        // fully garbage-collects a run of tombstones produces zero output
-        // files (see runMerge), so no fresh fileId is minted and the
-        // deleted inputs' seq/fileId watermark vanishes from disk. The
-        // manifest's persisted counters (stamped on every flush/compact,
-        // see VersionEdit.nextFileId/nextSeq) are the authoritative floor
-        // for exactly that case; take whichever recovery source is higher
-        // so this is purely additive safety, never a regression versus the
-        // scan-only behaviour this project already relied on.
         const scanNextFileId = maxId + 1;
         const scanNextSeq = maxSeq + 1;
         const nextFileId = @max(scanNextFileId, opened.set.counters.nextFileId orelse 0);
@@ -131,6 +131,7 @@ pub const Db = struct {
             .allocator = allocator,
             .dir = dir,
             .dirPath = dirPathCopy,
+            .lockFile = lockFile,
             .memtable = table,
             .wal = wal,
             .sstables = sstables,
@@ -158,6 +159,7 @@ pub const Db = struct {
         self.versionSet.close();
         self.versionState.deinit();
         self.memtable.deinit();
+        self.lockFile.close();
         self.dir.close();
         self.allocator.free(self.dirPath);
     }
@@ -444,12 +446,6 @@ pub const Db = struct {
         }
         outputs.deinit();
 
-        // Stamped even when this round produced zero output files (every
-        // input was a dropped tombstone): that is exactly the case where no
-        // fresh fileId gets minted and a directory scan on the next restart
-        // could otherwise regress below the seq/fileId already consumed by
-        // the now-deleted inputs (see the comment on VersionEdit.nextFileId
-        // and Db.open's counter merge).
         edit.setNextFileId(self.nextFileId);
         edit.setNextSeq(self.nextSeq);
         try self.versionSet.logAndApply(&edit, &self.versionState);
@@ -722,10 +718,6 @@ const SourceCursor = union(enum) {
     }
 };
 
-/// One live position in a k-way merge: the key it currently points at
-/// (a snapshot valid for the underlying source's whole lifetime, since
-/// sstable/memtable cursors never overwrite already-decoded key bytes)
-/// plus the index of the source cursor it belongs to.
 const KeyedIndex = struct { key: []const u8, idx: usize };
 
 fn keyIndexLess(_: void, a: KeyedIndex, b: KeyedIndex) bool {
@@ -735,16 +727,9 @@ fn keyIndexGreater(_: void, a: KeyedIndex, b: KeyedIndex) bool {
     return order(a.key, b.key) == .gt;
 }
 
-/// Ascending k-way merge heap: root always holds the smallest live key.
 const AscKeyHeap = heap.MinHeap(KeyedIndex, void, keyIndexLess);
-/// Descending k-way merge heap: root always holds the largest live key.
 const DescKeyHeap = heap.MinHeap(KeyedIndex, void, keyIndexGreater);
 
-/// Merges N sorted sstable cursors (compaction inputs) in ascending key
-/// order using a binary heap: O(log N) per advance instead of the O(N)
-/// full rescan a naive linear-scan merge needs for every emitted record.
-/// Ties (same key present in several inputs) resolve to the entry with
-/// the highest seq, matching last-writer-wins semantics.
 const SstableMerger = struct {
     cursors: []sstable.Cursor,
     heap: AscKeyHeap,
@@ -1282,15 +1267,6 @@ test "leveled compaction keeps levels disjoint and drops bottom tombstones" {
 }
 
 test "seq and fileId counters survive a compaction that garbage-collects every key" {
-    // Reproduces a real recovery gap: when a bottom-level compaction merges
-    // inputs that are entirely tombstones, runMerge produces zero output
-    // files (see the `builder == null` guard around minting a fresh
-    // fileId). If every file that ever carried a high seq/fileId gets
-    // deleted in that round and nothing new gets flushed before a restart,
-    // a directory-scan-only recovery would compute too low a floor and
-    // risk reusing already-consumed seq numbers. The manifest's persisted
-    // counters (VersionEdit.nextFileId/nextSeq, stamped unconditionally in
-    // runMerge) must close that gap.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1316,9 +1292,6 @@ test "seq and fileId counters survive a compaction that garbage-collects every k
 
         try db.maybeCompact();
 
-        // The whole point: every input was a dropped tombstone, so the
-        // compaction round produced no output file at all, and no new
-        // fileId was ever minted for it.
         try std.testing.expectEqual(@as(usize, 0), db.sstables.items.len);
 
         beforeNextSeq = db.nextSeq;
@@ -1326,8 +1299,6 @@ test "seq and fileId counters survive a compaction that garbage-collects every k
         try std.testing.expect(beforeNextSeq > 1);
     }
 
-    // On disk right now: no sstable files, an empty (reset) WAL. A
-    // scan-only recovery would compute nextSeq=1/nextFileId=1 here.
     var reopened = try openTemp(&tmp, allocator, .{
         .l0CompactionTrigger = 2,
         .l1BaseBytes = 4 * 1024 * 1024,
@@ -1336,8 +1307,6 @@ test "seq and fileId counters survive a compaction that garbage-collects every k
     try std.testing.expectEqual(beforeNextSeq, reopened.nextSeq);
     try std.testing.expectEqual(beforeNextFileId, reopened.nextFileId);
 
-    // Functional proof, not just counter equality: a fresh write after
-    // reopen must not reuse a seq number already spent on the GC'd keys.
     try reopened.put("fresh", "value");
     try std.testing.expect(reopened.nextSeq > beforeNextSeq);
 }
@@ -1629,4 +1598,42 @@ test "crash recovery honors wal durability boundary" {
     }
     const lastKey = try std.fmt.bufPrint(&keyBuf, "wkey{d}", .{total - 1});
     try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, lastKey));
+}
+
+test "a second open of a data directory fails while the first holds the lock" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var first = try openTemp(&tmp, allocator, .{});
+        defer first.close();
+        try first.put("k", "v");
+
+        try std.testing.expectError(OpenError.DataDirLocked, openTemp(&tmp, allocator, .{}));
+        try tmp.dir.access("store/" ++ lockName, .{});
+
+        const got = (try first.get(allocator, "k")).?;
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings("v", got);
+    }
+
+    var reopened = try openTemp(&tmp, allocator, .{});
+    defer reopened.close();
+    const got = (try reopened.get(allocator, "k")).?;
+    defer allocator.free(got);
+    try std.testing.expectEqualStrings("v", got);
+}
+
+test "the data directory lock is a real flock that other openers of the LOCK file observe" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try openTemp(&tmp, allocator, .{});
+    try std.testing.expectError(error.WouldBlock, tmp.dir.openFile("store/" ++ lockName, .{ .lock = .shared, .lock_nonblocking = true }));
+    db.close();
+
+    const probe = try tmp.dir.openFile("store/" ++ lockName, .{ .lock = .exclusive, .lock_nonblocking = true });
+    probe.close();
 }

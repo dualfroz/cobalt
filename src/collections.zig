@@ -7,17 +7,7 @@ const Allocator = std.mem.Allocator;
 const Db = dbmod.Db;
 const Transaction = txnmod.Transaction;
 
-/// Redis-like typed collections layered over the flat KV keyspace, sharing
-/// one Db with tables/indexes (row.zig/index.zig use tags 'R'/'I'/'M'; every
-/// key here starts with 'X' so the two namespaces never collide):
-///   "X" "C\0" name                         -> raw i64 (counter)
-///   "X" "H\0" name "\0" field               -> raw bytes (hash field)
-///   "X" "S\0" name "\0" member               -> empty marker (set member)
-///   "X" "L\0" name "\0M"                    -> raw {headSeq i64, tailSeq i64} (list meta)
-///   "X" "L\0" name "\0E\0" orderedInt(seq)  -> raw bytes (list element)
-///   "X" "Z\0" name "\0M\0" member            -> raw f64 (zset member -> score)
-///   "X" "Z\0" name "\0S\0" orderedFloat(score) orderedText(member) -> empty marker (zset score index)
-pub const nsTag: u8 = 'X';
+pub const nsTag: u8 = 0xFA;
 const sep: u8 = 0x00;
 const maxConflictRetries: usize = 64;
 
@@ -48,14 +38,6 @@ fn readF64(data: []const u8) !f64 {
     return @bitCast(std.mem.readInt(u64, data[0..8], .big));
 }
 
-/// Every atomic collection mutator below retries up to `maxConflictRetries`
-/// times on error.Conflict, re-reading current state fresh through `txn.get`
-/// on each attempt rather than replaying a stale value. `error.TooManyConflicts`
-/// is returned only if the retry budget is exhausted.
-/// Identifies which typed collection a name belongs to - used by collttl.zig
-/// to expire a WHOLE collection (every physical key under its namespace),
-/// since unlike a flat key a collection has no single Db key of its own
-/// (except Counter, see `exists`/`drop` below).
 pub const Kind = enum {
     counter,
     hash,
@@ -92,10 +74,6 @@ pub const Kind = enum {
         };
     }
 
-    /// Inverse of `tagByte`, null on any other byte. Used to decode a
-    /// `Kind` back out of a wire payload (`protocol.zig`'s `coll_ttl_op`)
-    /// or a marker key (`collttl.zig`'s `sweepExpired`), which previously
-    /// duplicated this exact switch inline.
     pub fn fromTagByte(b: u8) ?Kind {
         return switch (b) {
             'C' => .counter,
@@ -108,13 +86,6 @@ pub const Kind = enum {
     }
 };
 
-/// Prefix common to every physical key a Hash/Set/List/ZSet named `name`
-/// owns - each of those four kinds always segments as
-/// nsTag+kindTag+sep+name+sep+<rest>, so this single prefix reaches every
-/// field/member/element/score-entry at once. Counter is the one kind NOT
-/// covered here: its single key has no trailing separator after `name`
-/// (see Counter.key), so a same-named counter is handled separately in
-/// `exists`/`drop` below rather than through a prefix scan.
 fn genericPrefix(allocator: Allocator, k: Kind, name: []const u8) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
@@ -124,10 +95,6 @@ fn genericPrefix(allocator: Allocator, k: Kind, name: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-/// True if `name` currently has any physical presence under `k`'s namespace.
-/// A counter counts as existing once `set`/`incrBy` has stored a value for
-/// it, even 0 - that stored 0 is real data, not the "absent" default
-/// Counter.get returns for a name nothing ever touched.
 pub fn collectionExists(db: *Db, allocator: Allocator, k: Kind, name: []const u8) !bool {
     if (k == .counter) {
         const ck = try Counter.key(allocator, name);
@@ -143,12 +110,6 @@ pub fn collectionExists(db: *Db, allocator: Allocator, k: Kind, name: []const u8
     return (try it.next()) != null;
 }
 
-/// Deletes every physical key belonging to `name` under `k`'s namespace -
-/// every field of a hash, the meta record and every element of a list, both
-/// the member row and score-index row of every zset entry. Returns the
-/// count of physical keys removed. This is what makes a collection-level
-/// TTL (collttl.zig) actually mean something: expiring a collection has to
-/// remove ALL of it, not just one key the way ttl.zig's flat-key expiry does.
 pub fn dropCollection(db: *Db, allocator: Allocator, k: Kind, name: []const u8) !usize {
     if (k == .counter) {
         const ck = try Counter.key(allocator, name);
@@ -168,9 +129,6 @@ pub fn dropCollection(db: *Db, allocator: Allocator, k: Kind, name: []const u8) 
         keys.deinit();
     }
     {
-        // Collect first, delete after: db.delete mid-scan would mutate the
-        // memtable structure a live RangeIterator's cursors are threaded
-        // through (same reasoning as ttl.zig's sweepExpired).
         var it = try db.scanPrefix(allocator, p);
         defer it.deinit();
         while (try it.next()) |entry| {
@@ -190,10 +148,6 @@ fn prefixUpperBound(allocator: Allocator, prefix: []const u8) !?[]u8 {
     upper[end - 1] += 1;
     return upper;
 }
-
-// ---------------------------------------------------------------------
-// Counter
-// ---------------------------------------------------------------------
 
 pub const Counter = struct {
     fn key(allocator: Allocator, name: []const u8) ![]u8 {
@@ -222,9 +176,6 @@ pub const Counter = struct {
         try db.put(k, out.items);
     }
 
-    /// Atomically adds `delta` to the counter (creating it at 0 if absent)
-    /// and returns the new value. Uses an OCC transaction so concurrent
-    /// increments never lose an update to a lost read-modify-write race.
     pub fn incrBy(db: *Db, allocator: Allocator, name: []const u8, delta: i64) !i64 {
         const k = try key(allocator, name);
         defer allocator.free(k);
@@ -256,10 +207,6 @@ pub const Counter = struct {
     }
 };
 
-// ---------------------------------------------------------------------
-// Hash
-// ---------------------------------------------------------------------
-
 pub const HashField = struct {
     field: []u8,
     value: []u8,
@@ -290,7 +237,6 @@ pub const Hash = struct {
         return out.toOwnedSlice();
     }
 
-    /// Sets a field, returning true if the field was newly created.
     pub fn set(db: *Db, allocator: Allocator, name: []const u8, field: []const u8, value: []const u8) !bool {
         const k = try fieldKey(allocator, name, field);
         defer allocator.free(k);
@@ -312,7 +258,6 @@ pub const Hash = struct {
         return true;
     }
 
-    /// Deletes a field, returning true if it existed.
     pub fn del(db: *Db, allocator: Allocator, name: []const u8, field: []const u8) !bool {
         const existed = try exists(db, allocator, name, field);
         if (!existed) return false;
@@ -332,8 +277,6 @@ pub const Hash = struct {
         return count;
     }
 
-    /// Returns every field/value pair currently stored under `name`. Caller
-    /// owns the returned slice and each entry's `field`/`value` buffers.
     pub fn getAll(db: *Db, allocator: Allocator, name: []const u8) ![]HashField {
         const p = try prefix(allocator, name);
         defer allocator.free(p);
@@ -356,10 +299,6 @@ pub const Hash = struct {
     }
 };
 
-// ---------------------------------------------------------------------
-// Set
-// ---------------------------------------------------------------------
-
 pub const Set = struct {
     fn prefix(allocator: Allocator, name: []const u8) ![]u8 {
         var out = std.ArrayList(u8).init(allocator);
@@ -380,7 +319,6 @@ pub const Set = struct {
         return out.toOwnedSlice();
     }
 
-    /// Returns true if the member was newly added (false if already present).
     pub fn add(db: *Db, allocator: Allocator, name: []const u8, member: []const u8) !bool {
         if (try isMember(db, allocator, name, member)) return false;
         const k = try memberKey(allocator, name, member);
@@ -389,7 +327,6 @@ pub const Set = struct {
         return true;
     }
 
-    /// Returns true if the member was present and has been removed.
     pub fn remove(db: *Db, allocator: Allocator, name: []const u8, member: []const u8) !bool {
         if (!try isMember(db, allocator, name, member)) return false;
         const k = try memberKey(allocator, name, member);
@@ -415,8 +352,6 @@ pub const Set = struct {
         return members_.len;
     }
 
-    /// Returns every member currently in the set. Caller owns the slice and
-    /// each element.
     pub fn members(db: *Db, allocator: Allocator, name: []const u8) ![][]u8 {
         const p = try prefix(allocator, name);
         defer allocator.free(p);
@@ -442,7 +377,6 @@ pub const Set = struct {
         return false;
     }
 
-    /// Members present in every one of `names`. Caller owns the result.
     pub fn intersect(db: *Db, allocator: Allocator, names: []const []const u8) ![][]u8 {
         var results = std.ArrayList([]u8).init(allocator);
         errdefer {
@@ -466,7 +400,6 @@ pub const Set = struct {
         return results.toOwnedSlice();
     }
 
-    /// Members present in any of `names`, deduplicated. Caller owns the result.
     pub fn unionOf(db: *Db, allocator: Allocator, names: []const []const u8) ![][]u8 {
         var results = std.ArrayList([]u8).init(allocator);
         errdefer {
@@ -494,7 +427,6 @@ pub const Set = struct {
         return results.toOwnedSlice();
     }
 
-    /// Members in `name` that are not in any set of `others`. Caller owns the result.
     pub fn difference(db: *Db, allocator: Allocator, name: []const u8, others: []const []const u8) ![][]u8 {
         var results = std.ArrayList([]u8).init(allocator);
         errdefer {
@@ -518,15 +450,7 @@ pub const Set = struct {
     }
 };
 
-// ---------------------------------------------------------------------
-// List (double-ended queue keyed by a monotonic sequence range)
-// ---------------------------------------------------------------------
-
 const ListMeta = struct {
-    // Elements occupy sequence numbers (head+1 .. tail-1) inclusive; an
-    // empty list has tail == head + 1. Pushing left decrements head and
-    // writes at the new head; pushing right increments tail and writes at
-    // the slot just below the new tail.
     head: i64,
     tail: i64,
 };
@@ -707,10 +631,6 @@ pub const List = struct {
         return @intCast(tail - head - 1);
     }
 
-    /// Redis-style inclusive range with negative indices counting from the
-    /// end (-1 is the last element). Out-of-range indices are clamped;
-    /// start > stop after clamping yields an empty result. Caller owns the
-    /// returned slice and each element.
     pub fn range(db: *Db, allocator: Allocator, name: []const u8, start: i64, stop: i64) ![][]u8 {
         const total: i64 = @intCast(try len(db, allocator, name));
 
@@ -742,11 +662,6 @@ pub const List = struct {
         return results.toOwnedSlice();
     }
 };
-
-// ---------------------------------------------------------------------
-// ZSet (sorted set: member -> score, plus a score-ordered index for
-// range/rank queries)
-// ---------------------------------------------------------------------
 
 pub const ZMember = struct {
     member: []u8,
@@ -791,10 +706,6 @@ pub const ZSet = struct {
         return out.toOwnedSlice();
     }
 
-    /// Score-index key truncated to just the ordered score (no member
-    /// suffix), used as a scan bound. Every real entry is a strict byte
-    /// extension of this (the member part is never empty), so a key equal to
-    /// `scoreBound(s)` never itself denotes a stored member.
     fn scoreBound(allocator: Allocator, name: []const u8, scoreVal: f64) ![]u8 {
         var out = std.ArrayList(u8).init(allocator);
         errdefer out.deinit();
@@ -806,8 +717,6 @@ pub const ZSet = struct {
         return out.toOwnedSlice();
     }
 
-    /// Upserts `member`'s score, atomically re-pointing the score index if
-    /// the member already existed with a different score.
     pub fn add(db: *Db, allocator: Allocator, name: []const u8, member: []const u8, scoreVal: f64) !void {
         const mk = try memberKey(allocator, name, member);
         defer allocator.free(mk);
@@ -893,7 +802,6 @@ pub const ZSet = struct {
         return error.TooManyConflicts;
     }
 
-    /// Returns true if the member was present and has been removed.
     pub fn remove(db: *Db, allocator: Allocator, name: []const u8, member: []const u8) !bool {
         const mk = try memberKey(allocator, name, member);
         defer allocator.free(mk);
@@ -937,7 +845,6 @@ pub const ZSet = struct {
         if (key.len <= p.len or !std.mem.startsWith(u8, key, p)) return error.Malformed;
         const rest = key[p.len..];
 
-        // rest = [tag u8][8-byte ordered score][tag u8][escaped member][0x00 0x00]
         if (rest.len < 9 or rest[0] != @intFromEnum(row.ValueTag.float)) return error.Malformed;
         var bits = std.mem.readInt(u64, rest[1..9], .big);
         if (bits & 0x8000000000000000 != 0) {
@@ -969,9 +876,6 @@ pub const ZSet = struct {
         return .{ .member = try unescaped.toOwnedSlice(), .score = decodedScore };
     }
 
-    /// Ascending-by-score range selected by rank (0-based, inclusive on both
-    /// ends), Redis-style: negative indices count from the end. Caller owns
-    /// the returned slice and each member's buffer.
     pub fn rangeByRank(db: *Db, allocator: Allocator, name: []const u8, start: i64, stop: i64) ![]ZMember {
         const total: i64 = @intCast(try card(db, allocator, name));
 
@@ -1003,13 +907,6 @@ pub const ZSet = struct {
         return results.toOwnedSlice();
     }
 
-    /// All members whose score falls within [min, max], found via a real
-    /// bounded scan over the score index (not a full-collection scan): the
-    /// start bound is `scoreBound(min)` and the end bound is the byte
-    /// immediately after `scoreBound(max)`, which is enough to include every
-    /// entry whose score equals `max` since real entries strictly extend
-    /// their score bound (see `scoreBound`'s doc comment). Caller owns the
-    /// returned slice and each member's buffer.
     pub fn rangeByScore(db: *Db, allocator: Allocator, name: []const u8, min: f64, max: f64) ![]ZMember {
         var results = std.ArrayList(ZMember).init(allocator);
         errdefer {
@@ -1038,7 +935,6 @@ pub const ZSet = struct {
         return results.toOwnedSlice();
     }
 
-    /// 0-based ascending-by-score rank of `member`, or null if absent.
     pub fn rank(db: *Db, allocator: Allocator, name: []const u8, member: []const u8) !?usize {
         const target = try score(db, allocator, name, member) orelse return null;
 
@@ -1057,10 +953,6 @@ pub const ZSet = struct {
         return null;
     }
 };
-
-// ---------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------
 
 fn openTemp(tmp: *std.testing.TmpDir, allocator: Allocator) !Db {
     const dbPath = try tmp.dir.realpathAlloc(allocator, ".");
@@ -1091,9 +983,6 @@ test "counter incrBy rejects a real external conflict" {
     var db = try openTemp(&tmp, allocator);
     defer db.close();
 
-    // incrBy retries internally, so exercise the underlying primitive
-    // directly: begin a txn, let an external writer land in between, then
-    // confirm the stale commit is rejected rather than silently overwriting.
     const k = try Counter.key(allocator, "race");
     defer allocator.free(k);
 
@@ -1279,7 +1168,6 @@ test "zset add score incrBy remove rank" {
     const newScore = try ZSet.incrBy(&db, allocator, "leaderboard", "alice", 100);
     try std.testing.expectEqual(@as(f64, 110), newScore);
 
-    // Ranks ascending by score: carol(5), bob(20), alice(110).
     try std.testing.expectEqual(@as(usize, 0), (try ZSet.rank(&db, allocator, "leaderboard", "carol")).?);
     try std.testing.expectEqual(@as(usize, 2), (try ZSet.rank(&db, allocator, "leaderboard", "alice")).?);
     try std.testing.expect(try ZSet.rank(&db, allocator, "leaderboard", "missing") == null);
@@ -1357,9 +1245,6 @@ test "exists and drop cover counter (single key, no trailing separator)" {
     _ = try Counter.incrBy(&db, allocator, "hits", 0);
     try std.testing.expect(try collectionExists(&db, allocator, .counter, "hits"));
 
-    // A same-prefixed name must not be swept up by the drop of "hits" - the
-    // counter key has no trailing separator, so this is the one case where a
-    // naive prefix scan (instead of an exact key) would over-delete.
     _ = try Counter.incrBy(&db, allocator, "hitsExtra", 7);
 
     try std.testing.expectEqual(@as(usize, 1), try dropCollection(&db, allocator, .counter, "hits"));
@@ -1384,12 +1269,10 @@ test "drop removes every field of a hash and every element+meta of a list" {
     try List.pushRight(&db, allocator, "queue", "a");
     try List.pushRight(&db, allocator, "queue", "b");
     try std.testing.expect(try collectionExists(&db, allocator, .list, "queue"));
-    // 2 elements + 1 meta record.
     try std.testing.expectEqual(@as(usize, 3), try dropCollection(&db, allocator, .list, "queue"));
     try std.testing.expect(!try collectionExists(&db, allocator, .list, "queue"));
     try std.testing.expectEqual(@as(usize, 0), try List.len(&db, allocator, "queue"));
 
-    // Dropping something never created is a harmless no-op.
     try std.testing.expectEqual(@as(usize, 0), try dropCollection(&db, allocator, .set, "never-existed"));
 }
 
@@ -1403,7 +1286,6 @@ test "drop removes both the member row and score-index row of every zset entry" 
     try ZSet.add(&db, allocator, "leaderboard", "alice", 10);
     try ZSet.add(&db, allocator, "leaderboard", "bob", 20);
     try std.testing.expect(try collectionExists(&db, allocator, .zset, "leaderboard"));
-    // 2 members * (1 member row + 1 score-index row) = 4.
     try std.testing.expectEqual(@as(usize, 4), try dropCollection(&db, allocator, .zset, "leaderboard"));
     try std.testing.expect(!try collectionExists(&db, allocator, .zset, "leaderboard"));
     try std.testing.expectEqual(@as(usize, 0), try ZSet.card(&db, allocator, "leaderboard"));

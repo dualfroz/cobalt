@@ -8,50 +8,26 @@ const Row = rowmod.Row;
 const Page = querymod.Page;
 const Predicate = querymod.Predicate;
 
-/// GROUP BY / aggregate engine over already-materialized `Row` slices (the
-/// same currency `join.zig` uses): callers filter and fetch rows through
-/// `Table.select`/`Table.scanAll` first, then feed them here one at a time.
-/// Keeping this decoupled from `query.zig`'s `Table` (rather than adding a
-/// method on it) mirrors the existing split between the storage-facing
-/// `Table` and the purely row-shaped `join.zig`.
 pub const AggKind = enum {
-    /// Counts rows. `field.len == 0` counts every observed row
-    /// (`COUNT(*)`); otherwise only rows where `field` is present
-    /// (`COUNT(field)`).
     count,
     sum,
     avg,
     min,
     max,
-    /// Counts distinct non-none values of `field` (SQL's
-    /// `COUNT(DISTINCT field)`). Always requires a `field` - there is no
-    /// bare `COUNT(DISTINCT *)` form, mirroring `sum`/`avg`/`min`/`max`.
     count_distinct,
 };
 
 pub const AggSpec = struct {
-    /// Ignored for `.count` with `COUNT(*)` semantics (pass `""`).
     field: []const u8,
     kind: AggKind,
 };
 
 pub const AggregateError = error{
-    /// `.sum`/`.avg` observed a field holding a non-numeric `Value`
-    /// (anything but `.int`/`.float`).
     NonNumericField,
-    /// The running integer sum of a `.sum`/`.avg` accumulator would not fit
-    /// in `i64`. Never silently wraps or drops precision by switching to
-    /// float behind the caller's back.
     Overflow,
-    /// `sortGroupsBy` was asked to order by a field that names neither the
-    /// GROUP BY key nor any `specLabel` of the aggregate results - the
-    /// ORDER BY counterpart of `expr.parse`'s "malformed input is an error,
-    /// not a guess" convention `filterHaving` already applies to HAVING.
     UnknownOrderField,
 } || Allocator.Error;
 
-/// One row of `GroupBy.finish()`'s result: `group` is the distinct group-key
-/// value, `values` holds one result `Value` per input `AggSpec`, same order.
 pub const GroupRow = struct {
     group: Value,
     values: []Value,
@@ -68,23 +44,6 @@ fn freeGroupRows(allocator: Allocator, rows: []GroupRow) void {
     allocator.free(rows);
 }
 
-/// Trims a `GroupBy.finish()`/`run()` result to a `query.zig` `Page` window
-/// (0 = unlimited, the same convention `Table.selectPage`/`join.applyPage`
-/// use) - the GROUP BY counterpart of pagination for `table_aggregate`/
-/// `remote-aggregate`. Grouping has already had to materialize every
-/// distinct group to know how many there are, so - exactly like
-/// `join.applyPage` - there is no cheaper way to honor `offset`/`limit`
-/// than windowing the already-complete result; this always runs after
-/// `run()` returns, never instead of it. Not a generic
-/// `join.applyPage(GroupRow, ...)` call because `GroupRow.deinit` takes an
-/// `allocator` argument (it owns heap payloads on `.group`/`.values`)
-/// where `join.applyPage`'s `T.deinit()` takes none.
-///
-/// Takes ownership of `rows`: frees the backing slice, `.deinit()`s every
-/// row that falls outside `[offset, offset+limit)`, and returns a freshly
-/// allocated slice holding only the kept rows in their original (first-seen)
-/// order. Callers own the returned slice and the rows in it exactly as they
-/// would have owned `rows`.
 pub fn applyPageGroups(allocator: Allocator, rows: []GroupRow, page: Page) ![]GroupRow {
     const total = rows.len;
     const start = @min(page.offset, total);
@@ -104,25 +63,11 @@ pub fn applyPageGroups(allocator: Allocator, rows: []GroupRow, page: Page) ![]Gr
     return result;
 }
 
-/// The row field name a `GroupRow`/global aggregate result is exposed under
-/// for HAVING and CLI output purposes: bare `AggKind` name for `field.len ==
-/// 0` (`COUNT(*)`), otherwise `"kind_field"`. Must stay in sync with
-/// `main.zig`'s `printAggLabel`, which prints this same format directly to a
-/// writer without allocating - `filterHaving`/`globalMatchesHaving` need an
-/// owned string instead because it becomes a `Row` field name, so this is a
-/// separate (but format-identical) helper rather than a shared one.
 pub fn specLabel(allocator: Allocator, spec: AggSpec) Allocator.Error![]u8 {
     if (spec.field.len == 0) return allocator.dupe(u8, @tagName(spec.kind));
     return std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(spec.kind), spec.field });
 }
 
-/// Builds the synthetic probe `Row` a HAVING predicate is evaluated against:
-/// one field per `spec` (named via `specLabel`) holding that spec's result
-/// `Value` for this group, plus (when `groupField.len > 0`) one field named
-/// `groupField` holding the group's own key - so a HAVING clause can
-/// reference an aggregate result (`count`, `sum_score`, ...) or the group key
-/// itself through the exact same `expr.zig` grammar `WHERE` already uses.
-/// Does not take ownership of `groupValue`/`values` - `Row.set` dupes.
 fn buildHavingProbe(allocator: Allocator, groupField: []const u8, groupValue: ?Value, specs: []const AggSpec, values: []const Value) !Row {
     var probe = Row.init(allocator);
     errdefer probe.deinit();
@@ -135,25 +80,9 @@ fn buildHavingProbe(allocator: Allocator, groupField: []const u8, groupValue: ?V
     return probe;
 }
 
-/// Filters an already-grouped `run()` result by a HAVING predicate - the
-/// GROUP BY counterpart of `Predicate.evaluate` on plain rows, applied AFTER
-/// aggregation instead of before it (the same WHERE/HAVING split SQL makes).
-/// Takes ownership of `groups` (same convention as `applyPageGroups`): every
-/// group that fails `having` is `.deinit()`-ed here, the rest are moved
-/// (first-seen order preserved) into a freshly allocated result slice.
-/// Callers typically run this between `run()` and `applyPageGroups` - HAVING
-/// narrows which groups exist before LIMIT/OFFSET windows them, exactly like
-/// SQL evaluates `HAVING` before `LIMIT`.
 pub fn filterHaving(allocator: Allocator, groups: []GroupRow, groupField: []const u8, specs: []const AggSpec, having: Predicate) AggregateError![]GroupRow {
     var kept: std.ArrayListUnmanaged(GroupRow) = .{};
     var i: usize = 0;
-    // `groups[0..i)` is always fully accounted for by this point: each one
-    // either moved into `kept` (accepted) or was already `.deinit()`-ed
-    // in-loop (rejected) - touching it again here would double-free. Only
-    // `groups[i..]` (the current index, mid-evaluation when this errdefer
-    // fires, plus everything not yet reached) is still owned by `groups`
-    // and needs disposing, the same "always dispose of the input on every
-    // path" contract `applyPageGroups` upholds for its own OOM case.
     errdefer {
         for (kept.items) |*g| g.deinit(allocator);
         kept.deinit(allocator);
@@ -174,36 +103,17 @@ pub fn filterHaving(allocator: Allocator, groups: []GroupRow, groupField: []cons
     return kept.toOwnedSlice(allocator);
 }
 
-/// HAVING for the ungrouped (`runGlobal`, CLI's `*` sentinel) aggregate path:
-/// evaluates `having` against the same kind of synthetic probe row
-/// `filterHaving` builds, minus any group-key field (there is no group).
-/// Reports only whether the single global result should be kept - unlike
-/// `filterHaving` it never frees `values`, since `runGlobal` always produces
-/// exactly one result and the caller (which already owns it via
-/// `freeGlobalResult`) decides whether to print it or not.
 pub fn globalMatchesHaving(allocator: Allocator, specs: []const AggSpec, values: []const Value, having: Predicate) AggregateError!bool {
     var probe = try buildHavingProbe(allocator, "", null, specs, values);
     defer probe.deinit();
     return having.evaluate(&probe);
 }
 
-/// Which part of a `GroupRow` a single `OrderBy` column reads from -
-/// resolved once per column by `resolveSortKeys` rather than re-matching
-/// `ob.field` against `groupField`/every `specLabel` on every comparison
-/// `sortGroupsBy`'s sort makes.
 const SortKey = union(enum) {
     group,
     value: usize,
 };
 
-/// Resolves each `order[i].field` to either the group key itself
-/// (`groupField`, e.g. `city`) or the index of the `specs` entry whose
-/// `specLabel` matches (e.g. `sum_score`) - the same two-namespace lookup
-/// `buildHavingProbe` exposes to a HAVING predicate, done once up front
-/// instead of building a probe `Row` per comparison. An `order[i].field`
-/// matching neither is `error.UnknownOrderField` rather than silently
-/// sorting as if every row tied on that column. Caller owns the returned
-/// slice.
 fn resolveSortKeys(allocator: Allocator, groupField: []const u8, specs: []const AggSpec, order: []const querymod.OrderBy) AggregateError![]SortKey {
     var keys = try allocator.alloc(SortKey, order.len);
     errdefer allocator.free(keys);
@@ -226,21 +136,6 @@ fn resolveSortKeys(allocator: Allocator, groupField: []const u8, specs: []const 
     return keys;
 }
 
-/// Stable in-place sort of `groups` by `order` - the GROUP BY counterpart of
-/// `query.zig`'s `sortRowsBy`, applied to already-aggregated `GroupRow`s
-/// instead of plain `Row`s so an ORDER BY column can name either the group
-/// key (`city`) or an aggregate result (`sum_score`), the same two things a
-/// HAVING predicate can reference. Columns compare left to right exactly
-/// like `sortRowsBy`/SQL's `ORDER BY a, b`: the first entry decides unless
-/// it ties, in which case the next breaks it. `order.len == 0` is a no-op
-/// (the common case - most `table aggregate` calls have no ORDER BY).
-/// Does not take ownership of `groups` - unlike `filterHaving`/
-/// `applyPageGroups`, this never frees or reallocates any group, only
-/// reorders the slice in place, so callers keep using their own `defer
-/// freeGroupRows(...)` around the call exactly as if it were never made.
-/// Typically run after `filterHaving` and before `applyPageGroups` - ORDER
-/// BY sees the HAVING-narrowed set and decides what LIMIT/OFFSET's window
-/// actually keeps, the same clause order SQL evaluates.
 pub fn sortGroupsBy(allocator: Allocator, groups: []GroupRow, groupField: []const u8, specs: []const AggSpec, order: []const querymod.OrderBy) AggregateError!void {
     if (order.len == 0) return;
     const keys = try resolveSortKeys(allocator, groupField, specs, order);
@@ -279,9 +174,6 @@ const AccState = struct {
     allInt: bool = true,
     minv: ?Value = null,
     maxv: ?Value = null,
-    /// `.count_distinct` only: encoded-`Value` bytes seen so far, one entry
-    /// per distinct value (owns each key, same encode-as-hashmap-key trick
-    /// `GroupBy.observe` uses for the group key itself).
     distinct: std.StringHashMapUnmanaged(void) = .{},
 
     fn numericFieldValue(self: *const AccState, row: *const Row) ?Value {
@@ -309,9 +201,6 @@ const AccState = struct {
                     },
                     .float => |f| {
                         if (self.allInt) {
-                            // First float observed after an int-only run:
-                            // migrate the exact integer sum so far into the
-                            // float accumulator once, then continue in float.
                             self.sumFloat = @floatFromInt(self.sumInt);
                             self.allInt = false;
                         }
@@ -344,15 +233,6 @@ const AccState = struct {
         }
     }
 
-    /// Produces the final result `Value`, transferring ownership of any
-    /// heap payload (`.min`/`.max` on text/bytes fields) out of this
-    /// accumulator - a subsequent `deinit` sees `null` and frees nothing,
-    /// so the same payload is never freed twice. `.count_distinct` instead
-    /// frees its whole tracking set right here (the result is a plain
-    /// `.int`, nothing to hand ownership of), which is why this needs
-    /// `allocator` - both call sites (`GroupBy.finish`, `runGlobal`) skip a
-    /// separate `deinit` call after `take()` entirely, so this is the only
-    /// place that set is ever freed on the success path.
     fn take(self: *AccState, allocator: Allocator) Value {
         return switch (self.kind) {
             .count => .{ .int = @intCast(self.n) },
@@ -403,11 +283,6 @@ const Bundle = struct {
     }
 };
 
-/// Streaming GROUP BY accumulator: call `observe` once per candidate row
-/// (already filtered by whatever `Predicate` the caller wants applied), then
-/// `finish` to materialize one `GroupRow` per distinct group-key value seen,
-/// in first-seen order (stable, not sorted - callers that want sorted
-/// output can sort the returned slice by `.group` using `row.compare`).
 pub const GroupBy = struct {
     allocator: Allocator,
     groupField: []const u8,
@@ -419,10 +294,6 @@ pub const GroupBy = struct {
         return .{ .allocator = allocator, .groupField = groupField, .specs = specs };
     }
 
-    /// Safe to call after `finish()` (which empties the internal maps) or on
-    /// a `GroupBy` that was never `finish()`-ed (e.g. `observe` returned an
-    /// error partway through a batch) - either way, exactly what is still
-    /// owned gets freed once.
     pub fn deinit(self: *GroupBy) void {
         var it = self.map.iterator();
         while (it.next()) |entry| {
@@ -436,9 +307,6 @@ pub const GroupBy = struct {
         self.order = .{};
     }
 
-    /// Rows missing `groupField` entirely are excluded from every group
-    /// (no "null group" bucket) - the same omission `Table.createIndex`'s
-    /// backfill applies to rows missing an indexed field.
     pub fn observe(self: *GroupBy, row: *const Row) AggregateError!void {
         const groupVal = row.get(self.groupField) orelse return;
         const key = try rowmod.encodeValue(self.allocator, groupVal);
@@ -449,12 +317,6 @@ pub const GroupBy = struct {
             return;
         }
 
-        // Scoped to this block so the errdefers below only guard the
-        // allocation itself: once `bundle` is handed to `self.map.put`
-        // just after, ownership has moved there, and a later failure (the
-        // final observe loop) must NOT free it out from under the map -
-        // an errdefer spanning the whole function would do exactly that
-        // and leave a dangling pointer in `self.map`.
         const bundle = blk: {
             const b = try self.allocator.create(Bundle);
             errdefer self.allocator.destroy(b);
@@ -471,8 +333,6 @@ pub const GroupBy = struct {
         for (bundle.accs) |*a| try a.observe(self.allocator, row);
     }
 
-    /// Consumes the accumulated groups into an owned `[]GroupRow` and
-    /// leaves `self` empty (a subsequent `deinit()` is then a no-op).
     pub fn finish(self: *GroupBy) AggregateError![]GroupRow {
         var results = try self.allocator.alloc(GroupRow, self.order.items.len);
         var filled: usize = 0;
@@ -502,8 +362,6 @@ pub const GroupBy = struct {
     }
 };
 
-/// Convenience wrapper: groups `rows` by `groupField`, applies `specs`, and
-/// returns the finished result in one call.
 pub fn run(allocator: Allocator, rows: []const Row, groupField: []const u8, specs: []const AggSpec) AggregateError![]GroupRow {
     var gb = GroupBy.init(allocator, groupField, specs);
     errdefer gb.deinit();
@@ -511,11 +369,6 @@ pub fn run(allocator: Allocator, rows: []const Row, groupField: []const u8, spec
     return gb.finish();
 }
 
-/// A single aggregate row over all of `rows` with no grouping (SQL's
-/// `SELECT COUNT(*), SUM(x) FROM t` with no `GROUP BY`) - always produces
-/// exactly one result, even for zero input rows (every accumulator still
-/// reports its identity result: `count` 0, `sum` 0, `avg`/`min`/`max`
-/// `.none`).
 pub fn runGlobal(allocator: Allocator, rows: []const Row, specs: []const AggSpec) AggregateError![]Value {
     var accs = try allocator.alloc(AccState, specs.len);
     defer allocator.free(accs);
@@ -603,8 +456,6 @@ test "sum and avg skip rows missing the field, count star still counts them" {
         .{ .name = "team", .value = .{ .text = "a" } },
         .{ .name = "points", .value = .{ .int = 7 } },
     }));
-    // No "points" field on this row - must not participate in sum/avg, but
-    // must still be counted by COUNT(*).
     try rows.append(try makeRow(allocator, &.{
         .{ .name = "team", .value = .{ .text = "a" } },
     }));
@@ -619,10 +470,10 @@ test "sum and avg skip rows missing the field, count star still counts them" {
     defer freeGroupRows(allocator, groups);
 
     try std.testing.expectEqual(@as(usize, 1), groups.len);
-    try std.testing.expectEqual(@as(i64, 2), groups[0].values[0].int); // COUNT(*)
-    try std.testing.expectEqual(@as(i64, 1), groups[0].values[1].int); // COUNT(points)
-    try std.testing.expectEqual(@as(i64, 7), groups[0].values[2].int); // SUM(points)
-    try std.testing.expectApproxEqAbs(@as(f64, 7), groups[0].values[3].float, 1e-9); // AVG(points)
+    try std.testing.expectEqual(@as(i64, 2), groups[0].values[0].int);
+    try std.testing.expectEqual(@as(i64, 1), groups[0].values[1].int);
+    try std.testing.expectEqual(@as(i64, 7), groups[0].values[2].int);
+    try std.testing.expectApproxEqAbs(@as(f64, 7), groups[0].values[3].float, 1e-9);
 }
 
 test "avg on a group where the field is always missing reports none" {
@@ -662,7 +513,6 @@ test "sum stays exact integer until a float value forces it to switch" {
     {
         const groups = try run(allocator, rows.items, "g", &specs);
         defer freeGroupRows(allocator, groups);
-        // All-int input: exact int result, not a float with rounding risk.
         try std.testing.expectEqual(rowmod.ValueTag.int, @as(rowmod.ValueTag, groups[0].values[0]));
         try std.testing.expectEqual(@as(i64, 7), groups[0].values[0].int);
     }
@@ -756,7 +606,7 @@ test "count_distinct counts unique field values once per group, repeats collapse
     const data = [_]struct { team: []const u8, tag: []const u8 }{
         .{ .team = "a", .tag = "red" },
         .{ .team = "a", .tag = "blue" },
-        .{ .team = "a", .tag = "red" }, // repeat, must not double count
+        .{ .team = "a", .tag = "red" },
         .{ .team = "b", .tag = "green" },
     };
     for (data) |d| {
@@ -787,7 +637,6 @@ test "count_distinct ignores rows missing the field and never counts none as a v
         .{ .name = "team", .value = .{ .text = "a" } },
         .{ .name = "tag", .value = .{ .text = "red" } },
     }));
-    // No "tag" field on this row - must not create a phantom distinct value.
     try rows.append(try makeRow(allocator, &.{
         .{ .name = "team", .value = .{ .text = "a" } },
     }));
@@ -848,7 +697,7 @@ test "rows missing the group field are excluded from every group" {
         rows.deinit();
     }
     try rows.append(try makeRow(allocator, &.{.{ .name = "team", .value = .{ .text = "a" } }}));
-    try rows.append(try makeRow(allocator, &.{})); // no "team" field at all
+    try rows.append(try makeRow(allocator, &.{}));
 
     const specs = [_]AggSpec{.{ .field = "", .kind = .count }};
     const groups = try run(allocator, rows.items, "team", &specs);
@@ -1019,15 +868,6 @@ test "applyPageGroups propagates OutOfMemory from its own result allocation with
 
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, applyPageGroups(failing.allocator(), groups, .{ .offset = 1, .limit = 2 }));
-    // No explicit assertion beyond this: `testing.allocator`'s leak detector
-    // at process exit is the real check - every one of the 4 `GroupRow`s (2
-    // kept by the window, 2 trimmed outside it) must have been
-    // `.deinit(allocator)`-ed on the error path, and the `rows` backing
-    // slice itself freed, or this test fails on leak. Every `GroupRow` here
-    // was built by `run()` using the real `testing.allocator`, so the error
-    // path frees through that same allocator regardless of which allocator
-    // `applyPageGroups` was asked to allocate its OWN result slice with -
-    // the exact isolation `join.zig`'s analogous OOM test documents.
 }
 
 fn threeCityGroups(allocator: Allocator) ![]GroupRow {
@@ -1060,7 +900,6 @@ fn threeCityGroups(allocator: Allocator) ![]GroupRow {
 test "filterHaving keeps only groups whose aggregate result matches the predicate" {
     const allocator = std.testing.allocator;
     const groups = try threeCityGroups(allocator);
-    // warsaw: count=2 sum=40, krakow: count=1 sum=5, gdansk: count=3 sum=300
     const specs = [_]AggSpec{
         .{ .field = "", .kind = .count },
         .{ .field = "score", .kind = .sum },
@@ -1126,9 +965,6 @@ test "filterHaving composes with applyPageGroups: HAVING narrows before LIMIT/OF
         .{ .field = "", .kind = .count },
         .{ .field = "score", .kind = .sum },
     };
-    // Only warsaw and gdansk survive HAVING; a limit of 1 then keeps just
-    // the first of those two (warsaw, first-seen), not the first of all
-    // three original groups.
     const having = Predicate{ .gt = .{ .field = "count", .value = .{ .int = 1 } } };
     const filtered = try filterHaving(allocator, groups, "city", &specs, having);
     const paged = try applyPageGroups(allocator, filtered, .{ .limit = 1 });
@@ -1149,12 +985,6 @@ test "filterHaving propagates OutOfMemory without leaking any group, kept or rej
 
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, filterHaving(failing.allocator(), groups, "city", &specs, having));
-    // Leak detector on `std.testing.allocator` at process exit is the real
-    // check here (same pattern as `applyPageGroups`'s analogous OOM test):
-    // every one of the 3 groups `threeCityGroups` built with the real
-    // allocator must still get freed on this early failure, even though
-    // `filterHaving` itself was asked to allocate its OWN bookkeeping
-    // (`kept`) through the failing allocator.
 }
 
 test "globalMatchesHaving reports true or false without freeing the caller's values" {
@@ -1223,8 +1053,6 @@ test "sortGroupsBy orders by an aggregate result label, not just the group key" 
         .{ .field = "score", .kind = .sum },
     };
 
-    // warsaw sum=40, krakow sum=5, gdansk sum=300 - ascending by sum_score
-    // is a completely different order than ascending by city.
     const order = [_]querymod.OrderBy{.{ .field = "sum_score" }};
     try sortGroupsBy(allocator, groups, "city", &specs, &order);
 
@@ -1240,11 +1068,6 @@ test "sortGroupsBy breaks ties left to right across multiple order columns" {
         for (rows.items) |*r| r.deinit();
         rows.deinit();
     }
-    // Every group has count == 1 (a full tie on the first order column), so
-    // only the second column (the group key itself) can decide the order -
-    // built out of first-seen order d,b,a,c specifically so an
-    // alphabetical result proves the second column actually ran, rather
-    // than the sort coincidentally matching input order.
     const groupNames = [_][]const u8{ "d", "b", "a", "c" };
     for (groupNames) |g| {
         try rows.append(try makeRow(allocator, &.{.{ .name = "g", .value = .{ .text = g } }}));
@@ -1299,9 +1122,6 @@ test "sortGroupsBy composes with filterHaving and applyPageGroups: ORDER BY reor
         .{ .field = "", .kind = .count },
         .{ .field = "score", .kind = .sum },
     };
-    // HAVING keeps only warsaw (count=2, sum=40) and gdansk (count=3,
-    // sum=300); descending sum_score then puts gdansk first even though
-    // warsaw was first-seen - a limit of 1 must keep gdansk, not warsaw.
     const having = Predicate{ .gt = .{ .field = "count", .value = .{ .int = 1 } } };
     const filtered = try filterHaving(allocator, groups, "city", &specs, having);
     const order = [_]querymod.OrderBy{.{ .field = "sum_score", .descending = true }};
@@ -1326,12 +1146,6 @@ test "sortGroupsBy propagates OutOfMemory without leaking or freeing the caller'
     const order = [_]querymod.OrderBy{.{ .field = "city" }};
     try std.testing.expectError(error.OutOfMemory, sortGroupsBy(failing.allocator(), groups, "city", &specs, &order));
 
-    // `sortGroupsBy` never took ownership of `groups` (unlike
-    // `filterHaving`), so the outer `defer freeGroupRows(allocator, ...)`
-    // above must still see every group intact and still first-seen order
-    // (untouched, not partially sorted) - both the leak detector on
-    // `std.testing.allocator` and this ordering check are the real
-    // assertions here.
     try std.testing.expectEqualStrings("warsaw", groups[0].group.text);
     try std.testing.expectEqualStrings("krakow", groups[1].group.text);
     try std.testing.expectEqualStrings("gdansk", groups[2].group.text);

@@ -1,11 +1,6 @@
 const std = @import("std");
 const stats_mod = @import("stats.zig");
 
-// Metrics primitives (counter/gauge/histogram), two independent rate-limiter
-// algorithms (token bucket, sliding window counter), and a text-exposition
-// registry. Fully additive module: does not touch Db/txn/storage internals,
-// only depends on stats.zig's public Stats type for the export helper.
-
 pub const MetricCounter = struct {
     value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
@@ -50,10 +45,6 @@ pub const Gauge = struct {
 
 pub const HistogramError = error{EmptyBounds};
 
-/// Fixed-bucket histogram with Prometheus-style cumulative-bucket quantile
-/// estimation. `bounds` must be strictly increasing and is borrowed (caller
-/// keeps it alive for the histogram's lifetime); values greater than the
-/// last bound land in an implicit +Inf bucket.
 pub const Histogram = struct {
     bounds: []const f64,
     counts: []u64,
@@ -102,8 +93,6 @@ pub const Histogram = struct {
         return self.sum / @as(f64, @floatFromInt(self.total));
     }
 
-    /// Linear-interpolation quantile estimate over cumulative bucket counts,
-    /// same algorithm Prometheus uses for `histogram_quantile`. q in [0, 1].
     pub fn quantile(self: *Histogram, q: f64) f64 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -160,9 +149,6 @@ pub fn exponentialBuckets(allocator: std.mem.Allocator, start: f64, factor: f64,
     return out;
 }
 
-/// Classic token-bucket rate limiter. Time is passed in explicitly as
-/// nanoseconds so the algorithm is deterministic and testable; `tryAcquireNow`
-/// wraps it with the wall clock for real use.
 pub const TokenBucket = struct {
     capacity: f64,
     refillPerSecond: f64,
@@ -189,8 +175,6 @@ pub const TokenBucket = struct {
         self.lastRefillNanos = nowNanos;
     }
 
-    /// Attempts to consume `n` tokens at time `nowNanos`. All-or-nothing:
-    /// never partially consumes on failure.
     pub fn tryAcquireAt(self: *TokenBucket, n: f64, nowNanos: u64) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -214,11 +198,6 @@ pub const TokenBucket = struct {
     }
 };
 
-/// Sliding-window-counter rate limiter (the "Cloudflare" approximation):
-/// tracks a count for the current fixed window and the previous one, and
-/// weights the previous window's count by how much of it still overlaps the
-/// trailing `windowNanos` interval. O(1) memory unlike a sliding log, more
-/// accurate at window boundaries than a plain fixed window.
 pub const SlidingWindowLimiter = struct {
     limit: u64,
     windowNanos: u64,
@@ -280,8 +259,6 @@ const MetricRef = union(MetricKind) {
     histogram: *Histogram,
 };
 
-/// Named-metric registry with a Prometheus-style text exporter. Stores only
-/// borrowed pointers (owned name copies) - callers keep the metrics alive.
 pub const Registry = struct {
     allocator: std.mem.Allocator,
     entries: std.StringHashMapUnmanaged(MetricRef) = .{},
@@ -323,8 +300,6 @@ pub const Registry = struct {
         return self.entries.count();
     }
 
-    /// Writes every registered metric in Prometheus exposition format.
-    /// Output is sorted by name so it is deterministic (and diffable).
     pub fn exportText(self: *Registry, allocator: std.mem.Allocator, writer: anytype) !void {
         var names = try allocator.alloc([]const u8, self.entries.count());
         defer allocator.free(names);
@@ -358,9 +333,6 @@ fn lessThanStr(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
 
-/// Renders a Db Stats snapshot in the same Prometheus text format used by
-/// Registry.exportText, so `stats` output and ad-hoc registry metrics can be
-/// scraped through one shared shape.
 pub fn formatDbStats(writer: anytype, prefix: []const u8, s: stats_mod.Stats) !void {
     try writer.print("{s}_memtable_entries {d}\n", .{ prefix, s.memtableEntries });
     try writer.print("{s}_memtable_bytes {d}\n", .{ prefix, s.memtableBytes });
@@ -421,20 +393,14 @@ test "histogram quantile interpolates within a bucket" {
     var h = try Histogram.init(std.testing.allocator, &bounds);
     defer h.deinit();
 
-    // 4 values land in the (0,100] bucket, evenly spread by construction;
-    // linear interpolation only sees prev/cur cumulative counts, so the
-    // median of an all-in-one-bucket histogram is the bucket's own bound.
     var i: usize = 0;
     while (i < 4) : (i += 1) h.observe(50);
     try std.testing.expectApproxEqAbs(@as(f64, 100), h.quantile(0.5), 1e-9);
 
-    // Now spread evenly across both finite buckets: p50 should land exactly
-    // on the boundary between them.
     h.observe(150);
     h.observe(150);
     h.observe(150);
     h.observe(150);
-    // counts: bucket0=4 (<=100), bucket1=4 (<=200) => cumulative [4,8], total 8
     const q50 = h.quantile(0.5);
     try std.testing.expectApproxEqAbs(@as(f64, 100), q50, 1e-9);
 }
@@ -459,15 +425,13 @@ test "linearBuckets and exponentialBuckets produce expected boundaries" {
 }
 
 test "token bucket refills over time and denies when empty" {
-    var b = TokenBucket.init(10, 5, 0); // 10 capacity, 5 tokens/sec
+    var b = TokenBucket.init(10, 5, 0);
     try std.testing.expect(b.tryAcquireAt(10, 0));
     try std.testing.expect(!b.tryAcquireAt(1, 0));
 
-    // half a second later: +2.5 tokens
     try std.testing.expect(!b.tryAcquireAt(3, std.time.ns_per_s / 2));
     try std.testing.expectApproxEqAbs(@as(f64, 2.5), b.availableAt(std.time.ns_per_s / 2), 1e-9);
 
-    // two full seconds later than that: refill caps at capacity
     const later = std.time.ns_per_s / 2 + 2 * std.time.ns_per_s;
     try std.testing.expect(b.tryAcquireAt(10, later));
     try std.testing.expect(!b.tryAcquireAt(1, later));
@@ -485,11 +449,8 @@ test "sliding window limiter smooths across a window boundary" {
 
     var i: usize = 0;
     while (i < 10) : (i += 1) try std.testing.expect(lim.allowAt(0));
-    try std.testing.expect(!lim.allowAt(0)); // exhausted current window
+    try std.testing.expect(!lim.allowAt(0));
 
-    // Halfway into the next window: previous window's 10 requests are
-    // weighted at 50% overlap (5), so only 5 more should be allowed before
-    // the weighted total reaches the limit of 10.
     const halfwayNextWindow = windowNs + windowNs / 2;
     var allowed: usize = 0;
     i = 0;
@@ -507,7 +468,6 @@ test "sliding window limiter resets fully after a gap of more than one window" {
     try std.testing.expect(lim.allowAt(0));
     try std.testing.expect(!lim.allowAt(0));
 
-    // Jump 10 windows ahead: previous window count must not leak in.
     const farFuture = 10 * windowNs;
     try std.testing.expect(lim.allowAt(farFuture));
     try std.testing.expect(lim.allowAt(farFuture));
@@ -538,7 +498,6 @@ test "registry exports counters gauges and histograms as sorted prometheus text"
     try reg.exportText(std.testing.allocator, buf.writer());
 
     const text = buf.items;
-    // sorted alphabetically: latency < requests_total < temperature
     try std.testing.expect(std.mem.indexOf(u8, text, "latency_bucket{le=\"5\"} 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "latency_bucket{le=\"10\"} 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "latency_bucket{le=\"+Inf\"} 2\n") != null);
@@ -593,8 +552,6 @@ test "formatDbStats renders levels up to the deepest populated one" {
     try std.testing.expect(std.mem.indexOf(u8, text, "cobalt_cache_hit_rate 0.900000\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "cobalt_level_tables{level=\"0\"} 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "cobalt_level_tables{level=\"2\"} 4\n") != null);
-    // level 1 is empty but must still appear since deepestLevel is 2
     try std.testing.expect(std.mem.indexOf(u8, text, "cobalt_level_tables{level=\"1\"} 0\n") != null);
-    // level 3+ must not appear at all
     try std.testing.expect(std.mem.indexOf(u8, text, "level=\"3\"") == null);
 }

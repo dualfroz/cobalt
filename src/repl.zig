@@ -12,6 +12,7 @@ const exprmod = @import("expr.zig");
 const joinmod = @import("join.zig");
 const aggregatemod = @import("aggregate.zig");
 const windowmod = @import("window.zig");
+const keyspace = @import("keyspace.zig");
 
 const Allocator = std.mem.Allocator;
 const Db = dbmod.Db;
@@ -23,9 +24,6 @@ const Field = rowmod.Field;
 const Row = rowmod.Row;
 const CollKind = collectionsmod.Kind;
 
-/// Errors `Repl.dispatch` can raise on top of whatever the underlying `Db`/
-/// `Transaction`/`Table` call it wraps returns (those propagate as-is, e.g.
-/// `error.Conflict` from a failed commit).
 pub const ReplError = error{
     UnknownCommand,
     WrongArgCount,
@@ -36,35 +34,13 @@ pub const ReplError = error{
     UnknownCollectionOp,
     InvalidArgument,
     NoSuchKey,
+    ReservedKey,
 };
 
-/// Interactive session bound to one already-open `*Db`. The one-shot CLI in
-/// main.zig opens a fresh `Db` per process per command, and its `txn
-/// <script-file>` command runs a whole transaction non-interactively from a
-/// static file. `Repl` instead keeps the store open across many commands and
-/// lets `begin`/`commit`/`rollback` bracket an interactive `Transaction`:
-/// a `get` between `begin` and `commit` can steer what the *next* `put`
-/// does (e.g. "read balance, then decide how much to add"), which a script
-/// file evaluated top to bottom cannot express.
-///
-/// `table put/get/del` follow the active transaction automatically: with no
-/// transaction open they go straight through `query.Table` (each call is
-/// independently durable the moment it returns, exactly like `table put` on
-/// the plain CLI); with a transaction open they route through a `TableTxn`
-/// bound to it instead, so multiple `table put` calls across multiple
-/// tables in the same `begin`/`commit` bracket commit atomically as one
-/// `WriteBatch`, or none of them do on `error.Conflict` - the interactive
-/// equivalent of `txn <script-file>`.
-///
-/// `scan` always reads the live, already-committed `Db` state regardless of
-/// any open transaction: `Transaction` has no scan/range primitive (only
-/// `get`, which resolves the transaction's own staged writes first), so a
-/// staged-but-uncommitted put is invisible to `scan` until `commit` lands it
-/// for real. This is a deliberate, documented limitation, not an oversight.
-/// `table select`/`table join` are the same story one level up: `TableTxn`
-/// only ever brackets single-row put/get/delete, so both always run against
-/// `query.Table.open(self.db, ...)` directly, never through the active
-/// transaction, exactly like `scan`.
+fn requireUserKey(key: []const u8) ReplError!void {
+    keyspace.checkUserKey(key) catch return ReplError.ReservedKey;
+}
+
 pub const Repl = struct {
     db: *Db,
     allocator: Allocator,
@@ -101,10 +77,6 @@ pub const Repl = struct {
         }
     }
 
-    /// Runs one line of input, writing command output or `error: <name>` to
-    /// `writer`. Returns `false` on `exit`/`quit` (caller should stop
-    /// reading), `true` otherwise - including after a reported error, so one
-    /// bad line never kills the session.
     pub fn runLine(self: *Repl, line: []const u8, writer: anytype) !bool {
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         if (trimmed.len == 0 or trimmed[0] == '#') return true;
@@ -124,9 +96,6 @@ pub const Repl = struct {
         return true;
     }
 
-    /// Reads lines from `reader` until EOF, running each through `runLine`.
-    /// Writes a `cobalt>`/`cobalt(txn)>` prompt before each read when
-    /// `prompt` is set (interactive stdin use); script files pass `false`.
     pub fn runFromReader(self: *Repl, reader: anytype, writer: anytype, prompt: bool) !void {
         var buf: [8192]u8 = undefined;
         while (true) {
@@ -183,20 +152,25 @@ pub const Repl = struct {
 
     fn cmdPut(self: *Repl, args: []const []const u8, writer: anytype) !void {
         if (args.len != 2) return ReplError.WrongArgCount;
+        try requireUserKey(args[0]);
         if (self.txn) |*t| {
-            try t.put(args[0], args[1]);
+            try ttlmod.stagePersistentPutInTxn(t, self.allocator, args[0], args[1]);
         } else {
-            try self.db.put(args[0], args[1]);
+            try ttlmod.putPersistent(self.db, self.allocator, args[0], args[1]);
         }
         try writer.writeAll("OK\n");
     }
 
     fn cmdGet(self: *Repl, args: []const []const u8, writer: anytype) !void {
         if (args.len != 1) return ReplError.WrongArgCount;
-        const value = if (self.txn) |*t|
-            try t.get(self.allocator, args[0])
-        else
-            try self.db.get(self.allocator, args[0]);
+        try requireUserKey(args[0]);
+        const now = std.time.nanoTimestamp();
+        const value = if (self.txn) |*t| txnValue: {
+            const staged = try t.get(self.allocator, args[0]) orelse break :txnValue null;
+            if (!try ttlmod.isExpiredInTxn(t, self.allocator, args[0], now)) break :txnValue staged;
+            self.allocator.free(staged);
+            break :txnValue null;
+        } else try ttlmod.getLive(self.db, self.allocator, args[0], now);
         defer if (value) |v| self.allocator.free(v);
         if (value) |v| {
             try writer.print("{s}\n", .{v});
@@ -207,10 +181,11 @@ pub const Repl = struct {
 
     fn cmdDel(self: *Repl, args: []const []const u8, writer: anytype) !void {
         if (args.len != 1) return ReplError.WrongArgCount;
+        try requireUserKey(args[0]);
         if (self.txn) |*t| {
-            try t.delete(args[0]);
+            try ttlmod.stageDeleteInTxn(t, self.allocator, args[0]);
         } else {
-            try self.db.delete(args[0]);
+            try ttlmod.deleteKey(self.db, self.allocator, args[0]);
         }
         try writer.writeAll("OK\n");
     }
@@ -218,41 +193,46 @@ pub const Repl = struct {
     fn cmdScan(self: *Repl, args: []const []const u8, writer: anytype) !void {
         if (args.len > 1) return ReplError.WrongArgCount;
         const prefix = if (args.len == 1) args[0] else "";
-        var iter = try self.db.scanPrefix(self.allocator, prefix);
+        var iter = try keyspace.scanUserPrefix(self.db, self.allocator, prefix, std.time.nanoTimestamp());
         defer iter.deinit();
         while (try iter.next()) |entry| {
             try writer.print("{s}\t{s}\n", .{ entry.key, entry.value });
         }
     }
 
-    /// `expire`/`persist`/`ttl`/`expire-sweep` mirror the one-shot CLI's
-    /// same-named commands (main.zig) over `ttl.zig`'s flat-key TTL layer.
-    /// Like `scan` above, these always act on the live, already-committed
-    /// `Db` regardless of any open transaction: a TTL marker lives under its
-    /// own keyspace tag, set/cleared directly against `self.db`, never
-    /// staged through `Transaction` - there is no OCC-safe way to make
-    /// "expire this key in N seconds" conditional on a commit that hasn't
-    /// happened yet, so (deliberately, like `coll`'s ops) this bypasses the
-    /// active transaction entirely rather than pretending to participate in
-    /// it.
     fn cmdExpire(self: *Repl, args: []const []const u8, writer: anytype) !void {
         if (args.len != 2) return ReplError.WrongArgCount;
+        try requireUserKey(args[0]);
         const seconds = std.fmt.parseInt(u64, args[1], 10) catch return ReplError.InvalidArgument;
-        const existing = try self.db.get(self.allocator, args[0]) orelse return ReplError.NoSuchKey;
-        self.allocator.free(existing);
-        try ttlmod.setExpireSeconds(self.db, self.allocator, args[0], std.time.nanoTimestamp(), seconds);
+        const now = std.time.nanoTimestamp();
+        const live = if (self.txn) |*t|
+            try ttlmod.expireLiveInTxn(t, self.allocator, args[0], now, seconds)
+        else
+            try ttlmod.expireLive(self.db, self.allocator, args[0], now, seconds);
+        if (!live) return ReplError.NoSuchKey;
         try writer.writeAll("OK\n");
     }
 
     fn cmdPersist(self: *Repl, args: []const []const u8, writer: anytype) !void {
         if (args.len != 1) return ReplError.WrongArgCount;
-        try ttlmod.clearExpire(self.db, self.allocator, args[0]);
+        try requireUserKey(args[0]);
+        if (self.txn) |*t| {
+            try ttlmod.clearExpireInTxn(t, self.allocator, args[0]);
+        } else {
+            try ttlmod.clearExpire(self.db, self.allocator, args[0]);
+        }
         try writer.writeAll("OK\n");
     }
 
     fn cmdTtl(self: *Repl, args: []const []const u8, writer: anytype) !void {
         if (args.len != 1) return ReplError.WrongArgCount;
-        switch (try ttlmod.remaining(self.db, self.allocator, args[0], std.time.nanoTimestamp())) {
+        try requireUserKey(args[0]);
+        const now = std.time.nanoTimestamp();
+        const left = if (self.txn) |*t|
+            try ttlmod.remainingInTxn(t, self.allocator, args[0], now)
+        else
+            try ttlmod.remaining(self.db, self.allocator, args[0], now);
+        switch (left) {
             .noKey => try writer.writeAll("-2\n"),
             .noExpiry => try writer.writeAll("-1\n"),
             .seconds => |s| try writer.print("{d}\n", .{s}),
@@ -322,11 +302,6 @@ pub const Repl = struct {
         }
     }
 
-    /// `table select <table> [expr...] [--limit N] [--offset N] [--order-by
-    /// field[:desc][,field[:desc]...]]`: interactive counterpart of the
-    /// one-shot CLI's `table select` (main.zig's `runTable`) over
-    /// query.zig's `Table.selectPageOrdered`, same expr grammar (expr.zig)
-    /// and `--limit`/`--offset`/`--order-by` conventions.
     fn cmdTableSelect(self: *Repl, args: []const []const u8, writer: anytype) !void {
         if (args.len < 1) return ReplError.WrongArgCount;
         var table = try Table.open(self.db, self.allocator, args[0]);
@@ -351,11 +326,6 @@ pub const Repl = struct {
         for (rows) |r| try printRow(writer, r);
     }
 
-    /// `table explain <table> [expr...]`: interactive counterpart of the
-    /// one-shot CLI's `table explain` (main.zig's `runTable`), reporting
-    /// which strategy `table select` would use for the same predicate
-    /// without running it - `query.Table.explain` over the same expr
-    /// grammar `cmdTableSelect` already uses.
     fn cmdTableExplain(self: *Repl, args: []const []const u8, writer: anytype) !void {
         if (args.len < 1) return ReplError.WrongArgCount;
         var table = try Table.open(self.db, self.allocator, args[0]);
@@ -376,10 +346,6 @@ pub const Repl = struct {
         try printPlan(writer, plan);
     }
 
-    /// `table update <table> --set field=value[,field=value...] [expr...]`:
-    /// interactive counterpart of the one-shot CLI's `table update`
-    /// (main.zig's `runTable`) over `query.Table.updateWhere`, same
-    /// `--set`/expr grammar. Prints the number of rows updated.
     fn cmdTableUpdate(self: *Repl, args: []const []const u8, writer: anytype) !void {
         if (args.len < 1) return ReplError.WrongArgCount;
         var table = try Table.open(self.db, self.allocator, args[0]);
@@ -403,11 +369,6 @@ pub const Repl = struct {
         try writer.print("{d}\n", .{updated});
     }
 
-    /// `table delete <table> [expr...]`: interactive counterpart of the
-    /// one-shot CLI's `table delete` (main.zig's `runTable`) over
-    /// `query.Table.deleteWhere`, same expr grammar as `cmdTableSelect`/
-    /// `cmdTableExplain` (empty expr deletes every row). Prints the number
-    /// of rows deleted.
     fn cmdTableDelete(self: *Repl, args: []const []const u8, writer: anytype) !void {
         if (args.len < 1) return ReplError.WrongArgCount;
         var table = try Table.open(self.db, self.allocator, args[0]);
@@ -427,17 +388,6 @@ pub const Repl = struct {
         try writer.print("{d}\n", .{deleted});
     }
 
-    /// `table join [--left|--right|--full] <leftTable> <leftField>
-    /// <rightTable> <rightField> [--limit N] [--offset N]`: interactive
-    /// counterpart of the one-shot CLI's `table join` over join.zig's four
-    /// join functions. With no flag, prints inner-join pairs (`L <row>`
-    /// then `R <row>`); `--left`/`--right`/`--full` print `L (nil)`/
-    /// `R (nil)` for the unmatched side exactly like the CLI.
-    /// `--limit`/`--offset` window the already-joined result through
-    /// `join.applyPage`, same convention as `table select`'s paging (0 or
-    /// omitted = unlimited). Predicates on either side are not exposed here
-    /// (same deliberately minimal CLI surface as `table join` itself - the
-    /// richer path is the `join.zig` library API, as its own tests cover).
     fn cmdTableJoin(self: *Repl, args: []const []const u8, writer: anytype) !void {
         const JoinMode = enum { inner, left, right, full };
         var mode: JoinMode = .inner;
@@ -529,15 +479,6 @@ pub const Repl = struct {
         }
     }
 
-    /// `table aggregate <table> <groupField|*> <spec>[,<spec>...] [expr...]
-    /// [--limit N] [--offset N]`: interactive counterpart of the one-shot
-    /// CLI's `table aggregate` (main.zig's `runTable`) over `aggregate.zig`'s
-    /// `GroupBy`/`runGlobal`. `*` as the group field means no grouping
-    /// (`runGlobal`, always exactly one output line, `--limit`/`--offset`
-    /// ignored - nothing to page over a single row), same sentinel the CLI
-    /// uses; anything else groups by that field (`run`, one line per
-    /// distinct group value, first-seen order), windowed by
-    /// `aggregate.applyPageGroups` same as local `table aggregate`.
     fn cmdTableAggregate(self: *Repl, args: []const []const u8, writer: anytype) !void {
         if (args.len < 2) return ReplError.WrongArgCount;
         var table = try Table.open(self.db, self.allocator, args[0]);
@@ -591,23 +532,6 @@ pub const Repl = struct {
         }
     }
 
-    /// `table window <table> <kind[:field]>[,<kind[:field]>...] [expr...]
-    /// [partition <field>[,field...]] [order <field[:desc]>[,field...]]
-    /// [--limit N] [--offset N] [--range]`: interactive counterpart of the
-    /// one-shot CLI's `table window` (main.zig's `runTable`) over
-    /// `window.zig`'s `computeMany` - a comma-separated spec list computes
-    /// multiple annotation columns sharing one partition/order/frame,
-    /// mirroring `table aggregate`'s multi-spec list. Unlike
-    /// `cmdTableAggregate`, a window annotation never collapses rows - every
-    /// matching row is printed, annotated with the computed value(s) - so
-    /// `--limit`/`--offset` window WHICH rows get
-    /// printed, walked in `window.orderedIndices`' partition-then-order
-    /// display sequence (matching local `table window`'s fix for the same
-    /// raw-scan-order paging bug, not raw scan order). `--range` switches
-    /// sum/avg/count/min/max from the default ROWS running frame to SQL's
-    /// actual RANGE default (rows tied on `order` share the tie group's
-    /// combined value), same as local `table window`/`remote-window`;
-    /// rejected together with row_number/rank/dense_rank.
     fn cmdTableWindow(self: *Repl, args: []const []const u8, writer: anytype) !void {
         if (args.len < 2) return ReplError.WrongArgCount;
         var table = try Table.open(self.db, self.allocator, args[0]);
@@ -717,21 +641,6 @@ pub const Repl = struct {
         try table.delete(pk);
     }
 
-    /// Runs `coll <kind> <op> [args...]` against the live `Db` - the
-    /// interactive counterpart of the one-shot CLI's `coll` command
-    /// (main.zig's `runColl`), same dispatch shape and lazy-expiry-on-
-    /// access behavior (every op below reads/writes a named collection as
-    /// `rest[0]`, so a collection whose TTL already elapsed is expired
-    /// before the op sees it, matching the CLI). Deliberately NOT routed
-    /// through the REPL's active `Transaction` the way `table`/plain
-    /// `put`/`get`/`del` are: `Counter.incrBy`/`List.pushLeft`/`ZSet.add`/
-    /// etc. already open and commit their OWN internal `Transaction` with
-    /// OCC retry per call (see collections.zig), so there is no staged,
-    /// uncommitted state here for `begin`/`commit` to bracket the way
-    /// `TableTxn` brackets table writes - every `coll` op is independently
-    /// durable the instant it returns, with or without an open REPL
-    /// transaction, exactly like `scan` above always sees committed state
-    /// only regardless of any in-flight transaction.
     fn cmdColl(self: *Repl, args: []const []const u8, writer: anytype) !void {
         if (args.len >= 1 and std.mem.eql(u8, args[0], "expire-sweep")) {
             if (args.len != 1) return ReplError.WrongArgCount;
@@ -761,12 +670,6 @@ pub const Repl = struct {
         }
     }
 
-    /// `coll <kind> expire|ttl|persist <name>` and `coll expire-sweep`
-    /// mirror the CLI's `runCollTtl`/top-of-`runColl` special case over
-    /// collttl.zig - the collection-namespace counterpart of `cmdExpire`/
-    /// `cmdPersist`/`cmdTtl`/`cmdExpireSweep` above, same reasoning for
-    /// bypassing the active transaction (a whole collection's expiry is not
-    /// staged through `Transaction` either).
     fn cmdCollTtl(self: *Repl, kind: CollKind, op: []const u8, args: []const []const u8, writer: anytype) !void {
         if (std.mem.eql(u8, op, "expire")) {
             if (args.len != 2) return ReplError.WrongArgCount;
@@ -1017,13 +920,6 @@ pub const Repl = struct {
 
 const PageFlags = struct { limit: u32 = 0, offset: u32 = 0 };
 
-/// Pulls `--limit N` / `--offset N` out of a `table select` argument list
-/// wherever they appear, returning the remaining tokens (destined to be
-/// joined into the expr text) alongside the parsed page window. Same shape
-/// as main.zig's identically-named helper for `table select`/`remote-select`
-/// on the one-shot CLI - kept as its own small copy here rather than shared,
-/// since main.zig is the binary entry point and not a module repl.zig can
-/// import. Caller owns and frees `rest`.
 fn extractPageFlags(allocator: Allocator, args: []const []const u8) !struct { page: PageFlags, rest: [][]const u8 } {
     var page = PageFlags{};
     var rest = std.ArrayList([]const u8).init(allocator);
@@ -1045,12 +941,6 @@ fn extractPageFlags(allocator: Allocator, args: []const []const u8) !struct { pa
     return .{ .page = page, .rest = try rest.toOwnedSlice() };
 }
 
-/// Pulls a lone `--range` flag (no value) out of `table window`'s trailing
-/// args, requesting `window.FrameMode.range` instead of the default
-/// `.rows` running frame - see `window.zig`'s `compute` doc comment. Same
-/// shape as main.zig's identically-named helper, kept as its own small copy
-/// here for the same reason `extractPageFlags` above is. Caller owns and
-/// frees `rest`.
 fn extractRangeFlag(allocator: Allocator, args: []const []const u8) !struct { range: bool, rest: [][]const u8 } {
     var range = false;
     var rest = std.ArrayList([]const u8).init(allocator);
@@ -1067,15 +957,6 @@ fn extractRangeFlag(allocator: Allocator, args: []const []const u8) !struct { ra
 
 const SelectFlags = struct { page: PageFlags = .{}, orderBy: []const querymod.OrderBy = &.{} };
 
-/// `table select`-only counterpart of `extractPageFlags` above, mirroring
-/// main.zig's identically-shaped `extractSelectFlags`/`SelectFlags`: same
-/// `--limit`/`--offset` handling plus `--order-by
-/// field[:desc][,field[:desc]...]` (comma-separated, applied left to
-/// right), kept SEPARATE from `extractPageFlags` rather than folded into
-/// it because `extractPageFlags` is also used by `table join`/`table
-/// aggregate` here, neither of which sorts its result - recognizing
-/// `--order-by` there too would silently consume the flag without
-/// honoring it. Caller owns and frees `rest` AND `flags.orderBy`.
 fn extractSelectFlags(allocator: Allocator, args: []const []const u8) !struct { flags: SelectFlags, rest: [][]const u8 } {
     var flags = SelectFlags{};
     var rest = std.ArrayList([]const u8).init(allocator);
@@ -1103,11 +984,6 @@ fn extractSelectFlags(allocator: Allocator, args: []const []const u8) !struct { 
     return .{ .flags = flags, .rest = try rest.toOwnedSlice() };
 }
 
-/// Parses `--order-by`'s `field[:desc]` value - mirrors main.zig's
-/// identically-shaped `parseOrderByFlag` (kept as its own copy for the same
-/// reason `extractPageFlags`'s doc comment gives: repl.zig cannot import
-/// main.zig, the binary entry point). `:desc`/`:asc` are the only accepted
-/// suffixes; anything else is a malformed flag, not a silent default.
 fn parseOrderByFlag(text: []const u8) !querymod.OrderBy {
     if (std.mem.indexOfScalar(u8, text, ':')) |colon| {
         const field = text[0..colon];
@@ -1121,10 +997,6 @@ fn parseOrderByFlag(text: []const u8) !querymod.OrderBy {
     return .{ .field = text };
 }
 
-/// Splits `--order-by`'s comma-separated value into one or more columns -
-/// mirrors main.zig's identically-shaped `parseOrderByList` (kept as its
-/// own copy for the same reason `parseOrderByFlag` above is). Caller owns
-/// and frees the returned slice.
 fn parseOrderByList(allocator: Allocator, text: []const u8) ![]querymod.OrderBy {
     var list = std.ArrayList(querymod.OrderBy).init(allocator);
     errdefer list.deinit();
@@ -1135,9 +1007,6 @@ fn parseOrderByList(allocator: Allocator, text: []const u8) ![]querymod.OrderBy 
     return list.toOwnedSlice();
 }
 
-/// Splits `name=value` into a Field, validating the name the same way
-/// index/table identifiers already are. Values follow the CLI's `i:`/`f:`/
-/// `b:`/`s:` typed-literal convention via `Value.parseCli`.
 fn parseField(text: []const u8) !Field {
     const eq = std.mem.indexOfScalar(u8, text, '=') orelse return ReplError.InvalidField;
     const name = text[0..eq];
@@ -1146,11 +1015,6 @@ fn parseField(text: []const u8) !Field {
     return .{ .name = name, .value = value };
 }
 
-/// Splits `--set`'s comma-separated `name=value[,name=value...]` value into
-/// a list of Fields, each parsed by `parseField` - mirrors main.zig's
-/// identically-shaped `parseSetList` (kept as its own copy for the same
-/// reason `parseOrderByList` above is).  Caller owns and frees the returned
-/// slice.
 fn parseSetList(allocator: Allocator, text: []const u8) ![]Field {
     var list = std.ArrayList(Field).init(allocator);
     errdefer list.deinit();
@@ -1161,11 +1025,6 @@ fn parseSetList(allocator: Allocator, text: []const u8) ![]Field {
     return list.toOwnedSlice();
 }
 
-/// Pulls a single required `--set name=value[,name=value...]` flag out of a
-/// `table update` argument list - mirrors main.zig's identically-shaped
-/// `extractSetFlag`. Missing `--set` is `error.MissingSetFlag`: a `SET`-less
-/// `UPDATE` names nothing to change. Caller owns and frees `rest` and the
-/// returned `sets` slice.
 fn extractSetFlag(allocator: Allocator, args: []const []const u8) !struct { sets: []Field, rest: [][]const u8 } {
     var sets: []Field = &.{};
     errdefer allocator.free(sets);
@@ -1197,10 +1056,6 @@ fn parseAggKind(name: []const u8) ?aggregatemod.AggKind {
     return null;
 }
 
-/// Parses a comma-separated `table aggregate` spec list, same grammar and
-/// same small standalone copy as main.zig's identically-named helper (see
-/// `extractPageFlags` above for why this is not shared - main.zig is the
-/// binary entry point, not a module repl.zig can import).
 fn parseAggSpecs(allocator: Allocator, text: []const u8) ![]aggregatemod.AggSpec {
     var specs = std.ArrayList(aggregatemod.AggSpec).init(allocator);
     errdefer specs.deinit();
@@ -1248,11 +1103,6 @@ fn parseWindowKind(name: []const u8) ?windowmod.WindowKind {
     return null;
 }
 
-/// Parses a single `table window` spec token, same grammar (including
-/// lag/lead's optional `:offset[:default]` suffix and nth_value's required
-/// `:n[:default]` suffix) and same small standalone copy as main.zig's
-/// identically-named helper (see `parseAggSpecs` above for why this is not
-/// shared).
 fn parseWindowSpec(text: []const u8) !windowmod.WindowSpec {
     var it = std.mem.splitScalar(u8, text, ':');
     const kind = parseWindowKind(it.next().?) orelse return error.InvalidWindowSpec;
@@ -1267,9 +1117,6 @@ fn parseWindowSpec(text: []const u8) !windowmod.WindowSpec {
         var spec = windowmod.WindowSpec{ .field = field, .kind = kind };
         if (it.next()) |offsetText| {
             spec.offset = std.fmt.parseInt(u64, offsetText, 10) catch return error.InvalidWindowSpec;
-            // `it.rest()`, NOT another `it.next()`: a typed default literal
-            // (`i:-1`, `s:foo:bar`) can itself contain colons, which would
-            // get wrongly re-split by a further `splitScalar` step.
             const rest = it.rest();
             if (rest.len > 0) spec.default = Value.parseCli(rest) catch return error.InvalidWindowSpec;
         }
@@ -1296,11 +1143,6 @@ fn parseWindowSpec(text: []const u8) !windowmod.WindowSpec {
     return .{ .field = field, .kind = kind };
 }
 
-/// Parses `table window`'s comma-separated spec list, same grammar and same
-/// small standalone copy as main.zig's identically-named helper (see
-/// `parseAggSpecs` above for why this is not shared) - lets one interactive
-/// `table window` call annotate rows with multiple columns sharing one
-/// `PARTITION BY`/`ORDER BY`/frame (`window.computeMany`).
 fn parseWindowSpecs(allocator: Allocator, text: []const u8) ![]windowmod.WindowSpec {
     var specs = std.ArrayList(windowmod.WindowSpec).init(allocator);
     errdefer specs.deinit();
@@ -1328,10 +1170,6 @@ fn findLiteralToken(args: []const []const u8, token: []const u8) ?usize {
     return null;
 }
 
-/// Splits the trailing free-text args of `table window` on literal
-/// `partition` and `order` tokens, same grammar and same small standalone
-/// copy as main.zig's identically-named helper (see `parseAggSpecs` above
-/// for why this is not shared).
 fn splitWindowArgs(args: []const []const u8) struct { whereArgs: []const []const u8, partitionArgs: ?[]const []const u8, orderArgs: ?[]const []const u8 } {
     if (findLiteralToken(args, "partition")) |pi| {
         const whereArgs = args[0..pi];
@@ -1347,10 +1185,6 @@ fn splitWindowArgs(args: []const []const u8) struct { whereArgs: []const []const
     return .{ .whereArgs = args, .partitionArgs = null, .orderArgs = null };
 }
 
-/// Parses `table window`'s `partition <field>[,field...]` value, same
-/// grammar and same small standalone copy as main.zig's identically-named
-/// helper. Caller owns and frees the returned slice (not each field - they
-/// borrow from `text`).
 fn parsePartitionList(allocator: Allocator, text: []const u8) ![][]const u8 {
     var list = std.ArrayList([]const u8).init(allocator);
     errdefer list.deinit();
@@ -1382,8 +1216,6 @@ fn printRow(writer: anytype, row: Row) !void {
     try writer.writeAll("\n");
 }
 
-/// Same wording as main.zig's own `printPlan` (the two binaries do not
-/// share this helper - main.zig has no repl.zig dependency and vice versa).
 fn printPlan(writer: anytype, plan: querymod.Plan) !void {
     switch (plan.kind) {
         .full_scan => try writer.writeAll("full scan (no usable index)\n"),
@@ -1491,9 +1323,6 @@ test "table select --order-by sorts by field, honoring :desc and combining with 
     var repl = Repl.init(allocator, &db);
     defer repl.deinit();
 
-    // Insert with pk NOT in price order, so a bug that sorted only within
-    // the natural pk scan order (or ignored --order-by entirely) would
-    // produce a visibly different sequence than asserted below.
     const out = try runScript(allocator, &repl,
         \\table put items i:1 name=b price=i:20
         \\table put items i:2 name=a price=i:30
@@ -1542,9 +1371,6 @@ test "table select --order-by with two comma-separated columns sorts by the firs
     var repl = Repl.init(allocator, &db);
     defer repl.deinit();
 
-    // Two rows share city "warsaw" with prices NOT in insertion order, so
-    // a single-column city sort alone would leave them in whatever order
-    // they were inserted - only a real `price` tiebreak fixes that.
     const out = try runScript(allocator, &repl,
         \\table put items i:1 city=warsaw price=i:30
         \\table put items i:2 city=krakow price=i:5
@@ -1695,22 +1521,17 @@ test "table join inner/left/right/full match main.zig's L/R printing" {
     );
     defer allocator.free(out);
     try std.testing.expectEqualStrings(
-        // plain inner join: only alice/order100 matches, bob and the orphan
-        // order are absent.
         "OK\nOK\nOK\nOK\n" ++
             "L __pk=1\tname=alice\n" ++
             "R __pk=100\tcustomer_id=1\ttotal=50\n" ++
-            // --left: bob survives with R (nil), the orphan order is still absent.
             "L __pk=1\tname=alice\n" ++
             "R __pk=100\tcustomer_id=1\ttotal=50\n" ++
             "L __pk=2\tname=bob\n" ++
             "R (nil)\n" ++
-            // --right: the orphan order survives with L (nil), bob is absent.
             "L __pk=1\tname=alice\n" ++
             "R __pk=100\tcustomer_id=1\ttotal=50\n" ++
             "L (nil)\n" ++
             "R __pk=101\tcustomer_id=999\ttotal=5\n" ++
-            // --full: both bob and the orphan order survive.
             "L __pk=1\tname=alice\n" ++
             "R __pk=100\tcustomer_id=1\ttotal=50\n" ++
             "L __pk=2\tname=bob\n" ++
@@ -1742,10 +1563,8 @@ test "table join respects --limit and --offset like table select does" {
     defer allocator.free(out);
     try std.testing.expectEqualStrings(
         "OK\nOK\nOK\n" ++
-            // --offset 1 --limit 1: skip alice, keep exactly bob.
             "L __pk=2\tname=bob\n" ++
             "R (nil)\n" ++
-            // --offset 50 is past the end of a 3-row left outer join: nothing.
             "",
         out,
     );
@@ -1954,7 +1773,6 @@ test "table window --range shares a tied group's combined total, without it each
     var repl = Repl.init(allocator, &db);
     defer repl.deinit();
 
-    // Two rows tied at day=1 (10, 20), then one row at day=2 (5).
     const out = try runScript(allocator, &repl,
         \\table put orders i:1 day=i:1 amount=i:10
         \\table put orders i:2 day=i:1 amount=i:20
@@ -1966,11 +1784,9 @@ test "table window --range shares a tied group's combined total, without it each
     defer allocator.free(out);
     try std.testing.expectEqualStrings(
         "OK\nOK\nOK\n" ++
-            // --range: both day=1 rows share the tie group's combined total.
             "__pk=1\tday=1\tamount=10\tsum_amount=30\n" ++
             "__pk=2\tday=1\tamount=20\tsum_amount=30\n" ++
             "__pk=3\tday=2\tamount=5\tsum_amount=35\n" ++
-            // default (ROWS): each physical row keeps its own running total.
             "__pk=1\tday=1\tamount=10\tsum_amount=10\n" ++
             "__pk=2\tday=1\tamount=20\tsum_amount=30\n" ++
             "__pk=3\tday=2\tamount=5\tsum_amount=35\n",
@@ -2042,9 +1858,6 @@ test "table window honors --limit/--offset in partition-then-order display order
         \\
     );
     defer allocator.free(out);
-    // Sorted by total ascending: krakow/40 (rownum 1), warsaw/100 (rownum
-    // 2), warsaw/250 (rownum 3) - offset 1 limit 1 must land on the SECOND
-    // entry of that sorted walk, not the second row `table put` inserted.
     try std.testing.expectEqualStrings(
         "OK\nOK\nOK\n" ++
             "__pk=1\tcity=warsaw\ttotal=100\trow_number=2\n",
@@ -2208,10 +2021,6 @@ test "table window nth_value --range: position resolved against the CUMULATIVE f
         \\
     );
     defer allocator.free(out);
-    // day=1's tie group has 2 members - position 2 is its second member (20).
-    // day=2's frame is UNBOUNDED PRECEDING through its own tie group, so it
-    // already includes day=1's rows too - position 2 was already resolved
-    // to 20 there and stays 20, even though day=2's OWN group has just 1 row.
     try std.testing.expectEqualStrings(
         "OK\nOK\nOK\n" ++
             "__pk=1\tday=1\tamount=10\tnth_value_amount=20\n" ++
@@ -2832,6 +2641,69 @@ test "expire/ttl/persist manage a plain key's TTL like the CLI's same-named comm
     try std.testing.expectEqual(@as(?[]const u8, null), lines.next());
 }
 
+test "persist inside a transaction is staged: rollback keeps the TTL, commit clears it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    try db.put("a", "1");
+    try ttlmod.setExpireSeconds(&db, allocator, "a", std.time.nanoTimestamp(), 100);
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const rolledBack = try runScript(allocator, &repl, "begin\npersist a\nttl a\nrollback\n");
+    defer allocator.free(rolledBack);
+    try std.testing.expectEqualStrings("OK\nOK\n-1\nOK\n", rolledBack);
+    try std.testing.expect(try ttlmod.getExpiresAt(&db, allocator, "a") != null);
+
+    const committed = try runScript(allocator, &repl, "begin\npersist a\ncommit\nttl a\n");
+    defer allocator.free(committed);
+    try std.testing.expectEqualStrings("OK\nOK\nOK\n-1\n", committed);
+    try std.testing.expectEqual(@as(?i128, null), try ttlmod.getExpiresAt(&db, allocator, "a"));
+
+    const value = (try db.get(allocator, "a")).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("1", value);
+}
+
+test "ttl inside a transaction reflects staged put, expire and del" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    try db.put("c", "committed");
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(
+        allocator,
+        &repl,
+        "begin\nput k v\nttl k\nexpire k 50\nttl k\ndel k\nttl k\nexpire c 30\nttl c\nrollback\nttl k\nttl c\n",
+    );
+    defer allocator.free(out);
+
+    var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, out, "\n"), '\n');
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    try std.testing.expectEqualStrings("-1", lines.next().?);
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    const stagedTtl = std.fmt.parseInt(i64, lines.next().?, 10) catch unreachable;
+    try std.testing.expect(stagedTtl > 0 and stagedTtl <= 50);
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    try std.testing.expectEqualStrings("-2", lines.next().?);
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    const committedKeyTtl = std.fmt.parseInt(i64, lines.next().?, 10) catch unreachable;
+    try std.testing.expect(committedKeyTtl > 0 and committedKeyTtl <= 30);
+    try std.testing.expectEqualStrings("OK", lines.next().?);
+    try std.testing.expectEqualStrings("-2", lines.next().?);
+    try std.testing.expectEqualStrings("-1", lines.next().?);
+    try std.testing.expectEqual(@as(?[]const u8, null), lines.next());
+}
+
 test "expire on a missing key reports NoSuchKey without crashing" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2845,6 +2717,26 @@ test "expire on a missing key reports NoSuchKey without crashing" {
     const out = try runScript(allocator, &repl, "expire ghost 10\n");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("error: NoSuchKey\n", out);
+}
+
+test "scan hides ttl markers and collections, and raw commands refuse reserved keys" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    _ = try collectionsmod.Counter.incrBy(&db, allocator, "hits", 2);
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "put session:9 live\nexpire session:9 600\nscan\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("OK\nOK\nsession:9\tlive\n", out);
+
+    const reserved = try runScript(allocator, &repl, "get \xFCsession:9\nput \xF5x y\n");
+    defer allocator.free(reserved);
+    try std.testing.expectEqualStrings("error: ReservedKey\nerror: ReservedKey\n", reserved);
 }
 
 test "expire-sweep reaps an already-elapsed plain-key TTL" {
@@ -2862,6 +2754,100 @@ test "expire-sweep reaps an already-elapsed plain-key TTL" {
     const out = try runScript(allocator, &repl, "expire-sweep\nget a\n");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("reaped: 1\n(nil)\n", out);
+}
+
+test "get and scan treat an elapsed plain-key TTL as missing without a sweep, also inside a transaction" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    try db.put("a", "1");
+    try db.put("b", "2");
+    try db.put("c", "3");
+    try ttlmod.setExpireSeconds(&db, allocator, "a", std.time.nanoTimestamp() - 10 * std.time.ns_per_s, 1);
+    try ttlmod.setExpireSeconds(&db, allocator, "c", std.time.nanoTimestamp() - 10 * std.time.ns_per_s, 1);
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(allocator, &repl, "scan\nbegin\nget c\nget b\nrollback\nget a\nget b\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("b\t2\nOK\n(nil)\n2\nOK\n(nil)\n2\n", out);
+    try std.testing.expectEqual(ttlmod.TtlResult.noKey, try ttlmod.remaining(&db, allocator, "a", std.time.nanoTimestamp()));
+}
+
+test "put drops any ttl, also inside a transaction, and expire and ttl treat an elapsed unswept key as missing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    const past = std.time.nanoTimestamp() - 10 * std.time.ns_per_s;
+    try ttlmod.putWithTtl(&db, allocator, "dead", "old", past, 1);
+    try ttlmod.putWithTtl(&db, allocator, "rewritten", "old", past, 1);
+    try ttlmod.putWithTtl(&db, allocator, "staged", "old", past, 1);
+    try ttlmod.putWithTtl(&db, allocator, "live", "old", std.time.nanoTimestamp(), 600);
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const out = try runScript(
+        allocator,
+        &repl,
+        "ttl dead\nexpire dead 600\nttl dead\nget dead\n" ++
+            "put rewritten new\nget rewritten\nttl rewritten\n" ++
+            "put live new\nttl live\n" ++
+            "begin\nput staged new\nget staged\ncommit\nget staged\nttl staged\n" ++
+            "expire-sweep\n",
+    );
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "-2\nerror: NoSuchKey\n-2\n(nil)\n" ++
+            "OK\nnew\n-1\n" ++
+            "OK\n-1\n" ++
+            "OK\nOK\nnew\nOK\nnew\n-1\n" ++
+            "reaped: 0\n",
+        out,
+    );
+}
+
+test "del drops the ttl marker, also inside a transaction, and expire inside a transaction waits for commit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openTemp(&tmp, allocator);
+    defer db.close();
+    const now = std.time.nanoTimestamp();
+    try ttlmod.putWithTtl(&db, allocator, "plain", "v", now, 600);
+    try ttlmod.putWithTtl(&db, allocator, "staged", "v", now, 600);
+    try db.put("later", "v");
+    try db.put("abandoned", "v");
+
+    var repl = Repl.init(allocator, &db);
+    defer repl.deinit();
+
+    const direct = try runScript(allocator, &repl, "del plain\n");
+    defer allocator.free(direct);
+    try std.testing.expectEqualStrings("OK\n", direct);
+    try std.testing.expectEqual(@as(?i128, null), try ttlmod.getExpiresAt(&db, allocator, "plain"));
+
+    const staging = try runScript(allocator, &repl, "begin\ndel staged\nexpire later 600\nput fresh v\nexpire fresh 600\nexpire staged 600\nexpire ghost 600\n");
+    defer allocator.free(staging);
+    try std.testing.expectEqualStrings("OK\nOK\nOK\nOK\nOK\nerror: NoSuchKey\nerror: NoSuchKey\n", staging);
+    try std.testing.expect((try ttlmod.getExpiresAt(&db, allocator, "staged")) != null);
+    try std.testing.expectEqual(@as(?i128, null), try ttlmod.getExpiresAt(&db, allocator, "later"));
+    try std.testing.expectEqual(@as(?i128, null), try ttlmod.getExpiresAt(&db, allocator, "fresh"));
+
+    const committed = try runScript(allocator, &repl, "commit\nbegin\nexpire abandoned 600\nrollback\nttl abandoned\n");
+    defer allocator.free(committed);
+    try std.testing.expectEqualStrings("OK\nOK\nOK\nOK\n-1\n", committed);
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(allocator, "staged"));
+    try std.testing.expectEqual(@as(?i128, null), try ttlmod.getExpiresAt(&db, allocator, "staged"));
+    for ([_][]const u8{ "later", "fresh" }) |key| {
+        const left = (try ttlmod.remaining(&db, allocator, key, std.time.nanoTimestamp())).seconds;
+        try std.testing.expect(left >= 599 and left <= 600);
+    }
 }
 
 test "coll expire/ttl/persist manage a whole collection's TTL, and coll expire-sweep reaps it" {
@@ -2928,9 +2914,6 @@ test "coll expires a collection lazily via collttl before the next op sees it" {
     var repl = Repl.init(allocator, &db);
     defer repl.deinit();
 
-    // Reading it through the REPL must trigger the same lazy-expiry check
-    // the CLI's `runColl` performs before every op, so an already-elapsed
-    // TTL is honored immediately instead of only on the next sweep.
     const out = try runScript(allocator, &repl, "coll counter get session\n");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("0\n", out);

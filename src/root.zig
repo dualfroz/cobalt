@@ -7,6 +7,7 @@ pub const Entry = db.Entry;
 pub const RangeIterator = db.RangeIterator;
 pub const Snapshot = db.Snapshot;
 pub const WriteBatch = db.WriteBatch;
+pub const OpenError = db.OpenError;
 
 pub const Kind = @import("encode.zig").Kind;
 pub const Bloom = @import("bloom.zig").Bloom;
@@ -91,6 +92,7 @@ pub const pubsub = @import("pubsub.zig");
 pub const PubSubHub = pubsub.Hub;
 pub const PubSubSubscriber = pubsub.Subscriber;
 pub const PubSubMessage = pubsub.Message;
+pub const verify = @import("verify.zig");
 
 test {
     _ = @import("encode.zig");
@@ -130,4 +132,5 @@ test {
     _ = @import("dump.zig");
     _ = @import("window.zig");
     _ = @import("pubsub.zig");
+    _ = @import("verify.zig");
 }
